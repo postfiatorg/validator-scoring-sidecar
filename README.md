@@ -3,9 +3,8 @@
 Validator-facing tooling for Post Fiat Dynamic UNL Phase 2 shadow verification.
 
 This repository starts the operator-owned sidecar path. The current scope is
-limited to inspecting public scoring round metadata and fetching verified frozen
-input packages that future sidecar capabilities will score and publish through
-commit-reveal.
+limited to fetching verified frozen input packages that future sidecar
+capabilities will score and publish through commit-reveal.
 
 The sidecar is convenience tooling. Validators can inspect the frozen package
 and reproduce the same steps manually; the tool should not become a hidden trust
@@ -13,18 +12,16 @@ requirement.
 
 ## Current Scope
 
-The first command reads a scoring service round record and reports the frozen
-input package boundary:
+The sidecar reads scoring service round metadata, requires the frozen input
+package boundary, downloads the frozen input package, verifies `bundle.json`
+against `input_package_hash`, verifies every file listed in
+`bundle.json.file_hashes`, rejects cross-network packages, and writes only
+verified packages to the local cache.
 
 - `input_package_cid`
 - `input_package_hash`
 - `input_frozen_at`
 - `final_bundle_cid`, when present, as a separate final audit bundle reference
-
-The package fetch command downloads the frozen input package, verifies
-`bundle.json` against `input_package_hash`, verifies every file listed in
-`bundle.json.file_hashes`, rejects cross-network packages, and writes only
-verified packages to the local cache.
 
 The sidecar does not run inference, score validators, inspect package semantics
 in depth, watch chain history, submit commits or reveals, handle wallets or
@@ -86,58 +83,20 @@ set +a
 
 The sidecar reads exported environment variables. It does not parse `.env`
 files directly, which keeps the runtime dependency set small. Use
-`.env.devnet.example` the same way when inspecting devnet scoring rounds.
+`.env.devnet.example` the same way when fetching devnet scoring rounds.
 
 You can also select devnet without an env file:
 
 ```bash
-validator-scoring-sidecar inspect-round --network devnet --round-id 123
+validator-scoring-sidecar fetch-input-package --network devnet --round-id 123
 ```
 
-## Inspect A Round
+## Fetch An Input Package
 
-The scoring service endpoint is:
-
-```text
-GET /api/scoring/rounds/{round_id}
-```
-
-`round_id` is the scoring service database ID. The response also includes the
-public `round_number`.
-
-Human-readable output:
-
-```bash
-validator-scoring-sidecar inspect-round --round-id 123
-```
-
-```text
-Round ID: 123
-Round number: 123
-Status: COMPLETE
-Input package CID: Qm...
-Input package hash: 0123...
-Input frozen at: 2026-05-25T00:00:00+00:00
-Final bundle CID: Qm...
-```
-
-Machine-readable output:
-
-```bash
-validator-scoring-sidecar inspect-round --round-id 123 --json
-```
-
-```json
-{
-  "final_bundle_cid": "Qm...",
-  "input_frozen_at": "2026-05-25T00:00:00+00:00",
-  "input_package_cid": "Qm...",
-  "input_package_hash": "0123...",
-  "round_id": 123,
-  "round_number": 123,
-  "status": "COMPLETE"
-}
-```
+Fetch, verify, and cache a frozen input package for a known public round. The
+command first calls `GET /api/scoring/rounds/{round_id}` to discover the
+round's frozen input package metadata. `round_id` is the scoring service
+database ID. The response also includes the public `round_number`.
 
 If a round does not expose `input_package_cid`, `input_package_hash`, or
 `input_frozen_at`, the command exits nonzero and reports:
@@ -148,10 +107,6 @@ Round 123 does not expose frozen input package metadata (input_package_cid, inpu
 
 The round may still be valid historical audit data. It is just not suitable for
 frozen input inspection.
-
-## Fetch An Input Package
-
-Fetch, verify, and cache a frozen input package for a known public round:
 
 ```bash
 validator-scoring-sidecar fetch-input-package --round-id 123

@@ -51,40 +51,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    inspect = subparsers.add_parser(
-        "inspect-round",
-        help="Inspect frozen input metadata for a public scoring round.",
-    )
-    inspect.add_argument(
-        "--round-id",
-        type=_positive_int,
-        required=True,
-        help="Scoring service database round ID to inspect.",
-    )
-    inspect.add_argument(
-        "--base-url",
-        help="Scoring service base URL. Overrides POSTFIAT_SCORING_BASE_URL.",
-    )
-    inspect.add_argument(
-        "--data-dir",
-        help="Local sidecar data directory. Overrides POSTFIAT_SIDECAR_DATA_DIR.",
-    )
-    inspect.add_argument(
-        "--network",
-        help="Network label. Overrides POSTFIAT_SIDECAR_NETWORK.",
-    )
-    inspect.add_argument(
-        "--timeout",
-        type=float,
-        help="HTTP request timeout in seconds. Overrides POSTFIAT_SIDECAR_TIMEOUT_SECONDS.",
-    )
-    inspect.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit machine-readable JSON.",
-    )
-    inspect.set_defaults(handler=inspect_round)
-
     fetch = subparsers.add_parser(
         "fetch-input-package",
         help="Fetch, verify, and cache a frozen input package for a public round.",
@@ -139,40 +105,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def inspect_round(args: argparse.Namespace) -> int:
-    config = load_config(
-        base_url=args.base_url,
-        data_dir=args.data_dir,
-        network=args.network,
-        timeout_seconds=args.timeout,
-    )
-    client = ScoringClient(config)
-    try:
-        payload = client.fetch_round(args.round_id)
-        metadata = RoundMetadata.from_api_payload(
-            payload,
-            requested_round_id=args.round_id,
-        )
-    except MissingFrozenInputMetadata as exc:
-        _print_error(str(exc))
-        return EXIT_OPERATOR_ERROR
-    except RoundMetadataError as exc:
-        _print_error(f"Malformed round metadata: {exc}")
-        return EXIT_NETWORK_ERROR
-    except ScoringClientError as exc:
-        _print_error(str(exc))
-        return EXIT_NETWORK_ERROR
-    finally:
-        client.close()
-
-    if args.json:
-        print(json.dumps(metadata.as_dict(), indent=2, sort_keys=True))
-    else:
-        print(_format_human(metadata))
-
-    return EXIT_OK
-
-
 def fetch_input_package(args: argparse.Namespace) -> int:
     config = load_config(
         base_url=args.base_url,
@@ -216,21 +148,6 @@ def fetch_input_package(args: argparse.Namespace) -> int:
         print(_format_fetched_input_package(fetched_package))
 
     return EXIT_OK
-
-
-def _format_human(metadata: RoundMetadata) -> str:
-    final_bundle = metadata.final_bundle_cid or "(not published yet)"
-    return "\n".join(
-        [
-            f"Round ID: {metadata.round_id}",
-            f"Round number: {metadata.round_number}",
-            f"Status: {metadata.status}",
-            f"Input package CID: {metadata.input_package_cid}",
-            f"Input package hash: {metadata.input_package_hash}",
-            f"Input frozen at: {metadata.input_frozen_at}",
-            f"Final bundle CID: {final_bundle}",
-        ]
-    )
 
 
 def _format_fetched_input_package(fetched_package: FetchedInputPackage) -> str:

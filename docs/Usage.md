@@ -1,8 +1,7 @@
 # Usage
 
-This sidecar currently does two things:
+This sidecar currently has one main command:
 
-- inspect public scoring round metadata;
 - fetch, verify, and cache a frozen input package for a known round.
 
 It does not score validators, run inference, watch chain activity, submit memos,
@@ -21,13 +20,13 @@ python -m pip install -e ".[dev]"
 Testnet is the default:
 
 ```bash
-validator-scoring-sidecar inspect-round --round-id 123
+validator-scoring-sidecar fetch-input-package --round-id 123
 ```
 
 Use devnet explicitly when needed:
 
 ```bash
-validator-scoring-sidecar inspect-round --round-id 268 --network devnet
+validator-scoring-sidecar fetch-input-package --round-id 268 --network devnet
 ```
 
 You can also load an env file:
@@ -44,20 +43,6 @@ Devnet and testnet both use the shared IPFS gateway:
 ```text
 https://ipfs-testnet.postfiat.org/ipfs
 ```
-
-## Inspect A Round
-
-```bash
-validator-scoring-sidecar inspect-round --round-id 268 --network devnet
-```
-
-JSON output:
-
-```bash
-validator-scoring-sidecar inspect-round --round-id 268 --network devnet --json
-```
-
-This command only reads round metadata. It does not download the package.
 
 ## Fetch An Input Package
 
@@ -155,6 +140,5 @@ Show CLI help:
 
 ```bash
 validator-scoring-sidecar --help
-validator-scoring-sidecar inspect-round --help
 validator-scoring-sidecar fetch-input-package --help
 ```
