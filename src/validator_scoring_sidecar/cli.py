@@ -9,6 +9,14 @@ from collections.abc import Sequence
 from typing import NoReturn
 
 from validator_scoring_sidecar.config import ConfigError, load_config
+from validator_scoring_sidecar.input_package import (
+    PACKAGE_SOURCE_CHOICES,
+    FetchedInputPackage,
+    InputPackageCacheError,
+    InputPackageDownloadError,
+    InputPackageVerificationError,
+    fetch_input_package as fetch_verified_input_package,
+)
 from validator_scoring_sidecar.round_metadata import (
     MissingFrozenInputMetadata,
     RoundMetadata,
@@ -76,6 +84,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit machine-readable JSON.",
     )
     inspect.set_defaults(handler=inspect_round)
+
+    fetch = subparsers.add_parser(
+        "fetch-input-package",
+        help="Fetch, verify, and cache a frozen input package for a public round.",
+    )
+    fetch.add_argument(
+        "--round-id",
+        type=_positive_int,
+        required=True,
+        help="Scoring service database round ID to fetch.",
+    )
+    fetch.add_argument(
+        "--source",
+        choices=PACKAGE_SOURCE_CHOICES,
+        default="auto",
+        help="Package retrieval source. Defaults to auto.",
+    )
+    fetch.add_argument(
+        "--base-url",
+        help="Scoring service base URL. Overrides POSTFIAT_SCORING_BASE_URL.",
+    )
+    fetch.add_argument(
+        "--data-dir",
+        help="Local sidecar data directory. Overrides POSTFIAT_SIDECAR_DATA_DIR.",
+    )
+    fetch.add_argument(
+        "--ipfs-gateway-url",
+        help=(
+            "IPFS gateway URL prefix. Overrides "
+            "POSTFIAT_SIDECAR_IPFS_GATEWAY_URL."
+        ),
+    )
+    fetch.add_argument(
+        "--network",
+        help="Network label. Overrides POSTFIAT_SIDECAR_NETWORK.",
+    )
+    fetch.add_argument(
+        "--timeout",
+        type=float,
+        help="HTTP request timeout in seconds. Overrides POSTFIAT_SIDECAR_TIMEOUT_SECONDS.",
+    )
+    fetch.add_argument(
+        "--force",
+        action="store_true",
+        help="Refetch and replace an existing verified package cache.",
+    )
+    fetch.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+    fetch.set_defaults(handler=fetch_input_package)
     return parser
 
 
@@ -113,6 +173,51 @@ def inspect_round(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def fetch_input_package(args: argparse.Namespace) -> int:
+    config = load_config(
+        base_url=args.base_url,
+        data_dir=args.data_dir,
+        ipfs_gateway_url=args.ipfs_gateway_url,
+        network=args.network,
+        timeout_seconds=args.timeout,
+    )
+    client = ScoringClient(config)
+    try:
+        payload = client.fetch_round(args.round_id)
+        metadata = RoundMetadata.from_api_payload(
+            payload,
+            requested_round_id=args.round_id,
+        )
+        fetched_package = fetch_verified_input_package(
+            metadata,
+            config,
+            client,
+            source=args.source,
+            force=args.force,
+        )
+    except MissingFrozenInputMetadata as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except RoundMetadataError as exc:
+        _print_error(f"Malformed round metadata: {exc}")
+        return EXIT_NETWORK_ERROR
+    except (InputPackageVerificationError, InputPackageCacheError) as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except (InputPackageDownloadError, ScoringClientError) as exc:
+        _print_error(str(exc))
+        return EXIT_NETWORK_ERROR
+    finally:
+        client.close()
+
+    if args.json:
+        print(json.dumps(fetched_package.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(_format_fetched_input_package(fetched_package))
+
+    return EXIT_OK
+
+
 def _format_human(metadata: RoundMetadata) -> str:
     final_bundle = metadata.final_bundle_cid or "(not published yet)"
     return "\n".join(
@@ -124,6 +229,24 @@ def _format_human(metadata: RoundMetadata) -> str:
             f"Input package hash: {metadata.input_package_hash}",
             f"Input frozen at: {metadata.input_frozen_at}",
             f"Final bundle CID: {final_bundle}",
+        ]
+    )
+
+
+def _format_fetched_input_package(fetched_package: FetchedInputPackage) -> str:
+    cache_status = "reused" if fetched_package.cached else "fetched"
+    return "\n".join(
+        [
+            f"Round ID: {fetched_package.round_id}",
+            f"Round number: {fetched_package.round_number}",
+            f"Network: {fetched_package.network}",
+            f"Input package CID: {fetched_package.input_package_cid}",
+            f"Input package hash: {fetched_package.input_package_hash}",
+            f"Input frozen at: {fetched_package.input_frozen_at}",
+            f"Source: {fetched_package.source}",
+            f"Cache status: {cache_status}",
+            f"Verified files: {fetched_package.verified_file_count}",
+            f"Local path: {fetched_package.local_path}",
         ]
     )
 
@@ -144,4 +267,3 @@ def _argparse_error(message: str) -> NoReturn:
 
 def _print_error(message: str) -> None:
     print(f"Error: {message}", file=sys.stderr)
-

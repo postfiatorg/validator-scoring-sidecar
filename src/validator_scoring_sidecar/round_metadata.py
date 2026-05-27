@@ -26,7 +26,8 @@ class MissingFrozenInputMetadata(RoundMetadataError):
         super().__init__(
             "Round "
             f"{round_identifier} does not expose frozen input package metadata "
-            f"({fields}). It may be a legacy, dry-run, override, or pre-M2.1 round."
+            f"({fields}). It may be a legacy, dry-run, override, or round "
+            "created before frozen input metadata was introduced."
         )
 
 

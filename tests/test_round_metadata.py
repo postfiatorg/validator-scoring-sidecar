@@ -53,7 +53,7 @@ def test_round_metadata_requires_frozen_input_fields(field):
         RoundMetadata.from_api_payload(payload, requested_round_id=123)
 
     assert field in exc_info.value.missing_fields
-    assert "legacy, dry-run, override, or pre-M2.1" in str(exc_info.value)
+    assert "created before frozen input metadata was introduced" in str(exc_info.value)
 
 
 def test_round_metadata_reports_all_missing_frozen_input_fields():

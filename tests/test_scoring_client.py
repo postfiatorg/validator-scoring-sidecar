@@ -22,6 +22,25 @@ def test_round_url_uses_scoring_endpoint_path():
     )
 
 
+def test_input_package_file_url_uses_input_namespace():
+    client = ScoringClient(_config(), http_client=httpx.Client())
+
+    assert client.input_package_file_url(456, "inputs/model_request.json") == (
+        "https://scoring.example.org/api/scoring/rounds/456"
+        "/input/inputs/model_request.json"
+    )
+
+
+def test_ipfs_package_file_url_uses_gateway_cid_and_file_path():
+    client = ScoringClient(_config(), http_client=httpx.Client())
+
+    assert client.ipfs_package_file_url(
+        "https://ipfs.example.org/ipfs",
+        "QmInput",
+        "inputs/model_request.json",
+    ) == "https://ipfs.example.org/ipfs/QmInput/inputs/model_request.json"
+
+
 def test_fetch_round_returns_json_payload():
     def handler(request):
         assert request.url.path == "/api/scoring/rounds/123"
@@ -54,4 +73,3 @@ def test_fetch_round_raises_for_network_error():
 
     with pytest.raises(ScoringNetworkError):
         client.fetch_round(123)
-
