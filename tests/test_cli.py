@@ -7,6 +7,7 @@ from validator_scoring_sidecar.input_package import (
     FetchedInputPackage,
     InputPackageVerificationError,
 )
+from validator_scoring_sidecar.sync import SyncLockError, SyncResult
 
 
 class FakeClient:
@@ -195,3 +196,169 @@ def test_fetch_input_package_verification_error_fails(capsys):
     assert exit_code == 1
     assert "hash mismatch" in captured.err
     assert captured.out == ""
+
+
+def test_sync_json_output(capsys, monkeypatch, tmp_path):
+    def fake_sync(config, client, *, source, round_limit):
+        assert source == "auto"
+        assert round_limit == 5
+        return SyncResult(
+            status="input_package_ready",
+            network=config.network,
+            scanned_rounds=2,
+            package=FetchedInputPackage(
+                round_id=123,
+                round_number=456,
+                network=config.network,
+                input_package_cid="QmInput",
+                input_package_hash="a" * 64,
+                input_frozen_at="2026-05-25T00:00:00+00:00",
+                source="https",
+                cached=False,
+                local_path=tmp_path / "packages" / ("a" * 64),
+                verified_file_count=3,
+            ),
+        )
+
+    monkeypatch.setattr(cli, "sync_input_package", fake_sync)
+
+    exit_code = cli.main(
+        [
+            "sync",
+            "--data-dir",
+            str(tmp_path),
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out) == {
+        "status": "input_package_ready",
+        "network": "testnet",
+        "scanned_rounds": 2,
+        "action": "fetched",
+        "round_id": 123,
+        "round_number": 456,
+        "package": {
+            "round_id": 123,
+            "round_number": 456,
+            "network": "testnet",
+            "input_package_cid": "QmInput",
+            "input_package_hash": "a" * 64,
+            "input_frozen_at": "2026-05-25T00:00:00+00:00",
+            "source": "https",
+            "cached": False,
+            "local_path": str(tmp_path / "packages" / ("a" * 64)),
+            "verified_file_count": 3,
+        },
+    }
+    assert captured.err == ""
+
+
+def test_sync_lock_json_output(capsys, monkeypatch, tmp_path):
+    def fake_sync(config, client, *, source, round_limit):
+        raise SyncLockError(tmp_path / "sidecar.lock")
+
+    monkeypatch.setattr(cli, "sync_input_package", fake_sync)
+
+    exit_code = cli.main(
+        [
+            "sync",
+            "--data-dir",
+            str(tmp_path),
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 4
+    assert json.loads(captured.out) == {
+        "status": "locked",
+        "network": "testnet",
+        "lock_path": str(tmp_path / "sidecar.lock"),
+    }
+    assert captured.err == ""
+
+
+def test_sync_no_eligible_round_json_output(capsys, monkeypatch, tmp_path):
+    def fake_sync(config, client, *, source, round_limit):
+        return SyncResult(
+            status="no_eligible_round",
+            network=config.network,
+            scanned_rounds=2,
+        )
+
+    monkeypatch.setattr(cli, "sync_input_package", fake_sync)
+
+    exit_code = cli.main(
+        [
+            "sync",
+            "--data-dir",
+            str(tmp_path),
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out) == {
+        "status": "no_eligible_round",
+        "network": "testnet",
+        "scanned_rounds": 2,
+    }
+    assert captured.err == ""
+
+
+def test_sync_human_output(capsys, monkeypatch, tmp_path):
+    def fake_sync(config, client, *, source, round_limit):
+        return SyncResult(
+            status="input_package_ready",
+            network=config.network,
+            scanned_rounds=1,
+            package=FetchedInputPackage(
+                round_id=123,
+                round_number=456,
+                network=config.network,
+                input_package_cid="QmInput",
+                input_package_hash="a" * 64,
+                input_frozen_at="2026-05-25T00:00:00+00:00",
+                source="https",
+                cached=True,
+                local_path=tmp_path / "packages" / ("a" * 64),
+                verified_file_count=3,
+            ),
+        )
+
+    monkeypatch.setattr(cli, "sync_input_package", fake_sync)
+
+    exit_code = cli.main(["sync", "--data-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Sync status: input package ready" in captured.out
+    assert "Action: cache_reused" in captured.out
+    assert "Scanned rounds: 1" in captured.out
+    assert "Cache status: reused" in captured.out
+    assert captured.err == ""
+
+
+def test_sync_rejects_round_limit_above_sidecar_cap(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["sync", "--round-limit", "21"])
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert "less than or equal to 20" in captured.err
+
+
+def test_sync_data_dir_file_fails_without_traceback(capsys, tmp_path):
+    data_dir = tmp_path / "sidecar-data"
+    data_dir.write_text("not a directory", encoding="utf-8")
+
+    exit_code = cli.main(["sync", "--data-dir", str(data_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Failed to prepare sidecar sync lock" in captured.err
+    assert "Traceback" not in captured.err

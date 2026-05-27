@@ -3,7 +3,7 @@
 Validator-facing tooling for Post Fiat Dynamic UNL Phase 2 shadow verification.
 
 This repository starts the operator-owned sidecar path. The current scope is
-limited to fetching verified frozen input packages that future sidecar
+limited to syncing verified frozen input packages that future sidecar
 capabilities will score and publish through commit-reveal.
 
 The sidecar is convenience tooling. Validators can inspect the frozen package
@@ -12,11 +12,11 @@ requirement.
 
 ## Current Scope
 
-The sidecar reads scoring service round metadata, requires the frozen input
-package boundary, downloads the frozen input package, verifies `bundle.json`
-against `input_package_hash`, verifies every file listed in
-`bundle.json.file_hashes`, rejects cross-network packages, and writes only
-verified packages to the local cache.
+The sidecar discovers recent scoring rounds, requires the frozen input package
+boundary, downloads the frozen input package, verifies `bundle.json` against
+`input_package_hash`, verifies every file listed in `bundle.json.file_hashes`,
+rejects cross-network packages, writes only verified packages to the local
+cache, and records local round state in SQLite.
 
 - `input_package_cid`
 - `input_package_hash`
@@ -69,8 +69,9 @@ between networks. Explicit `--base-url`, `--ipfs-gateway-url`, and `--data-dir`
 values override everything for their settings. Environment variables override
 defaults when the corresponding CLI flag is not provided.
 
-The data directory is where verified input packages and later local sidecar
-state are stored.
+The data directory is where verified input packages and local sidecar state are
+stored. Local round state is stored in `sidecar.db`; verified packages are
+stored under `packages/`.
 
 Example environment files are provided for devnet and testnet:
 
@@ -88,7 +89,83 @@ files directly, which keeps the runtime dependency set small. Use
 You can also select devnet without an env file:
 
 ```bash
-validator-scoring-sidecar fetch-input-package --network devnet --round-id 123
+validator-scoring-sidecar sync --network devnet
+```
+
+## Sync Inputs
+
+Run one sync pass to discover and verify the newest unhandled public round with
+frozen input metadata:
+
+```bash
+validator-scoring-sidecar sync
+```
+
+The command calls `GET /api/scoring/rounds`, scans recent rounds newest first,
+skips rounds that do not expose `input_package_cid`, `input_package_hash`, and
+`input_frozen_at`, and reuses the same verified package fetch/cache path as
+`fetch-input-package`.
+
+By default, sync scans up to 5 recent rounds. Use `--round-limit` to scan
+farther back during recovery or debugging; the sidecar caps this at 20.
+
+Human-readable output:
+
+```text
+Sync status: input package ready
+Action: fetched
+Scanned rounds: 3
+Round ID: 123
+Round number: 123
+Network: testnet
+Input package CID: Qm...
+Input package hash: 0123...
+Input frozen at: 2026-05-25T00:00:00+00:00
+Source: https
+Cache status: fetched
+Verified files: 9
+Local path: /home/validator/.postfiat/validator-scoring-sidecar/testnet/packages/0123...
+```
+
+Machine-readable output:
+
+```bash
+validator-scoring-sidecar sync --json
+```
+
+```json
+{
+  "action": "fetched",
+  "scanned_rounds": 3,
+  "network": "testnet",
+  "package": {
+    "cached": false,
+    "input_frozen_at": "2026-05-25T00:00:00+00:00",
+    "input_package_cid": "Qm...",
+    "input_package_hash": "0123...",
+    "local_path": "/home/validator/.postfiat/validator-scoring-sidecar/testnet/packages/0123...",
+    "network": "testnet",
+    "round_id": 123,
+    "round_number": 123,
+    "source": "https",
+    "verified_file_count": 9
+  },
+  "round_id": 123,
+  "round_number": 123,
+  "status": "input_package_ready"
+}
+```
+
+If no recent unhandled round exposes frozen input metadata, sync exits `0` with
+`no_eligible_round` status. Sync uses a local advisory lock under the data
+directory so overlapping cron or manual runs do not mutate the same state at
+the same time.
+
+If sync reports that a previously verified package cache failed verification,
+repair it by refetching the known round directly:
+
+```bash
+validator-scoring-sidecar fetch-input-package --round-id 123 --force
 ```
 
 ## Fetch An Input Package
@@ -179,10 +256,11 @@ validator-scoring-sidecar fetch-input-package --round-id 123 --force
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Frozen input metadata was found and printed. |
+| `0` | Command completed successfully, including sync no-op cases. |
 | `1` | Expected operator-facing failure, such as missing frozen input metadata or package verification failure. |
 | `2` | CLI usage or configuration error. |
 | `3` | Network, HTTP, malformed metadata, or response decoding error from the scoring service or package source. |
+| `4` | Sync lock was already held by another sidecar run. |
 
 ## Development
 
@@ -196,5 +274,6 @@ python -m pytest
 ```
 
 The tests use mocked HTTP and cover config precedence, round URL construction,
-round metadata parsing, missing frozen-input metadata behavior, verified package
-fetching, cache behavior, source selection, and CLI output modes.
+round discovery, round metadata parsing, missing frozen-input metadata behavior,
+verified package fetching, cache behavior, source selection, SQLite state,
+local locking, and CLI output modes.

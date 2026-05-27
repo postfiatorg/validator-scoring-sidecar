@@ -26,11 +26,21 @@ from validator_scoring_sidecar.scoring_client import (
     ScoringClient,
     ScoringClientError,
 )
+from validator_scoring_sidecar.state import SidecarStateError
+from validator_scoring_sidecar.sync import (
+    DEFAULT_SYNC_ROUND_LIMIT,
+    MAX_SYNC_ROUND_LIMIT,
+    SyncLockError,
+    SyncResult,
+    SyncSetupError,
+    sync_input_package,
+)
 
 EXIT_OK = 0
 EXIT_OPERATOR_ERROR = 1
 EXIT_USAGE_ERROR = 2
 EXIT_NETWORK_ERROR = 3
+EXIT_LOCKED = 4
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -67,42 +77,76 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Package retrieval source. Defaults to auto.",
     )
+    _add_common_config_arguments(fetch)
     fetch.add_argument(
+        "--force",
+        action="store_true",
+        help="Refetch and replace an existing verified package cache.",
+    )
+    _add_json_argument(fetch)
+    fetch.set_defaults(handler=fetch_input_package)
+
+    sync = subparsers.add_parser(
+        "sync",
+        help="Discover and verify the newest unhandled frozen input package.",
+    )
+    sync.add_argument(
+        "--source",
+        choices=PACKAGE_SOURCE_CHOICES,
+        default="auto",
+        help="Package retrieval source. Defaults to auto.",
+    )
+    sync.add_argument(
+        "--round-limit",
+        type=_round_limit,
+        default=DEFAULT_SYNC_ROUND_LIMIT,
+        help=(
+            "Number of recent rounds to inspect for eligible frozen input "
+            f"metadata. Defaults to {DEFAULT_SYNC_ROUND_LIMIT}."
+        ),
+    )
+    _add_common_config_arguments(sync)
+    _add_json_argument(sync)
+    sync.set_defaults(handler=sync_input_packages)
+    return parser
+
+
+def _add_common_config_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
         "--base-url",
         help="Scoring service base URL. Overrides POSTFIAT_SCORING_BASE_URL.",
     )
-    fetch.add_argument(
+    parser.add_argument(
         "--data-dir",
         help="Local sidecar data directory. Overrides POSTFIAT_SIDECAR_DATA_DIR.",
     )
-    fetch.add_argument(
+    parser.add_argument(
         "--ipfs-gateway-url",
         help=(
             "IPFS gateway URL prefix. Overrides "
             "POSTFIAT_SIDECAR_IPFS_GATEWAY_URL."
         ),
     )
-    fetch.add_argument(
+    parser.add_argument(
         "--network",
         help="Network label. Overrides POSTFIAT_SIDECAR_NETWORK.",
     )
-    fetch.add_argument(
+    parser.add_argument(
         "--timeout",
         type=float,
-        help="HTTP request timeout in seconds. Overrides POSTFIAT_SIDECAR_TIMEOUT_SECONDS.",
+        help=(
+            "HTTP request timeout in seconds. Overrides "
+            "POSTFIAT_SIDECAR_TIMEOUT_SECONDS."
+        ),
     )
-    fetch.add_argument(
-        "--force",
-        action="store_true",
-        help="Refetch and replace an existing verified package cache.",
-    )
-    fetch.add_argument(
+
+
+def _add_json_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON.",
     )
-    fetch.set_defaults(handler=fetch_input_package)
-    return parser
 
 
 def fetch_input_package(args: argparse.Namespace) -> int:
@@ -150,6 +194,68 @@ def fetch_input_package(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def sync_input_packages(args: argparse.Namespace) -> int:
+    config = load_config(
+        base_url=args.base_url,
+        data_dir=args.data_dir,
+        ipfs_gateway_url=args.ipfs_gateway_url,
+        network=args.network,
+        timeout_seconds=args.timeout,
+    )
+    client = ScoringClient(config)
+    try:
+        result = sync_input_package(
+            config,
+            client,
+            source=args.source,
+            round_limit=args.round_limit,
+        )
+    except SyncLockError as exc:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "status": "locked",
+                        "network": config.network,
+                        "lock_path": str(exc.lock_path),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            _print_error(str(exc))
+        return EXIT_LOCKED
+    except SyncSetupError as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except MissingFrozenInputMetadata as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except RoundMetadataError as exc:
+        _print_error(f"Malformed round metadata: {exc}")
+        return EXIT_NETWORK_ERROR
+    except (
+        InputPackageVerificationError,
+        InputPackageCacheError,
+        SidecarStateError,
+    ) as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except (InputPackageDownloadError, ScoringClientError) as exc:
+        _print_error(str(exc))
+        return EXIT_NETWORK_ERROR
+    finally:
+        client.close()
+
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(_format_sync_result(result))
+
+    return EXIT_OK
+
+
 def _format_fetched_input_package(fetched_package: FetchedInputPackage) -> str:
     cache_status = "reused" if fetched_package.cached else "fetched"
     return "\n".join(
@@ -168,6 +274,25 @@ def _format_fetched_input_package(fetched_package: FetchedInputPackage) -> str:
     )
 
 
+def _format_sync_result(result: SyncResult) -> str:
+    if result.package is None:
+        return "\n".join(
+            [
+                "Sync status: no eligible round",
+                f"Network: {result.network}",
+                f"Scanned rounds: {result.scanned_rounds}",
+            ]
+        )
+    return "\n".join(
+        [
+            "Sync status: input package ready",
+            f"Action: {result.action}",
+            f"Scanned rounds: {result.scanned_rounds}",
+            _format_fetched_input_package(result.package),
+        ]
+    )
+
+
 def _positive_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -175,6 +300,13 @@ def _positive_int(value: str) -> int:
         _argparse_error("must be an integer")
     if parsed <= 0:
         _argparse_error("must be greater than zero")
+    return parsed
+
+
+def _round_limit(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > MAX_SYNC_ROUND_LIMIT:
+        _argparse_error(f"must be less than or equal to {MAX_SYNC_ROUND_LIMIT}")
     return parsed
 
 

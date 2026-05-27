@@ -9,7 +9,6 @@ import httpx
 
 from validator_scoring_sidecar.config import SidecarConfig
 
-
 class ScoringClientError(RuntimeError):
     """Base error for scoring service client failures."""
 
@@ -59,6 +58,16 @@ class ScoringClient:
             raise ValueError("round_id must be greater than zero")
         return f"{self._config.scoring_base_url}/api/scoring/rounds/{round_id}"
 
+    def rounds_url(self, *, limit: int, offset: int = 0) -> str:
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
+        if offset < 0:
+            raise ValueError("offset must be greater than or equal to zero")
+        return (
+            f"{self._config.scoring_base_url}/api/scoring/rounds"
+            f"?limit={limit}&offset={offset}"
+        )
+
     def input_package_file_url(self, round_number: int, file_path: str) -> str:
         if round_number <= 0:
             raise ValueError("round_number must be greater than zero")
@@ -88,6 +97,28 @@ class ScoringClient:
                 f"{self.round_url(round_id)}"
             )
         return payload
+
+    def fetch_rounds(self, *, limit: int, offset: int = 0) -> list[dict[str, Any]]:
+        """Fetch recent public scoring round metadata records, newest first."""
+
+        url = self.rounds_url(limit=limit, offset=offset)
+        payload = self._fetch_json(url, service_name="Scoring service")
+        if not isinstance(payload, dict):
+            raise ScoringResponseError(
+                "Scoring service returned a non-object JSON body for "
+                f"{url}"
+            )
+
+        rounds = payload.get("rounds")
+        if not isinstance(rounds, list):
+            raise ScoringResponseError(
+                f"Scoring service response for {url} is missing a rounds list"
+            )
+        if any(not isinstance(round_payload, dict) for round_payload in rounds):
+            raise ScoringResponseError(
+                f"Scoring service response for {url} contains a non-object round"
+            )
+        return rounds
 
     def fetch_input_package_file(
         self,

@@ -6,6 +6,7 @@ from validator_scoring_sidecar.scoring_client import (
     ScoringClient,
     ScoringHTTPError,
     ScoringNetworkError,
+    ScoringResponseError,
 )
 
 
@@ -19,6 +20,14 @@ def test_round_url_uses_scoring_endpoint_path():
     assert (
         client.round_url(123)
         == "https://scoring.example.org/api/scoring/rounds/123"
+    )
+
+
+def test_rounds_url_uses_scoring_endpoint_path_and_query():
+    client = ScoringClient(_config(), http_client=httpx.Client())
+
+    assert client.rounds_url(limit=20, offset=5) == (
+        "https://scoring.example.org/api/scoring/rounds?limit=20&offset=5"
     )
 
 
@@ -50,6 +59,31 @@ def test_fetch_round_returns_json_payload():
     client = ScoringClient(_config(), http_client=http_client)
 
     assert client.fetch_round(123) == {"id": 123}
+
+
+def test_fetch_rounds_returns_round_payloads():
+    def handler(request):
+        assert request.url.path == "/api/scoring/rounds"
+        assert request.url.params["limit"] == "20"
+        assert request.url.params["offset"] == "0"
+        return httpx.Response(200, json={"rounds": [{"id": 123}], "total": 1})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = ScoringClient(_config(), http_client=http_client)
+
+    assert client.fetch_rounds(limit=20) == [{"id": 123}]
+
+
+def test_fetch_rounds_rejects_malformed_payload():
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"items": []})
+        )
+    )
+    client = ScoringClient(_config(), http_client=http_client)
+
+    with pytest.raises(ScoringResponseError, match="missing a rounds list"):
+        client.fetch_rounds(limit=20)
 
 
 def test_fetch_round_raises_for_http_error():

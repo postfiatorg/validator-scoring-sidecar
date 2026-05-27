@@ -1,7 +1,8 @@
 # Usage
 
-This sidecar currently has one main command:
+This sidecar currently has two input-package commands:
 
+- sync the newest unhandled frozen input package for automation;
 - fetch, verify, and cache a frozen input package for a known round.
 
 It does not score validators, run inference, watch chain activity, submit memos,
@@ -20,13 +21,13 @@ python -m pip install -e ".[dev]"
 Testnet is the default:
 
 ```bash
-validator-scoring-sidecar fetch-input-package --round-id 123
+validator-scoring-sidecar sync
 ```
 
 Use devnet explicitly when needed:
 
 ```bash
-validator-scoring-sidecar fetch-input-package --round-id 268 --network devnet
+validator-scoring-sidecar sync --network devnet
 ```
 
 You can also load an env file:
@@ -44,7 +45,51 @@ Devnet and testnet both use the shared IPFS gateway:
 https://ipfs-testnet.postfiat.org/ipfs
 ```
 
+## Sync Inputs
+
+Use sync for normal unattended operation:
+
+```bash
+validator-scoring-sidecar sync --network devnet --json
+```
+
+Sync checks recent scoring rounds, finds the newest unhandled round with frozen
+input metadata, fetches and verifies its input package, caches it locally, and
+records local state in SQLite.
+
+By default, sync scans up to 5 recent rounds. Use `--round-limit` only for
+recovery or debugging; the maximum is 20.
+
+If there is nothing new to do, sync exits successfully with `no_eligible_round`
+status. This makes repeated cron runs safe.
+
+If sync reports that an existing verified cache is corrupt, refetch the known
+round directly:
+
+```bash
+validator-scoring-sidecar fetch-input-package \
+  --round-id 268 \
+  --network devnet \
+  --force
+```
+
+The sidecar stores local state here:
+
+```text
+{data_dir}/sidecar.db
+```
+
+It also uses a local lock file so overlapping runs do not update the same state
+at the same time:
+
+```text
+{data_dir}/sidecar.lock
+```
+
 ## Fetch An Input Package
+
+Use `fetch-input-package` when you already know the scoring service round id or
+when you want to debug one round directly.
 
 Use a throwaway data directory while testing locally:
 
@@ -140,5 +185,6 @@ Show CLI help:
 
 ```bash
 validator-scoring-sidecar --help
+validator-scoring-sidecar sync --help
 validator-scoring-sidecar fetch-input-package --help
 ```
