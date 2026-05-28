@@ -28,3 +28,7 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 
+[tool.pyright]
+exclude = ["src/validator_scoring_sidecar/scoring/_vendor_source"]
+ignore = ["src/validator_scoring_sidecar/scoring/_vendor_source"]
+

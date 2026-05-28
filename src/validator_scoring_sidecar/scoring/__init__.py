@@ -27,26 +27,58 @@ import would change pydantic's runtime annotation resolution and break
 behavioral parity with the foundation modules; the asymmetry is deliberate to
 preserve byte-fidelity with the upstream.
 
+Foundation-equivalence identification
+-------------------------------------
+
+The foundation publishes ``code.parser.version`` and ``code.selector.version``
+in each round's execution manifest as the whole-repo deploy commit hash, not
+the commit where those specific files last changed. Identifying foundation
+equivalence by commit hash would refuse legitimate rounds whenever the
+foundation deploys any unrelated change. The sidecar therefore identifies
+foundation equivalence by the sha256 content hash of the foundation source
+files instead.
+
+``SUPPORTED_PARSER_CONTENT_HASHES`` and ``SUPPORTED_SELECTOR_CONTENT_HASHES``
+are the sha256 digests of the foundation's
+``scoring_service/services/response_parser.py`` and
+``scoring_service/services/unl_selector.py`` files at the commits the sidecar
+vendor was lifted from. The unadapted source files are checked into the
+``_vendor_source`` directory inside this package so the declared hashes are
+auditable: anyone can recompute the digests from disk and confirm they match
+the declared constants (``tests/test_scoring_provenance.py`` enforces this).
+
 Refresh procedure when the foundation updates parser or selector:
 
-1. Identify the new foundation commit on ``postfiatorg/dynamic-unl-scoring``
-   that updated ``scoring_service/services/response_parser.py`` or
-   ``scoring_service/services/unl_selector.py``.
-2. Copy the updated file(s) over ``parser.py`` / ``selector.py`` in this
-   package.
-3. Re-apply the local adaptations above so the modules remain self-contained.
-4. Add the new commit identifier to ``SCORING_CODE_VERSION`` as an additional
-   supported version. Do not remove the prior identifier yet.
-5. Keep the prior identifier in ``SCORING_CODE_VERSION`` until every devnet
-   and testnet round produced by the prior foundation commit has been
-   verified by the sidecar.
-6. Only then drop the prior identifier from ``SCORING_CODE_VERSION``.
+1. Fetch the new foundation ``response_parser.py`` and ``unl_selector.py``
+   from ``postfiatorg/dynamic-unl-scoring`` at the deployed branch
+   (``main``, ``devnet``, or ``testnet``).
+2. Compute sha256 of each file (mechanical; the CI workflow at
+   ``.github/workflows/vendor-freshness.yml`` does this automatically).
+3. If the new hash is already in the corresponding supported set, the
+   foundation did not actually change that file; no action.
+4. If a hash is new, diff the new file against the existing copy in
+   ``_vendor_source`` (human judgment). Two outcomes:
 
-``SCORING_CODE_VERSION`` is a frozenset of ``"git:<commit>"`` identifiers
-matching the format the foundation emits in the execution manifest's
-``code.parser.version`` and ``code.selector.version`` fields. The manifest
-compatibility checker fails closed when a round's parser or selector version
-falls outside this set.
+   - **Cosmetic** (comments, whitespace, refactor that preserves behavior):
+     replace the file in ``_vendor_source`` with the new content, re-apply
+     the local adaptations to ``parser.py`` / ``selector.py``, and add the
+     new hash to the supported set. Run the test suite to confirm behavior
+     is preserved.
+   - **Behavioral** (new field, new validation, changed control flow):
+     vendor refresh required. Copy the new file into ``_vendor_source``,
+     re-apply the local adaptations, and add the new hash to the supported
+     set. Keep the prior hash in the set until both devnet and testnet have
+     deployed the new foundation commit AND at least one round on each has
+     been successfully verified by a sidecar running the new vendor with no
+     manifest-incompatible errors. Only then drop the prior hash.
+
+The CI workflow ``.github/workflows/vendor-freshness.yml`` runs the
+mechanical part of this procedure on every push and pull request against
+``main``, ``devnet``, and ``testnet``. Drift on ``main`` is reported but
+non-blocking so day-to-day development is not gated on immediate vendor
+refresh. Drift on ``devnet`` or ``testnet`` fails the workflow because those
+branches map directly to deployed sidecar environments and must remain
+synchronized with the corresponding deployed foundation branch.
 """
 
 from validator_scoring_sidecar.scoring.parser import (
@@ -62,9 +94,14 @@ from validator_scoring_sidecar.scoring.selector import (
     select_unl,
 )
 
-SCORING_CODE_VERSION: frozenset[str] = frozenset(
+SUPPORTED_PARSER_CONTENT_HASHES: frozenset[str] = frozenset(
     {
-        "git:43bc6946d6991d0bbf7a1b75a7e326a7ab52411b",
+        "1eeeed7bee91d2e6e95039018074c5e30ba3e92dffaa16257e6e5dbd07a2f7f7",
+    }
+)
+SUPPORTED_SELECTOR_CONTENT_HASHES: frozenset[str] = frozenset(
+    {
+        "cdd65a60565ba5ac340b5be60421f770905fc461cefa770c71465a179c2ff9f2",
     }
 )
 
@@ -72,7 +109,8 @@ __all__ = [
     "DIMENSIONAL_FIELDS",
     "NetworkReport",
     "NetworkReportCategory",
-    "SCORING_CODE_VERSION",
+    "SUPPORTED_PARSER_CONTENT_HASHES",
+    "SUPPORTED_SELECTOR_CONTENT_HASHES",
     "ScoringResult",
     "UNLSelectionResult",
     "ValidatorScore",
