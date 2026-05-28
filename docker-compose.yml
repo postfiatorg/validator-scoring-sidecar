@@ -1,0 +1,18 @@
+services:
+  sidecar:
+    build: .
+    image: validator-scoring-sidecar:local
+    container_name: validator-scoring-sidecar
+    init: true
+    restart: unless-stopped
+    # .env is created from .env.testnet.example or .env.devnet.example.
+    env_file:
+      - .env
+    environment:
+      # Pinned to the mounted volume; overrides any host-style path in .env.
+      POSTFIAT_SIDECAR_DATA_DIR: /data
+    volumes:
+      - sidecar_data:/data
+
+volumes:
+  sidecar_data:
