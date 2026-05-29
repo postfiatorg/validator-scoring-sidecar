@@ -1,190 +1,108 @@
 # Usage
 
-This sidecar currently has two input-package commands:
+The validator-scoring-sidecar runs alongside your Post Fiat Ledger validator. It fetches and verifies the foundation's frozen input package for each scoring round and caches the result locally. This guide walks you through running it on devnet or testnet.
 
-- sync the newest unhandled frozen input package for automation;
-- fetch, verify, and cache a frozen input package for a known round.
+## What the sidecar does
 
-It does not score validators, run inference, watch chain activity, submit memos,
-or handle validator keys.
+- Discovers recent scoring rounds from the public Post Fiat scoring service.
+- Downloads the foundation's frozen input package for the latest unhandled round.
+- Verifies the package's `bundle.json` against `input_package_hash` and verifies every listed file using the canonical JSON hash rule.
+- Caches verified packages and records local round state in SQLite.
+
+## What the sidecar does NOT do
+
+The sidecar is convenience tooling, not a trust requirement. It does not currently run inference or score validators, hold validator keys, submit on-chain memos, watch chain history, publish convergence reports, or change Validator List authority. These capabilities will be added in later releases.
 
 ## Setup
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev]"
-```
+You need a host with Docker and Docker Compose.
 
-## Choose A Network
-
-Testnet is the default:
+Clone the repository:
 
 ```bash
-validator-scoring-sidecar sync
+git clone https://github.com/postfiatorg/validator-scoring-sidecar.git
+cd validator-scoring-sidecar
 ```
 
-Use devnet explicitly when needed:
+Pick a network. Testnet:
 
 ```bash
-validator-scoring-sidecar sync --network devnet
+cp .env.testnet.example .env
 ```
 
-You can also load an env file:
+Or devnet:
 
 ```bash
 cp .env.devnet.example .env
-set -a
-source .env
-set +a
 ```
 
-Devnet and testnet both use the shared IPFS gateway:
-
-```text
-https://ipfs-testnet.postfiat.org/ipfs
-```
-
-## Sync Inputs
-
-Use sync for normal unattended operation:
+Start the sidecar:
 
 ```bash
-validator-scoring-sidecar sync --network devnet --json
+docker compose up -d
 ```
 
-Sync checks recent scoring rounds, finds the newest unhandled round with frozen
-input metadata, fetches and verifies its input package, caches it locally, and
-records local state in SQLite.
+That's it. The container runs the sync loop in the background and persists verified packages plus state under a Docker named volume.
 
-By default, sync scans up to 5 recent rounds. Use `--round-limit` only for
-recovery or debugging; the maximum is 20.
+## Verifying a healthy first sync
 
-If there is nothing new to do, sync exits successfully with `no_eligible_round`
-status. This makes repeated cron runs safe.
-
-If sync reports that an existing verified cache is corrupt, refetch the known
-round directly:
+Watch the logs:
 
 ```bash
-validator-scoring-sidecar fetch-input-package \
-  --round-id 268 \
-  --network devnet \
-  --force
+docker compose logs -f sidecar
 ```
 
-The sidecar stores local state here:
+You should see lines like:
 
-```text
-{data_dir}/sidecar.db
+```
+2026-05-29T00:00:00+00:00 validator-scoring-sidecar: starting sync loop (interval=3600s)
+2026-05-29T00:00:02+00:00 validator-scoring-sidecar: sync completed; sleeping 3600s
 ```
 
-It also uses a local lock file so overlapping runs do not update the same state
-at the same time:
+A `sync completed` line means the first pass succeeded. Either it fetched a fresh round, or the scoring service had no eligible round to expose right now — both outcomes are normal. Foundation rounds happen on a weekly cadence.
 
-```text
-{data_dir}/sidecar.lock
-```
+## One-shot commands
 
-## Fetch An Input Package
-
-Use `fetch-input-package` when you already know the scoring service round id or
-when you want to debug one round directly.
-
-Use a throwaway data directory while testing locally:
+To fetch a specific round by its scoring-service ID (for example to test or to recover a known-bad cache entry):
 
 ```bash
-validator-scoring-sidecar fetch-input-package \
-  --round-id 268 \
-  --network devnet \
-  --data-dir /tmp/validator-sidecar-smoke
+docker compose run --rm sidecar fetch-input-package --round-id 268
 ```
 
-The default fetch mode tries HTTPS first and then IPFS if HTTPS fails.
+Add `--force` to refetch and replace an existing cached package.
 
-Force HTTPS:
+## Recovering from a corrupt cache
+
+If `sync` logs that a previously verified package failed verification, refetch the round directly with `--force`:
 
 ```bash
-validator-scoring-sidecar fetch-input-package \
-  --round-id 268 \
-  --network devnet \
-  --data-dir /tmp/validator-sidecar-smoke \
-  --source https
+docker compose run --rm sidecar fetch-input-package --round-id <id> --force
 ```
 
-Force IPFS:
+## Stopping the sidecar
 
 ```bash
-validator-scoring-sidecar fetch-input-package \
-  --round-id 268 \
-  --network devnet \
-  --data-dir /tmp/validator-sidecar-smoke-ipfs \
-  --source ipfs
+docker compose down
 ```
 
-JSON output:
+This stops and removes the container. The named volume holding verified packages and SQLite state remains, so a later `docker compose up -d` resumes where you left off. To remove the data too, pass `-v`:
 
 ```bash
-validator-scoring-sidecar fetch-input-package \
-  --round-id 268 \
-  --network devnet \
-  --data-dir /tmp/validator-sidecar-smoke \
-  --json
+docker compose down -v
 ```
 
-## Cache Location
+## Switching networks
 
-You do not need to pass `--data-dir` for normal use. If it is omitted, the
-sidecar uses:
-
-```text
-~/.postfiat/validator-scoring-sidecar/{network}
-```
-
-Examples:
-
-```text
-~/.postfiat/validator-scoring-sidecar/testnet
-~/.postfiat/validator-scoring-sidecar/devnet
-```
-
-The `/tmp/...` paths in this guide are only for local smoke tests where you do
-not want to write into your real sidecar cache.
-
-Verified packages are stored by input package hash:
-
-```text
-{data_dir}/packages/{input_package_hash}/
-```
-
-The sidecar also writes local metadata:
-
-```text
-{data_dir}/packages/{input_package_hash}/.sidecar/package.json
-```
-
-Use `--force` to refetch and replace an existing verified cache:
+Stop the stack, copy the other env example, and start again:
 
 ```bash
-validator-scoring-sidecar fetch-input-package \
-  --round-id 268 \
-  --network devnet \
-  --data-dir /tmp/validator-sidecar-smoke \
-  --force
+docker compose down
+cp .env.devnet.example .env   # or .env.testnet.example
+docker compose up -d
 ```
 
-## Development Checks
+The data volume retains state from the previous network. If you want a clean slate, also pass `-v` to `docker compose down`.
 
-Run tests:
+## Configuration
 
-```bash
-python -m pytest
-```
-
-Show CLI help:
-
-```bash
-validator-scoring-sidecar --help
-validator-scoring-sidecar sync --help
-validator-scoring-sidecar fetch-input-package --help
-```
+The setup above does not require editing any environment values. For the full list of variables, including advanced tunables you should normally leave at their defaults, see [`Configuration.md`](Configuration.md).
