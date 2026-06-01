@@ -3,6 +3,10 @@ import json
 import pytest
 
 from validator_scoring_sidecar import cli
+from validator_scoring_sidecar.deployment import (
+    DeploymentRecord,
+    ModalNotAvailableError,
+)
 from validator_scoring_sidecar.input_package import (
     FetchedInputPackage,
     InputPackageVerificationError,
@@ -12,6 +16,7 @@ from validator_scoring_sidecar.sync import SyncLockError, SyncResult
 
 class FakeClient:
     payload = None
+    rounds = None
     error = None
     last_config = None
 
@@ -23,6 +28,11 @@ class FakeClient:
         if self.error is not None:
             raise self.error
         return dict(self.payload)
+
+    def fetch_rounds(self, *, limit, offset=0):
+        if self.error is not None:
+            raise self.error
+        return [dict(payload) for payload in (self.rounds or [])]
 
     def close(self):
         pass
@@ -57,6 +67,7 @@ class FakePackageFetcher:
 @pytest.fixture(autouse=True)
 def fake_client(monkeypatch):
     FakeClient.payload = _payload()
+    FakeClient.rounds = None
     FakeClient.error = None
     FakeClient.last_config = None
     FakePackageFetcher.error = None
@@ -362,3 +373,187 @@ def test_sync_data_dir_file_fails_without_traceback(capsys, tmp_path):
     assert exit_code == 1
     assert "Failed to prepare sidecar sync lock" in captured.err
     assert "Traceback" not in captured.err
+
+
+def _deployment_record():
+    return DeploymentRecord(
+        mode="modal",
+        image="lmsysorg/sglang:nightly@sha256:" + "d" * 64,
+        gpu_class="H100",
+        tensor_parallelism=1,
+        launch_args=["--enable-deterministic-inference"],
+        environment={"SGLANG_FLASHINFER_WORKSPACE_SIZE": "2147483648"},
+        served_model_name="Qwen/Qwen3.6-27B-FP8",
+        model_revision="a" * 40,
+        endpoint_url="https://operator--app.modal.run",
+        deployed_at="2026-06-01T00:00:00+00:00",
+    )
+
+
+def _write_manifest(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"runtime": {}, "model": {}}), encoding="utf-8")
+    return manifest_path
+
+
+def test_deploy_modal_human_output(capsys, monkeypatch, tmp_path):
+    manifest_path = _write_manifest(tmp_path)
+    record = _deployment_record()
+
+    def fake_deploy(manifest, config, *, deployer, app_name):
+        return record
+
+    monkeypatch.setattr(cli, "deploy_modal_endpoint", fake_deploy)
+
+    exit_code = cli.main(
+        [
+            "deploy-modal",
+            "--manifest",
+            str(manifest_path),
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Mode: modal" in captured.out
+    assert "Endpoint URL: https://operator--app.modal.run" in captured.out
+    assert "GPU class: H100" in captured.out
+    assert str(tmp_path / "runtime" / "deployment_record.json") in captured.out
+    assert captured.err == ""
+
+
+def test_deploy_modal_json_output(capsys, monkeypatch, tmp_path):
+    manifest_path = _write_manifest(tmp_path)
+    record = _deployment_record()
+
+    monkeypatch.setattr(
+        cli,
+        "deploy_modal_endpoint",
+        lambda manifest, config, *, deployer, app_name: record,
+    )
+
+    exit_code = cli.main(
+        [
+            "deploy-modal",
+            "--manifest",
+            str(manifest_path),
+            "--data-dir",
+            str(tmp_path),
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out) == record.as_dict()
+    assert captured.err == ""
+
+
+def test_deploy_modal_rejects_round_id_with_manifest(capsys, tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "deploy-modal",
+                "--round-id",
+                "123",
+                "--manifest",
+                str(tmp_path / "manifest.json"),
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_deploy_modal_error_exits_operator_error(capsys, monkeypatch, tmp_path):
+    manifest_path = _write_manifest(tmp_path)
+
+    def fake_deploy(manifest, config, *, deployer, app_name):
+        raise ModalNotAvailableError("no Modal login found; run `modal setup`")
+
+    monkeypatch.setattr(cli, "deploy_modal_endpoint", fake_deploy)
+
+    exit_code = cli.main(
+        [
+            "deploy-modal",
+            "--manifest",
+            str(manifest_path),
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "no Modal login" in captured.err
+    assert captured.out == ""
+
+
+def test_deploy_modal_round_id_loads_package_manifest(capsys, monkeypatch, tmp_path):
+    runtime_dir = tmp_path / "packages" / ("a" * 64) / "runtime"
+    runtime_dir.mkdir(parents=True)
+    manifest = {"runtime": {"kind": "modal_sglang"}, "model": {"provider": "huggingface"}}
+    (runtime_dir / "execution_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    seen = {}
+
+    def fake_deploy(loaded_manifest, config, *, deployer, app_name):
+        seen["manifest"] = loaded_manifest
+        return _deployment_record()
+
+    monkeypatch.setattr(cli, "deploy_modal_endpoint", fake_deploy)
+
+    exit_code = cli.main(
+        [
+            "deploy-modal",
+            "--round-id",
+            "123",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert seen["manifest"] == manifest
+    assert captured.err == ""
+
+
+def test_deploy_modal_defaults_to_latest_round(capsys, monkeypatch, tmp_path):
+    runtime_dir = tmp_path / "packages" / ("a" * 64) / "runtime"
+    runtime_dir.mkdir(parents=True)
+    manifest = {"runtime": {"kind": "modal_sglang"}, "model": {"provider": "huggingface"}}
+    (runtime_dir / "execution_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    FakeClient.rounds = [
+        _payload(id=200, round_number=500, input_package_hash=None),
+        _payload(id=199, round_number=499),
+    ]
+    seen = {}
+
+    def fake_deploy(loaded_manifest, config, *, deployer, app_name):
+        seen["manifest"] = loaded_manifest
+        return _deployment_record()
+
+    monkeypatch.setattr(cli, "deploy_modal_endpoint", fake_deploy)
+
+    exit_code = cli.main(["deploy-modal", "--data-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert seen["manifest"] == manifest
+    assert captured.err == ""
+
+
+def test_deploy_modal_no_eligible_round_exits_operator_error(capsys, tmp_path):
+    FakeClient.rounds = [_payload(id=200, input_package_cid=None)]
+
+    exit_code = cli.main(["deploy-modal", "--data-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "no recent round exposes a frozen input package" in captured.err
+    assert captured.out == ""

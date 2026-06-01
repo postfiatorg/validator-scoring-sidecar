@@ -6,9 +6,20 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 from typing import NoReturn
 
 from validator_scoring_sidecar.config import ConfigError, load_config
+from validator_scoring_sidecar.deployment import (
+    DeploymentError,
+    DeploymentRecord,
+    deploy_modal_endpoint,
+    deployment_record_path,
+    load_round_manifest,
+    read_manifest_file,
+    select_latest_deployable_round,
+)
+from validator_scoring_sidecar.modal_deployer import RealModalDeployer
 from validator_scoring_sidecar.input_package import (
     PACKAGE_SOURCE_CHOICES,
     FetchedInputPackage,
@@ -108,6 +119,46 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_config_arguments(sync)
     _add_json_argument(sync)
     sync.set_defaults(handler=sync_input_packages)
+
+    deploy = subparsers.add_parser(
+        "deploy-modal",
+        help="Deploy a manifest-pinned Modal inference endpoint and record it.",
+    )
+    deploy_source = deploy.add_mutually_exclusive_group(required=False)
+    deploy_source.add_argument(
+        "--round-id",
+        type=_positive_int,
+        help=(
+            "Scoring service round ID whose frozen manifest to deploy from. "
+            "Defaults to the latest eligible round when omitted."
+        ),
+    )
+    deploy_source.add_argument(
+        "--manifest",
+        help="Path to an execution_manifest.json to deploy from directly.",
+    )
+    deploy.add_argument(
+        "--source",
+        choices=PACKAGE_SOURCE_CHOICES,
+        default="auto",
+        help="Package retrieval source for round fetches. Defaults to auto.",
+    )
+    deploy.add_argument(
+        "--round-limit",
+        type=_round_limit,
+        default=DEFAULT_SYNC_ROUND_LIMIT,
+        help=(
+            "Recent rounds to scan when neither --round-id nor --manifest is "
+            f"given. Defaults to {DEFAULT_SYNC_ROUND_LIMIT}."
+        ),
+    )
+    deploy.add_argument(
+        "--app-name",
+        help="Modal app name to deploy under. Defaults to a per-network name.",
+    )
+    _add_common_config_arguments(deploy)
+    _add_json_argument(deploy)
+    deploy.set_defaults(handler=deploy_modal_command)
     return parser
 
 
@@ -254,6 +305,90 @@ def sync_input_packages(args: argparse.Namespace) -> int:
         print(_format_sync_result(result))
 
     return EXIT_OK
+
+
+def deploy_modal_command(args: argparse.Namespace) -> int:
+    config = load_config(
+        base_url=args.base_url,
+        data_dir=args.data_dir,
+        ipfs_gateway_url=args.ipfs_gateway_url,
+        network=args.network,
+        timeout_seconds=args.timeout,
+    )
+    try:
+        manifest = _load_deploy_manifest(args, config)
+        record = deploy_modal_endpoint(
+            manifest,
+            config,
+            deployer=RealModalDeployer(),
+            app_name=args.app_name,
+        )
+    except MissingFrozenInputMetadata as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except RoundMetadataError as exc:
+        _print_error(f"Malformed round metadata: {exc}")
+        return EXIT_NETWORK_ERROR
+    except (InputPackageVerificationError, InputPackageCacheError) as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except (InputPackageDownloadError, ScoringClientError) as exc:
+        _print_error(str(exc))
+        return EXIT_NETWORK_ERROR
+    except DeploymentError as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+
+    if args.json:
+        print(json.dumps(record.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(_format_deployment_record(record, config))
+
+    return EXIT_OK
+
+
+def _load_deploy_manifest(args: argparse.Namespace, config) -> dict:
+    if args.manifest is not None:
+        return read_manifest_file(Path(args.manifest))
+
+    client = ScoringClient(config)
+    try:
+        if args.round_id is not None:
+            payload = client.fetch_round(args.round_id)
+            metadata = RoundMetadata.from_api_payload(
+                payload,
+                requested_round_id=args.round_id,
+            )
+        else:
+            metadata = select_latest_deployable_round(
+                client.fetch_rounds(limit=args.round_limit)
+            )
+        fetched_package = fetch_verified_input_package(
+            metadata,
+            config,
+            client,
+            source=args.source,
+            force=False,
+        )
+    finally:
+        client.close()
+    return load_round_manifest(fetched_package.local_path)
+
+
+def _format_deployment_record(record: DeploymentRecord, config) -> str:
+    return "\n".join(
+        [
+            f"Mode: {record.mode}",
+            f"Endpoint URL: {record.endpoint_url}",
+            f"Image: {record.image}",
+            f"GPU class: {record.gpu_class}",
+            f"Tensor parallelism: {record.tensor_parallelism}",
+            f"Served model: {record.served_model_name}",
+            f"Model revision: {record.model_revision}",
+            f"Deployed at: {record.deployed_at}",
+            f"Record path: {deployment_record_path(config)}",
+        ]
+    )
 
 
 def _format_fetched_input_package(fetched_package: FetchedInputPackage) -> str:

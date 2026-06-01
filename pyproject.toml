@@ -17,6 +17,9 @@ dependencies = [
 dev = [
   "pytest>=8,<9",
 ]
+modal = [
+  "modal>=0.73",
+]
 
 [project.scripts]
 validator-scoring-sidecar = "validator_scoring_sidecar.cli:main"
@@ -29,6 +32,14 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.pyright]
-exclude = ["src/validator_scoring_sidecar/scoring/_vendor_source"]
-ignore = ["src/validator_scoring_sidecar/scoring/_vendor_source"]
+exclude = [
+  "src/validator_scoring_sidecar/scoring/_vendor_source",
+  "src/validator_scoring_sidecar/_modal_app.py",
+  "src/validator_scoring_sidecar/modal_deployer.py",
+]
+ignore = [
+  "src/validator_scoring_sidecar/scoring/_vendor_source",
+  "src/validator_scoring_sidecar/_modal_app.py",
+  "src/validator_scoring_sidecar/modal_deployer.py",
+]
 
