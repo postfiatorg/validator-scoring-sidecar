@@ -41,10 +41,15 @@ EXPECTED_CANONICAL_SEPARATORS = [",", ":"]
 BackendMode = Literal["modal", "local"]
 EffectiveMode = Literal["modal", "local", "local_unverified"]
 
+# The sidecar's own runtime kind per mode. The manifest always carries the
+# foundation's kind (modal_sglang); the sidecar reproduces the same engine on
+# Modal (modal_sglang) or locally (local_sglang). Compatibility is matched on
+# the engine, so the host placement (modal vs local) is allowed to differ.
 _MODE_RUNTIME_KIND: dict[str, str] = {
     "modal": "modal_sglang",
     "local": "local_sglang",
 }
+SUPPORTED_RUNTIME_ENGINE = "sglang"
 
 
 @dataclass(frozen=True)
@@ -266,15 +271,17 @@ def _check_runtime(
 ) -> Failure | None:
     runtime_section = manifest.get("runtime", {})
     deployment_mode = deployment_record["mode"]
-    expected_kind = _MODE_RUNTIME_KIND[deployment_mode]
+    sidecar_kind = _MODE_RUNTIME_KIND[deployment_mode]
 
-    if runtime_section.get("kind") != expected_kind:
+    manifest_kind = runtime_section.get("kind")
+    if _runtime_engine(manifest_kind) != SUPPORTED_RUNTIME_ENGINE:
         return _incompatible(
             "runtime.kind",
             (
-                f"manifest runtime.kind {runtime_section.get('kind')!r} does "
-                f"not match sidecar backend kind {expected_kind!r} "
-                f"(mode={deployment_mode})"
+                f"manifest runtime.kind {manifest_kind!r} is not compatible with "
+                f"the sidecar's {sidecar_kind!r} backend; only the "
+                f"{SUPPORTED_RUNTIME_ENGINE!r} engine is supported, with Modal or "
+                f"local hosting allowed to differ"
             ),
         )
 
@@ -585,6 +592,15 @@ def _is_full_commit_hash(value: Any) -> bool:
 
 def _has_image_digest(value: Any) -> bool:
     return isinstance(value, str) and "@sha256:" in value
+
+
+def _runtime_engine(kind: Any) -> str | None:
+    """Return the engine suffix of a runtime kind (e.g. ``modal_sglang`` →
+    ``sglang``), so Modal and local hosting of the same engine compare equal."""
+
+    if not isinstance(kind, str) or not kind:
+        return None
+    return kind.rpartition("_")[2] or kind
 
 
 def _incompatible(field_name: str, message: str) -> Failure:

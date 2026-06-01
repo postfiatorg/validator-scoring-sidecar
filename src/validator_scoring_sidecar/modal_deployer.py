@@ -22,8 +22,8 @@ from pathlib import Path
 from validator_scoring_sidecar.deployment import (
     ModalDeploymentError,
     ModalDeploymentResult,
-    ModalDeploymentSpec,
     ModalNotAvailableError,
+    RuntimeSpec,
 )
 
 APP_MODULE_PATH = Path(__file__).with_name("_modal_app.py")
@@ -53,11 +53,11 @@ ENV_MODEL_REVISION = "SIDECAR_MODAL_MODEL_REVISION"
 class RealModalDeployer:
     """Deploys the bundled Modal app under the operator's account."""
 
-    def deploy(self, spec: ModalDeploymentSpec) -> ModalDeploymentResult:
+    def deploy(self, spec: RuntimeSpec, *, app_name: str) -> ModalDeploymentResult:
         self._require_modal_installed()
         self._require_modal_login()
-        completed = self._run_modal_deploy(spec)
-        endpoint_url = self._resolve_endpoint_url(spec, completed.stdout)
+        completed = self._run_modal_deploy(spec, app_name)
+        endpoint_url = self._resolve_endpoint_url(app_name, completed.stdout)
         return ModalDeploymentResult(endpoint_url=endpoint_url)
 
     def _require_modal_installed(self) -> None:
@@ -73,12 +73,13 @@ class RealModalDeployer:
 
     def _run_modal_deploy(
         self,
-        spec: ModalDeploymentSpec,
+        spec: RuntimeSpec,
+        app_name: str,
     ) -> subprocess.CompletedProcess[str]:
         try:
             completed = subprocess.run(
                 ["modal", "deploy", str(APP_MODULE_PATH)],
-                env=self._deploy_environment(spec),
+                env=self._deploy_environment(spec, app_name),
                 capture_output=True,
                 text=True,
                 timeout=_DEPLOY_TIMEOUT_SECONDS,
@@ -94,13 +95,17 @@ class RealModalDeployer:
             raise ModalDeploymentError(self._deploy_failure_message(completed))
         return completed
 
-    def _deploy_environment(self, spec: ModalDeploymentSpec) -> dict[str, str]:
+    def _deploy_environment(
+        self,
+        spec: RuntimeSpec,
+        app_name: str,
+    ) -> dict[str, str]:
         import json
 
         environment = dict(os.environ)
         environment.update(
             {
-                ENV_APP_NAME: spec.app_name,
+                ENV_APP_NAME: app_name,
                 ENV_IMAGE: spec.image,
                 ENV_GPU: spec.gpu,
                 ENV_LAUNCH_COMMAND: json.dumps(spec.launch_command),
@@ -114,10 +119,10 @@ class RealModalDeployer:
 
     def _resolve_endpoint_url(
         self,
-        spec: ModalDeploymentSpec,
+        app_name: str,
         deploy_stdout: str,
     ) -> str:
-        url = self._lookup_endpoint_url(spec)
+        url = self._lookup_endpoint_url(app_name)
         if url:
             return url
         match = _WEB_URL_PATTERN.search(deploy_stdout or "")
@@ -125,14 +130,14 @@ class RealModalDeployer:
             return match.group(0)
         raise ModalDeploymentError(
             "deployment succeeded but no endpoint URL could be resolved; "
-            f"inspect the {spec.app_name!r} app with `modal app list`"
+            f"inspect the {app_name!r} app with `modal app list`"
         )
 
-    def _lookup_endpoint_url(self, spec: ModalDeploymentSpec) -> str | None:
+    def _lookup_endpoint_url(self, app_name: str) -> str | None:
         try:
             import modal
 
-            endpoint = modal.Cls.from_name(spec.app_name, ENDPOINT_CLASS_NAME)
+            endpoint = modal.Cls.from_name(app_name, ENDPOINT_CLASS_NAME)
             web_method = getattr(endpoint(), ENDPOINT_WEB_METHOD)
             return web_method.get_web_url()
         except Exception:

@@ -557,3 +557,74 @@ def test_deploy_modal_no_eligible_round_exits_operator_error(capsys, tmp_path):
     assert exit_code == 1
     assert "no recent round exposes a frozen input package" in captured.err
     assert captured.out == ""
+
+
+def _local_deployment_record():
+    return DeploymentRecord(
+        mode="local",
+        image="lmsysorg/sglang:nightly@sha256:" + "d" * 64,
+        gpu_class="H100",
+        tensor_parallelism=1,
+        launch_args=["--enable-deterministic-inference"],
+        environment={"SGLANG_FLASHINFER_WORKSPACE_SIZE": "2147483648"},
+        served_model_name="Qwen/Qwen3.6-27B-FP8",
+        model_revision="a" * 40,
+        endpoint_url="http://localhost:8000/v1",
+        deployed_at="2026-06-01T00:00:00+00:00",
+    )
+
+
+def test_start_sglang_human_output(capsys, monkeypatch, tmp_path):
+    manifest_path = _write_manifest(tmp_path)
+    record = _local_deployment_record()
+
+    def fake_start(manifest, config, *, starter, gpu_detector, port):
+        return record
+
+    monkeypatch.setattr(cli, "start_local_sglang_endpoint", fake_start)
+
+    exit_code = cli.main(
+        [
+            "start-sglang",
+            "--manifest",
+            str(manifest_path),
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Mode: local" in captured.out
+    assert "Endpoint URL: http://localhost:8000/v1" in captured.out
+    assert str(tmp_path / "runtime" / "deployment_record.json") in captured.out
+    assert captured.err == ""
+
+
+def test_start_sglang_gpu_mismatch_exits_operator_error(capsys, monkeypatch, tmp_path):
+    from validator_scoring_sidecar.deployment import GpuMismatchError
+
+    manifest_path = _write_manifest(tmp_path)
+
+    def fake_start(manifest, config, *, starter, gpu_detector, port):
+        raise GpuMismatchError(
+            "host GPU 'NVIDIA A100 80GB' does not match the manifest's pinned "
+            "GPU class 'H100'"
+        )
+
+    monkeypatch.setattr(cli, "start_local_sglang_endpoint", fake_start)
+
+    exit_code = cli.main(
+        [
+            "start-sglang",
+            "--manifest",
+            str(manifest_path),
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "does not match" in captured.err
+    assert captured.out == ""

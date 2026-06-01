@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import NoReturn
 
 from validator_scoring_sidecar.config import ConfigError, load_config
 from validator_scoring_sidecar.deployment import (
+    DEFAULT_LOCAL_PORT,
     DeploymentError,
     DeploymentRecord,
     deploy_modal_endpoint,
@@ -18,7 +19,9 @@ from validator_scoring_sidecar.deployment import (
     load_round_manifest,
     read_manifest_file,
     select_latest_deployable_round,
+    start_local_sglang_endpoint,
 )
+from validator_scoring_sidecar.local_runtime import RealLocalSglangStarter, detect_gpu
 from validator_scoring_sidecar.modal_deployer import RealModalDeployer
 from validator_scoring_sidecar.input_package import (
     PACKAGE_SOURCE_CHOICES,
@@ -159,6 +162,48 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_config_arguments(deploy)
     _add_json_argument(deploy)
     deploy.set_defaults(handler=deploy_modal_command)
+
+    start = subparsers.add_parser(
+        "start-sglang",
+        help="Start a manifest-pinned local SGLang endpoint and record it.",
+    )
+    start_source = start.add_mutually_exclusive_group(required=False)
+    start_source.add_argument(
+        "--round-id",
+        type=_positive_int,
+        help=(
+            "Scoring service round ID whose frozen manifest to start from. "
+            "Defaults to the latest eligible round when omitted."
+        ),
+    )
+    start_source.add_argument(
+        "--manifest",
+        help="Path to an execution_manifest.json to start from directly.",
+    )
+    start.add_argument(
+        "--source",
+        choices=PACKAGE_SOURCE_CHOICES,
+        default="auto",
+        help="Package retrieval source for round fetches. Defaults to auto.",
+    )
+    start.add_argument(
+        "--round-limit",
+        type=_round_limit,
+        default=DEFAULT_SYNC_ROUND_LIMIT,
+        help=(
+            "Recent rounds to scan when neither --round-id nor --manifest is "
+            f"given. Defaults to {DEFAULT_SYNC_ROUND_LIMIT}."
+        ),
+    )
+    start.add_argument(
+        "--port",
+        type=_positive_int,
+        default=DEFAULT_LOCAL_PORT,
+        help=f"Local port to serve SGLang on. Defaults to {DEFAULT_LOCAL_PORT}.",
+    )
+    _add_common_config_arguments(start)
+    _add_json_argument(start)
+    start.set_defaults(handler=start_sglang_command)
     return parser
 
 
@@ -308,6 +353,34 @@ def sync_input_packages(args: argparse.Namespace) -> int:
 
 
 def deploy_modal_command(args: argparse.Namespace) -> int:
+    return _run_runtime_command(
+        args,
+        lambda manifest, config: deploy_modal_endpoint(
+            manifest,
+            config,
+            deployer=RealModalDeployer(),
+            app_name=args.app_name,
+        ),
+    )
+
+
+def start_sglang_command(args: argparse.Namespace) -> int:
+    return _run_runtime_command(
+        args,
+        lambda manifest, config: start_local_sglang_endpoint(
+            manifest,
+            config,
+            starter=RealLocalSglangStarter(),
+            gpu_detector=detect_gpu,
+            port=args.port,
+        ),
+    )
+
+
+def _run_runtime_command(
+    args: argparse.Namespace,
+    produce_record: Callable[..., DeploymentRecord],
+) -> int:
     config = load_config(
         base_url=args.base_url,
         data_dir=args.data_dir,
@@ -317,12 +390,7 @@ def deploy_modal_command(args: argparse.Namespace) -> int:
     )
     try:
         manifest = _load_deploy_manifest(args, config)
-        record = deploy_modal_endpoint(
-            manifest,
-            config,
-            deployer=RealModalDeployer(),
-            app_name=args.app_name,
-        )
+        record = produce_record(manifest, config)
     except MissingFrozenInputMetadata as exc:
         _print_error(str(exc))
         return EXIT_OPERATOR_ERROR

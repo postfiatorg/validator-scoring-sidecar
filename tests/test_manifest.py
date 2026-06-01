@@ -156,11 +156,10 @@ def test_compatible_modal_round_passes():
     assert result.effective_mode == "modal"
 
 
-def test_compatible_local_round_passes_when_runtime_kind_aligned():
-    manifest = _manifest()
-    manifest["runtime"]["kind"] = "local_sglang"
-
-    result = _check(manifest, _deployment(mode="local"))
+def test_compatible_local_round_passes_against_modal_manifest():
+    # The foundation always stamps modal_sglang; a local sidecar runs the same
+    # engine locally, so it must pass against the real foundation manifest.
+    result = _check(deployment=_deployment(mode="local"))
 
     assert result.passed is True
     assert result.effective_mode == "local"
@@ -341,9 +340,13 @@ def test_revision_must_match_deployment():
 # ---------------------------------------------------------------------------
 
 
-def test_runtime_kind_must_match_backend_mode():
-    # Manifest says modal_sglang but operator is in local mode.
-    result = _check(deployment=_deployment(mode="local"))
+def test_runtime_kind_unsupported_engine_fails():
+    # A different inference engine the sidecar cannot reproduce is rejected,
+    # independent of host placement (modal vs local).
+    manifest = _manifest()
+    manifest["runtime"]["kind"] = "modal_vllm"
+
+    result = _check(manifest)
 
     assert result.failure.field == "runtime.kind"
 
@@ -389,23 +392,19 @@ def test_gpu_mismatch_in_modal_mode_cannot_be_acknowledged():
 
 
 def test_gpu_mismatch_in_local_mode_without_ack_fails():
-    manifest = _manifest()
-    manifest["runtime"]["kind"] = "local_sglang"
     deployment = _deployment(mode="local")
     deployment["gpu_class"] = "A100"
     deployment["gpu_mismatch_acknowledged"] = False
 
-    assert _check(manifest, deployment).failure.field == "runtime.gpu"
+    assert _check(deployment=deployment).failure.field == "runtime.gpu"
 
 
 def test_gpu_mismatch_in_local_mode_with_ack_passes_as_local_unverified():
-    manifest = _manifest()
-    manifest["runtime"]["kind"] = "local_sglang"
     deployment = _deployment(mode="local")
     deployment["gpu_class"] = "A100"
     deployment["gpu_mismatch_acknowledged"] = True
 
-    result = _check(manifest, deployment)
+    result = _check(deployment=deployment)
 
     assert result.passed is True
     assert result.effective_mode == "local_unverified"
@@ -414,13 +413,11 @@ def test_gpu_mismatch_in_local_mode_with_ack_passes_as_local_unverified():
 def test_gpu_mismatch_with_non_boolean_ack_value_still_fails():
     # `gpu_mismatch_acknowledged` is strictly compared to True; non-boolean
     # truthy values such as the string "true" do not count as acknowledged.
-    manifest = _manifest()
-    manifest["runtime"]["kind"] = "local_sglang"
     deployment = _deployment(mode="local")
     deployment["gpu_class"] = "A100"
     deployment["gpu_mismatch_acknowledged"] = "true"
 
-    assert _check(manifest, deployment).failure.field == "runtime.gpu"
+    assert _check(deployment=deployment).failure.field == "runtime.gpu"
 
 
 def test_launch_args_missing_deterministic_flag_in_manifest_fails():

@@ -4,6 +4,9 @@ import pytest
 
 from validator_scoring_sidecar.config import load_config
 from validator_scoring_sidecar.deployment import (
+    GpuMismatchError,
+    LocalRuntimeError,
+    LocalStartResult,
     ManifestRuntimeError,
     ModalDeploymentError,
     ModalDeploymentResult,
@@ -11,10 +14,13 @@ from validator_scoring_sidecar.deployment import (
     default_app_name,
     deploy_modal_endpoint,
     deployment_record_path,
-    extract_modal_spec,
+    extract_runtime_spec,
     load_round_manifest,
+    match_gpu_class,
     read_manifest_file,
+    resolve_model_path_args,
     select_latest_deployable_round,
+    start_local_sglang_endpoint,
 )
 from validator_scoring_sidecar.manifest import check_compatibility
 from validator_scoring_sidecar.scoring import (
@@ -25,16 +31,33 @@ from validator_scoring_sidecar.scoring import (
 IMAGE_REF = "lmsysorg/sglang:nightly-dev@sha256:" + "d" * 64
 MODEL_ID = "Qwen/Qwen3.6-27B-FP8"
 MODEL_REVISION = "a" * 40
+H100_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
 
 
 class FakeDeployer:
     def __init__(self, endpoint_url="https://operator--app.modal.run"):
         self.endpoint_url = endpoint_url
         self.spec = None
+        self.app_name = None
 
-    def deploy(self, spec):
+    def deploy(self, spec, *, app_name):
         self.spec = spec
+        self.app_name = app_name
         return ModalDeploymentResult(endpoint_url=self.endpoint_url)
+
+
+class FakeStarter:
+    def __init__(self, endpoint_url="http://localhost:8000/v1"):
+        self.endpoint_url = endpoint_url
+        self.spec = None
+        self.port = None
+        self.started = False
+
+    def start(self, spec, *, port):
+        self.started = True
+        self.spec = spec
+        self.port = port
+        return LocalStartResult(endpoint_url=self.endpoint_url)
 
 
 def _config(tmp_path):
@@ -105,10 +128,28 @@ def _manifest(**overrides):
     return manifest
 
 
-def test_extract_modal_spec_reads_runtime_and_model():
-    spec = extract_modal_spec(_manifest(), app_name="app")
+def _round_payload(**overrides):
+    payload = {
+        "id": 123,
+        "round_number": 456,
+        "status": "INPUT_FROZEN",
+        "input_package_cid": "QmInput",
+        "input_package_hash": "a" * 64,
+        "input_frozen_at": "2026-05-25T00:00:00+00:00",
+        "final_bundle_cid": None,
+    }
+    payload.update(overrides)
+    return payload
 
-    assert spec.app_name == "app"
+
+# ---------------------------------------------------------------------------
+# Runtime spec extraction (shared by Modal and local)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_runtime_spec_reads_runtime_and_model():
+    spec = extract_runtime_spec(_manifest())
+
     assert spec.image == IMAGE_REF
     assert spec.gpu == "H100"
     assert spec.tensor_parallelism == 1
@@ -123,37 +164,42 @@ def test_extract_modal_spec_reads_runtime_and_model():
 @pytest.mark.parametrize(
     "mutation",
     [
-        {"runtime": {"kind": "local_sglang"}},
+        {"runtime": {"kind": "modal_vllm"}},
         {"runtime": "not-an-object"},
         {"model": "not-an-object"},
     ],
 )
-def test_extract_modal_spec_rejects_structural_problems(mutation):
+def test_extract_runtime_spec_rejects_structural_problems(mutation):
     manifest = _manifest()
     manifest.update(mutation)
     with pytest.raises(ManifestRuntimeError):
-        extract_modal_spec(manifest, app_name="app")
+        extract_runtime_spec(manifest)
 
 
-def test_extract_modal_spec_requires_digest_pinned_image():
+def test_extract_runtime_spec_requires_digest_pinned_image():
     manifest = _manifest()
     manifest["runtime"]["image"] = "lmsysorg/sglang:nightly-dev"
     with pytest.raises(ManifestRuntimeError, match="@sha256:"):
-        extract_modal_spec(manifest, app_name="app")
+        extract_runtime_spec(manifest)
 
 
-def test_extract_modal_spec_requires_full_commit_revision():
+def test_extract_runtime_spec_requires_full_commit_revision():
     manifest = _manifest()
     manifest["model"]["revision"] = "main"
     with pytest.raises(ManifestRuntimeError, match="40-character"):
-        extract_modal_spec(manifest, app_name="app")
+        extract_runtime_spec(manifest)
 
 
-def test_extract_modal_spec_requires_deterministic_flag():
+def test_extract_runtime_spec_requires_deterministic_flag():
     manifest = _manifest()
     manifest["runtime"]["launch_args"] = ["--model-path", MODEL_ID]
     with pytest.raises(ManifestRuntimeError, match="enable-deterministic-inference"):
-        extract_modal_spec(manifest, app_name="app")
+        extract_runtime_spec(manifest)
+
+
+# ---------------------------------------------------------------------------
+# Modal deployment
+# ---------------------------------------------------------------------------
 
 
 def test_deploy_modal_endpoint_writes_record(tmp_path):
@@ -168,7 +214,7 @@ def test_deploy_modal_endpoint_writes_record(tmp_path):
         now="2026-06-01T00:00:00+00:00",
     )
 
-    assert deployer.spec.app_name == "my-app"
+    assert deployer.app_name == "my-app"
     assert record.mode == "modal"
     assert record.endpoint_url == "https://operator--app.modal.run"
     assert record.deployed_at == "2026-06-01T00:00:00+00:00"
@@ -183,8 +229,8 @@ def test_deploy_modal_endpoint_defaults_app_name_to_network(tmp_path):
 
     deploy_modal_endpoint(_manifest(), _config(tmp_path), deployer=deployer)
 
-    assert deployer.spec.app_name == default_app_name("testnet")
-    assert deployer.spec.app_name == "validator-scoring-sidecar-testnet"
+    assert deployer.app_name == default_app_name("testnet")
+    assert deployer.app_name == "validator-scoring-sidecar-testnet"
 
 
 def test_deploy_record_passes_compatibility_checker(tmp_path):
@@ -211,6 +257,120 @@ def test_deploy_modal_endpoint_rejects_empty_endpoint_url(tmp_path):
         )
 
 
+# ---------------------------------------------------------------------------
+# GPU matching and model-path resolution (local helpers)
+# ---------------------------------------------------------------------------
+
+
+def test_match_gpu_class_accepts_verbose_device_name():
+    assert match_gpu_class("H100", H100_DEVICE_NAME) == "H100"
+
+
+def test_match_gpu_class_rejects_different_gpu():
+    with pytest.raises(GpuMismatchError):
+        match_gpu_class("H100", "NVIDIA A100 80GB")
+
+
+@pytest.mark.parametrize("detected", ["", "   ", None])
+def test_match_gpu_class_rejects_missing_gpu(detected):
+    with pytest.raises(GpuMismatchError):
+        match_gpu_class("H100", detected)
+
+
+def test_resolve_model_path_args_space_form():
+    args = ["--model-path", MODEL_ID, "--tp", "1"]
+    assert resolve_model_path_args(args, "/snap") == ["--model-path", "/snap", "--tp", "1"]
+
+
+def test_resolve_model_path_args_equals_form():
+    args = [f"--model-path={MODEL_ID}", "--tp", "1"]
+    assert resolve_model_path_args(args, "/snap") == ["--model-path=/snap", "--tp", "1"]
+
+
+def test_resolve_model_path_args_appends_when_absent():
+    args = ["--tp", "1"]
+    assert resolve_model_path_args(args, "/snap") == ["--tp", "1", "--model-path", "/snap"]
+
+
+# ---------------------------------------------------------------------------
+# Local SGLang startup
+# ---------------------------------------------------------------------------
+
+
+def test_start_local_sglang_endpoint_writes_local_record(tmp_path):
+    config = _config(tmp_path)
+    starter = FakeStarter()
+
+    record = start_local_sglang_endpoint(
+        _manifest(),
+        config,
+        starter=starter,
+        gpu_detector=lambda: H100_DEVICE_NAME,
+        port=8000,
+        now="2026-06-01T00:00:00+00:00",
+    )
+
+    assert starter.port == 8000
+    assert record.mode == "local"
+    assert record.gpu_class == "H100"
+    assert record.endpoint_url == "http://localhost:8000/v1"
+    assert record.deployed_at == "2026-06-01T00:00:00+00:00"
+
+    path = deployment_record_path(config)
+    assert json.loads(path.read_text(encoding="utf-8")) == record.as_dict()
+
+
+def test_start_local_record_passes_compatibility_checker(tmp_path):
+    manifest = _manifest()
+
+    record = start_local_sglang_endpoint(
+        manifest,
+        _config(tmp_path),
+        starter=FakeStarter(),
+        gpu_detector=lambda: H100_DEVICE_NAME,
+    )
+
+    result = check_compatibility(
+        manifest,
+        record.as_dict(),
+        sidecar_network="testnet",
+        expected_round_number=456,
+    )
+    assert result.passed
+    assert result.effective_mode == "local"
+
+
+def test_start_local_refuses_and_skips_start_on_gpu_mismatch(tmp_path):
+    config = _config(tmp_path)
+    starter = FakeStarter()
+
+    with pytest.raises(GpuMismatchError):
+        start_local_sglang_endpoint(
+            _manifest(),
+            config,
+            starter=starter,
+            gpu_detector=lambda: "NVIDIA A100 80GB",
+        )
+
+    assert starter.started is False
+    assert not deployment_record_path(config).exists()
+
+
+def test_start_local_rejects_empty_endpoint_url(tmp_path):
+    with pytest.raises(LocalRuntimeError):
+        start_local_sglang_endpoint(
+            _manifest(),
+            _config(tmp_path),
+            starter=FakeStarter(endpoint_url="   "),
+            gpu_detector=lambda: H100_DEVICE_NAME,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Manifest loading and round selection
+# ---------------------------------------------------------------------------
+
+
 def test_load_round_manifest_reads_from_verified_package(tmp_path):
     package_path = tmp_path / "packages" / ("a" * 64)
     runtime_dir = package_path / "runtime"
@@ -234,20 +394,6 @@ def test_read_manifest_file_invalid_json_raises(tmp_path):
     path.write_text("{not json", encoding="utf-8")
     with pytest.raises(ManifestRuntimeError, match="not valid JSON"):
         read_manifest_file(path)
-
-
-def _round_payload(**overrides):
-    payload = {
-        "id": 123,
-        "round_number": 456,
-        "status": "INPUT_FROZEN",
-        "input_package_cid": "QmInput",
-        "input_package_hash": "a" * 64,
-        "input_frozen_at": "2026-05-25T00:00:00+00:00",
-        "final_bundle_cid": None,
-    }
-    payload.update(overrides)
-    return payload
 
 
 def test_select_latest_deployable_round_picks_newest_eligible():
