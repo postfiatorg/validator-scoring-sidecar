@@ -5,9 +5,11 @@ import pytest
 
 from validator_scoring_sidecar.failure import FailureCategory
 from validator_scoring_sidecar.inference import (
+    BACKEND_MODE_LOCAL,
     BACKEND_MODE_MODAL,
     InferenceConfigError,
     InferenceError,
+    LocalSglangBackend,
     ModalBackend,
     ModelRequestError,
     load_model_request,
@@ -246,3 +248,90 @@ def test_load_model_request_invalid_json_raises(tmp_path):
 
     with pytest.raises(ModelRequestError, match="not valid JSON"):
         load_model_request(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Local SGLang backend
+# ---------------------------------------------------------------------------
+
+
+def _local_backend(handler, endpoint=None):
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    if endpoint is None:
+        return LocalSglangBackend(http_client=client)
+    return LocalSglangBackend(endpoint, http_client=client)
+
+
+def test_local_backend_mode_is_local():
+    assert (
+        LocalSglangBackend(http_client=httpx.Client()).backend_mode
+        == BACKEND_MODE_LOCAL
+    )
+
+
+def test_local_run_forwards_request_and_sends_no_proxy_auth():
+    captured = {}
+
+    def handler(request):
+        captured["path"] = request.url.path
+        captured["headers"] = request.headers
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_completion("LOCAL OUTPUT"))
+
+    result = _local_backend(handler).run(_model_request())
+
+    assert captured["path"] == "/v1/chat/completions"
+    # The local server is not proxy-auth protected; no Modal credentials are sent.
+    assert "Modal-Key" not in captured["headers"]
+    assert "Modal-Secret" not in captured["headers"]
+    # Byte-identical request body to the Modal path: method dropped, extra_body merged.
+    assert captured["body"] == {
+        "model": "Qwen/Qwen3.6-27B-FP8",
+        "messages": [{"role": "user", "content": "score validators"}],
+        "temperature": 0,
+        "max_tokens": 16384,
+        "response_format": {"type": "json_object"},
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    assert result.content == "LOCAL OUTPUT"
+
+
+def test_local_default_endpoint_targets_localhost():
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json=_completion())
+
+    _local_backend(handler).run(_model_request())
+
+    assert captured["url"] == "http://localhost:8000/v1/chat/completions"
+
+
+def test_local_timeout_maps_to_inference_timeout():
+    def handler(request):
+        raise httpx.ReadTimeout("slow", request=request)
+
+    with pytest.raises(InferenceError) as exc_info:
+        _local_backend(handler).run(_model_request())
+
+    assert exc_info.value.category == FailureCategory.INFERENCE_TIMEOUT
+
+
+def test_local_connection_error_maps_to_runtime_unavailable():
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(InferenceError) as exc_info:
+        _local_backend(handler).run(_model_request())
+
+    assert exc_info.value.category == FailureCategory.RUNTIME_UNAVAILABLE
+
+
+def test_local_http_error_status_maps_to_inference_error():
+    with pytest.raises(InferenceError) as exc_info:
+        _local_backend(lambda request: httpx.Response(503, json={"error": "x"})).run(
+            _model_request()
+        )
+
+    assert exc_info.value.category == FailureCategory.INFERENCE_ERROR

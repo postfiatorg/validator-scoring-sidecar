@@ -1,21 +1,23 @@
 """Inference backends that re-run a frozen scoring round on validator hardware.
 
 The sidecar reproduces a scoring round by sending the round's frozen
-``inputs/model_request.json`` to an inference endpoint the operator deployed
+``inputs/model_request.json`` to an inference endpoint the operator stood up
 (see ``deployment.py`` and ``docs/Deployment.md``) and capturing the raw model
 response. The request is submitted exactly as the foundation froze it — the
 same fields, no normalization or default-filling — so the response is a
 faithful independent reproduction that a later stage can compare against the
 foundation's output.
 
-``ModalBackend`` is the first backend; a local SGLang backend will implement
-the same ``InferenceBackend`` interface later. It talks to the endpoint's
-OpenAI-compatible ``POST /v1/chat/completions`` route over HTTP, mirroring the
-foundation's ``ModalClient.score_request`` wire behavior (same request fields,
-``Modal-Key`` / ``Modal-Secret`` proxy auth, ``/v1`` base path). It stops at the
-raw response: parsing, selection, hashing, comparison, and persistence belong
-to later stages. Failures are classified with the shared ``FailureCategory``
-vocabulary so downstream convergence reporting reads one taxonomy.
+Both backends share one OpenAI-compatible ``POST /v1/chat/completions`` path
+(``_ChatCompletionsBackend``), so they issue a byte-identical request; this
+matters because a divergence in how the frozen request reaches the model would
+surface as a false disagreement. ``ModalBackend`` adds Modal ``Modal-Key`` /
+``Modal-Secret`` proxy-auth headers and targets the operator's deployed Modal
+app; ``LocalSglangBackend`` targets a local SGLang server (localhost by default)
+and sends no auth headers. Both stop at the raw response: parsing, selection,
+hashing, comparison, and persistence belong to later stages, and both classify
+failures with the shared ``FailureCategory`` vocabulary so downstream
+convergence reporting reads one taxonomy.
 """
 
 from __future__ import annotations
@@ -35,7 +37,9 @@ ENV_MODAL_KEY = "POSTFIAT_SIDECAR_MODAL_KEY"
 ENV_MODAL_SECRET = "POSTFIAT_SIDECAR_MODAL_SECRET"
 MODEL_REQUEST_RELATIVE_PATH = "inputs/model_request.json"
 BACKEND_MODE_MODAL = "modal"
+BACKEND_MODE_LOCAL = "local"
 DEFAULT_INFERENCE_TIMEOUT_SECONDS = 2100.0
+DEFAULT_LOCAL_ENDPOINT_URL = "http://localhost:8000/v1"
 PROXY_AUTH_KEY_HEADER = "Modal-Key"
 PROXY_AUTH_SECRET_HEADER = "Modal-Secret"
 CHAT_COMPLETIONS_SUFFIX = "chat/completions"
@@ -118,54 +122,29 @@ def load_model_request(package_path: Path) -> dict[str, Any]:
     return content
 
 
-class ModalBackend:
-    """Calls an operator-deployed Modal SGLang endpoint over its OpenAI API."""
+class _ChatCompletionsBackend:
+    """Shared OpenAI-compatible chat-completions path for inference backends.
 
-    backend_mode = BACKEND_MODE_MODAL
+    Subclasses set ``backend_mode`` and supply the endpoint and any request
+    headers; the frozen-request body construction, the HTTP call, failure
+    classification, and response extraction are identical so the two backends
+    issue a byte-identical request.
+    """
+
+    backend_mode: str = ""
 
     def __init__(
         self,
         endpoint_url: str,
         *,
-        proxy_auth_key: str | None,
-        proxy_auth_secret: str | None,
+        headers: dict[str, str] | None = None,
         timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
         http_client: httpx.Client | None = None,
     ):
-        key = (proxy_auth_key or "").strip()
-        secret = (proxy_auth_secret or "").strip()
-        if not key or not secret:
-            raise InferenceConfigError(
-                f"{ENV_MODAL_KEY} and {ENV_MODAL_SECRET} are required to call the "
-                "deployed Modal endpoint"
-            )
         self._url = _chat_completions_url(endpoint_url)
-        self._headers = {
-            PROXY_AUTH_KEY_HEADER: key,
-            PROXY_AUTH_SECRET_HEADER: secret,
-        }
+        self._headers = dict(headers or {})
         self._http = http_client or httpx.Client(timeout=timeout_seconds)
         self._owns_client = http_client is None
-
-    @classmethod
-    def from_environment(
-        cls,
-        endpoint_url: str,
-        *,
-        timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
-        http_client: httpx.Client | None = None,
-        environ: Mapping[str, str] | None = None,
-    ) -> "ModalBackend":
-        """Build a backend, reading proxy-auth credentials only from the env."""
-
-        env = os.environ if environ is None else environ
-        return cls(
-            endpoint_url,
-            proxy_auth_key=env.get(ENV_MODAL_KEY),
-            proxy_auth_secret=env.get(ENV_MODAL_SECRET),
-            timeout_seconds=timeout_seconds,
-            http_client=http_client,
-        )
 
     def close(self) -> None:
         if self._owns_client:
@@ -208,6 +187,82 @@ class ModalBackend:
         )
 
 
+class ModalBackend(_ChatCompletionsBackend):
+    """Calls an operator-deployed Modal SGLang endpoint over its OpenAI API."""
+
+    backend_mode = BACKEND_MODE_MODAL
+
+    def __init__(
+        self,
+        endpoint_url: str,
+        *,
+        proxy_auth_key: str | None,
+        proxy_auth_secret: str | None,
+        timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+        http_client: httpx.Client | None = None,
+    ):
+        key = (proxy_auth_key or "").strip()
+        secret = (proxy_auth_secret or "").strip()
+        if not key or not secret:
+            raise InferenceConfigError(
+                f"{ENV_MODAL_KEY} and {ENV_MODAL_SECRET} are required to call the "
+                "deployed Modal endpoint"
+            )
+        super().__init__(
+            endpoint_url,
+            headers={
+                PROXY_AUTH_KEY_HEADER: key,
+                PROXY_AUTH_SECRET_HEADER: secret,
+            },
+            timeout_seconds=timeout_seconds,
+            http_client=http_client,
+        )
+
+    @classmethod
+    def from_environment(
+        cls,
+        endpoint_url: str,
+        *,
+        timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+        http_client: httpx.Client | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> "ModalBackend":
+        """Build a backend, reading proxy-auth credentials only from the env."""
+
+        env = os.environ if environ is None else environ
+        return cls(
+            endpoint_url,
+            proxy_auth_key=env.get(ENV_MODAL_KEY),
+            proxy_auth_secret=env.get(ENV_MODAL_SECRET),
+            timeout_seconds=timeout_seconds,
+            http_client=http_client,
+        )
+
+
+class LocalSglangBackend(_ChatCompletionsBackend):
+    """Calls an operator's local SGLang server over its OpenAI API.
+
+    The local server is not proxy-auth protected, so no credentials are sent;
+    the endpoint defaults to ``http://localhost:8000/v1``.
+    """
+
+    backend_mode = BACKEND_MODE_LOCAL
+
+    def __init__(
+        self,
+        endpoint_url: str = DEFAULT_LOCAL_ENDPOINT_URL,
+        *,
+        timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+        http_client: httpx.Client | None = None,
+    ):
+        super().__init__(
+            endpoint_url,
+            headers=None,
+            timeout_seconds=timeout_seconds,
+            http_client=http_client,
+        )
+
+
 def _build_request_body(model_request: dict[str, Any]) -> dict[str, Any]:
     body = {key: model_request[key] for key in REQUEST_BODY_KEYS if key in model_request}
     extra_body = model_request.get("extra_body")
@@ -242,7 +297,7 @@ def _extract_content(payload: Any) -> str:
 def _chat_completions_url(endpoint_url: str) -> str:
     base = (endpoint_url or "").strip().rstrip("/")
     if not base:
-        raise InferenceConfigError("a Modal endpoint URL is required")
+        raise InferenceConfigError("an inference endpoint URL is required")
     if not base.endswith("/v1"):
         base = f"{base}/v1"
     return f"{base}/{CHAT_COMPLETIONS_SUFFIX}"
