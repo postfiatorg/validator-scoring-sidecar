@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,11 +15,56 @@ from validator_scoring_sidecar.round_metadata import RoundMetadata
 STATE_DB_FILENAME = "sidecar.db"
 STATE_DISCOVERED = "DISCOVERED"
 STATE_INPUT_PACKAGE_VERIFIED = "INPUT_PACKAGE_VERIFIED"
-SCHEMA_VERSION = 1
+STATE_SCORED = "SCORED"
+STATE_SCORING_FAILED = "SCORING_FAILED"
+STATE_SKIPPED = "SKIPPED"
+SCHEMA_VERSION = 2
+
+# A round in any of these states already has its verified input package, so
+# sync must treat it as handled and not re-fetch it.
+INPUT_READY_STATES = frozenset(
+    {
+        STATE_INPUT_PACKAGE_VERIFIED,
+        STATE_SCORED,
+        STATE_SCORING_FAILED,
+        STATE_SKIPPED,
+    }
+)
+
+_V2_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("scored_at", "TEXT"),
+    ("backend_mode", "TEXT"),
+    ("model_response_hash", "TEXT"),
+    ("validator_scores_hash", "TEXT"),
+    ("selected_unl_hash", "TEXT"),
+    ("comparison_levels_matched", "TEXT"),
+    ("error_category", "TEXT"),
+    ("error_details", "TEXT"),
+)
 
 
 class SidecarStateError(RuntimeError):
     """Raised when local sidecar state cannot be read or written."""
+
+
+@dataclass(frozen=True)
+class ScoreOutcome:
+    """The result of a scoring attempt, persisted by ``record_score``.
+
+    ``comparison_levels_matched`` is ``None`` while a scored round still awaits
+    the foundation's hashes; it becomes a (possibly empty) list once a
+    comparison has run. ``selected_unl_hash`` is reserved for the deferred
+    selected-UNL level and is unset today.
+    """
+
+    sidecar_state: str
+    backend_mode: str | None = None
+    model_response_hash: str | None = None
+    validator_scores_hash: str | None = None
+    selected_unl_hash: str | None = None
+    comparison_levels_matched: list[str] | None = None
+    error_category: str | None = None
+    error_details: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -36,6 +82,14 @@ class RoundStateRecord:
     local_package_path: str | None
     fetch_source: str | None
     verified_file_count: int | None
+    scored_at: str | None
+    backend_mode: str | None
+    model_response_hash: str | None
+    validator_scores_hash: str | None
+    selected_unl_hash: str | None
+    comparison_levels_matched: str | None
+    error_category: str | None
+    error_details: str | None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "RoundStateRecord":
@@ -51,6 +105,14 @@ class RoundStateRecord:
             local_package_path=row["local_package_path"],
             fetch_source=row["fetch_source"],
             verified_file_count=row["verified_file_count"],
+            scored_at=row["scored_at"],
+            backend_mode=row["backend_mode"],
+            model_response_hash=row["model_response_hash"],
+            validator_scores_hash=row["validator_scores_hash"],
+            selected_unl_hash=row["selected_unl_hash"],
+            comparison_levels_matched=row["comparison_levels_matched"],
+            error_category=row["error_category"],
+            error_details=row["error_details"],
         )
 
     def matches_frozen_input(self, metadata: RoundMetadata) -> bool:
@@ -105,7 +167,10 @@ class SidecarState:
             """
             SELECT network, round_id, round_number, scoring_status, sidecar_state,
                    input_package_cid, input_package_hash, input_frozen_at,
-                   local_package_path, fetch_source, verified_file_count
+                   local_package_path, fetch_source, verified_file_count,
+                   scored_at, backend_mode, model_response_hash,
+                   validator_scores_hash, selected_unl_hash,
+                   comparison_levels_matched, error_category, error_details
             FROM sidecar_rounds
             WHERE network = ? AND round_id = ?
             """,
@@ -123,7 +188,7 @@ class SidecarState:
         record = self.get_round(network, metadata.round_id)
         return (
             record is not None
-            and record.sidecar_state == STATE_INPUT_PACKAGE_VERIFIED
+            and record.sidecar_state in INPUT_READY_STATES
             and record.matches_frozen_input(metadata)
             and cache_path.is_dir()
         )
@@ -212,6 +277,75 @@ class SidecarState:
             ),
         )
 
+    def record_score(
+        self,
+        network: str,
+        metadata: RoundMetadata,
+        outcome: ScoreOutcome,
+    ) -> None:
+        """Persist a scoring outcome, preserving the input-fetch columns."""
+
+        now = _utc_now()
+        comparison = (
+            ",".join(outcome.comparison_levels_matched)
+            if outcome.comparison_levels_matched is not None
+            else None
+        )
+        error_details = (
+            json.dumps(outcome.error_details, sort_keys=True)
+            if outcome.error_details is not None
+            else None
+        )
+        self._execute_write(
+            """
+            INSERT INTO sidecar_rounds (
+                network, round_id, round_number, scoring_status, sidecar_state,
+                input_package_cid, input_package_hash, input_frozen_at,
+                scored_at, backend_mode, model_response_hash,
+                validator_scores_hash, selected_unl_hash,
+                comparison_levels_matched, error_category, error_details,
+                discovered_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(network, round_id) DO UPDATE SET
+                round_number = excluded.round_number,
+                scoring_status = excluded.scoring_status,
+                sidecar_state = excluded.sidecar_state,
+                input_package_cid = excluded.input_package_cid,
+                input_package_hash = excluded.input_package_hash,
+                input_frozen_at = excluded.input_frozen_at,
+                scored_at = excluded.scored_at,
+                backend_mode = excluded.backend_mode,
+                model_response_hash = excluded.model_response_hash,
+                validator_scores_hash = excluded.validator_scores_hash,
+                selected_unl_hash = excluded.selected_unl_hash,
+                comparison_levels_matched = excluded.comparison_levels_matched,
+                error_category = excluded.error_category,
+                error_details = excluded.error_details,
+                updated_at = excluded.updated_at
+            """,
+            (
+                network,
+                metadata.round_id,
+                metadata.round_number,
+                metadata.status,
+                outcome.sidecar_state,
+                metadata.input_package_cid,
+                metadata.input_package_hash,
+                metadata.input_frozen_at,
+                now,
+                outcome.backend_mode,
+                outcome.model_response_hash,
+                outcome.validator_scores_hash,
+                outcome.selected_unl_hash,
+                comparison,
+                outcome.error_category,
+                error_details,
+                now,
+                now,
+            ),
+        )
+
     def _ensure_schema(self) -> None:
         current_version = self._schema_version()
         if current_version > SCHEMA_VERSION:
@@ -223,6 +357,13 @@ class SidecarState:
         if current_version == SCHEMA_VERSION:
             return
 
+        if current_version == 0:
+            self._create_schema()
+        elif current_version == 1:
+            self._migrate_v1_to_v2()
+        self._execute_write(f"PRAGMA user_version = {SCHEMA_VERSION}", ())
+
+    def _create_schema(self) -> None:
         self._execute_write(
             """
             CREATE TABLE IF NOT EXISTS sidecar_rounds (
@@ -237,6 +378,14 @@ class SidecarState:
                 local_package_path TEXT,
                 fetch_source TEXT,
                 verified_file_count INTEGER,
+                scored_at TEXT,
+                backend_mode TEXT,
+                model_response_hash TEXT,
+                validator_scores_hash TEXT,
+                selected_unl_hash TEXT,
+                comparison_levels_matched TEXT,
+                error_category TEXT,
+                error_details TEXT,
                 discovered_at TEXT NOT NULL,
                 input_verified_at TEXT,
                 updated_at TEXT NOT NULL,
@@ -252,7 +401,25 @@ class SidecarState:
             """,
             (),
         )
-        self._execute_write(f"PRAGMA user_version = {SCHEMA_VERSION}", ())
+
+    def _migrate_v1_to_v2(self) -> None:
+        existing = self._existing_columns("sidecar_rounds")
+        for name, column_type in _V2_COLUMNS:
+            if name not in existing:
+                self._execute_write(
+                    f"ALTER TABLE sidecar_rounds ADD COLUMN {name} {column_type}",
+                    (),
+                )
+
+    def _existing_columns(self, table: str) -> set[str]:
+        connection = self._require_connection()
+        try:
+            cursor = connection.execute(f"PRAGMA table_info({table})")
+            return {row[1] for row in cursor.fetchall()}
+        except sqlite3.Error as exc:
+            raise SidecarStateError(
+                f"Failed to read sidecar state schema for {table}: {exc}"
+            ) from exc
 
     def _schema_version(self) -> int:
         connection = self._require_connection()

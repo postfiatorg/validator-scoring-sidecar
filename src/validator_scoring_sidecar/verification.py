@@ -184,6 +184,20 @@ def verify_round(
             diverged_levels=[],
             first_divergence=None,
         )
+    return compare_hashes(input_package_hash, hashes, foundation_hashes)
+
+
+def compare_hashes(
+    input_package_hash: str,
+    sidecar_hashes: dict[str, str],
+    foundation_hashes: dict[str, Any],
+) -> VerificationResult:
+    """Compare already-computed sidecar hashes against the foundation's.
+
+    Used both fresh (right after scoring) and for the deferred path, where the
+    sidecar hashes were persisted on an earlier pass and only the foundation's
+    final bundle has since become available.
+    """
 
     matched: list[str] = []
     diverged: list[str] = []
@@ -191,7 +205,7 @@ def verify_round(
         foundation_hash = foundation_hashes.get(hash_name)
         if not isinstance(foundation_hash, str):
             continue
-        if hashes[hash_name] == foundation_hash:
+        if sidecar_hashes.get(hash_name) == foundation_hash:
             matched.append(level)
         else:
             diverged.append(level)
@@ -211,7 +225,7 @@ def verify_round(
     )
     return VerificationResult(
         input_package_hash=input_package_hash,
-        hashes=hashes,
+        hashes=dict(sidecar_hashes),
         compared=bool(matched or diverged),
         matched_levels=matched,
         diverged_levels=diverged,
@@ -226,6 +240,28 @@ def verification_hashes_path(config: SidecarConfig, input_package_hash: str) -> 
     return config.data_dir.joinpath(
         SCORED_DIR_NAME, input_package_hash, VERIFICATION_HASHES_FILE_NAME
     )
+
+
+def read_verification_hashes(
+    config: SidecarConfig,
+    input_package_hash: str,
+) -> dict[str, str] | None:
+    """Read previously persisted sidecar hashes, or None if not yet written."""
+
+    target = verification_hashes_path(config, input_package_hash)
+    try:
+        content = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as exc:
+        raise VerificationError(
+            f"persisted verification hashes are not valid JSON: {target}"
+        ) from exc
+    if not isinstance(content, dict):
+        raise VerificationError(
+            f"persisted verification hashes must be a JSON object: {target}"
+        )
+    return content
 
 
 def persist_verification_hashes(

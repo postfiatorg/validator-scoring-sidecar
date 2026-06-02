@@ -41,6 +41,7 @@ from validator_scoring_sidecar.scoring_client import (
     ScoringClientError,
 )
 from validator_scoring_sidecar.state import SidecarStateError
+from validator_scoring_sidecar.score import ScoreResult, score_round
 from validator_scoring_sidecar.sync import (
     DEFAULT_SYNC_ROUND_LIMIT,
     MAX_SYNC_ROUND_LIMIT,
@@ -49,6 +50,7 @@ from validator_scoring_sidecar.sync import (
     SyncSetupError,
     sync_input_package,
 )
+from validator_scoring_sidecar.verification import VerificationError
 
 EXIT_OK = 0
 EXIT_OPERATOR_ERROR = 1
@@ -204,6 +206,34 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_config_arguments(start)
     _add_json_argument(start)
     start.set_defaults(handler=start_sglang_command)
+
+    score = subparsers.add_parser(
+        "score",
+        help="Score a round end to end and record the verification outcome.",
+    )
+    score.add_argument(
+        "--round-id",
+        type=_positive_int,
+        help="Round to score. Defaults to the latest eligible round when omitted.",
+    )
+    score.add_argument(
+        "--source",
+        choices=PACKAGE_SOURCE_CHOICES,
+        default="auto",
+        help="Package retrieval source for round fetches. Defaults to auto.",
+    )
+    score.add_argument(
+        "--round-limit",
+        type=_round_limit,
+        default=DEFAULT_SYNC_ROUND_LIMIT,
+        help=(
+            "Recent rounds to scan when no --round-id is given. Defaults to "
+            f"{DEFAULT_SYNC_ROUND_LIMIT}."
+        ),
+    )
+    _add_common_config_arguments(score)
+    _add_json_argument(score)
+    score.set_defaults(handler=score_command)
     return parser
 
 
@@ -413,6 +443,91 @@ def _run_runtime_command(
         print(_format_deployment_record(record, config))
 
     return EXIT_OK
+
+
+def score_command(args: argparse.Namespace) -> int:
+    config = load_config(
+        base_url=args.base_url,
+        data_dir=args.data_dir,
+        ipfs_gateway_url=args.ipfs_gateway_url,
+        network=args.network,
+        timeout_seconds=args.timeout,
+    )
+    client = ScoringClient(config)
+    try:
+        result = score_round(
+            config,
+            client,
+            round_id=args.round_id,
+            source=args.source,
+            round_limit=args.round_limit,
+        )
+    except SyncLockError as exc:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "status": "locked",
+                        "network": config.network,
+                        "lock_path": str(exc.lock_path),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            _print_error(str(exc))
+        return EXIT_LOCKED
+    except SyncSetupError as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except MissingFrozenInputMetadata as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except RoundMetadataError as exc:
+        _print_error(f"Malformed round metadata: {exc}")
+        return EXIT_NETWORK_ERROR
+    except (
+        InputPackageVerificationError,
+        InputPackageCacheError,
+        SidecarStateError,
+        VerificationError,
+    ) as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except (InputPackageDownloadError, ScoringClientError) as exc:
+        _print_error(str(exc))
+        return EXIT_NETWORK_ERROR
+    except DeploymentError as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    finally:
+        client.close()
+
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(_format_score_result(result))
+
+    return EXIT_OK
+
+
+def _format_score_result(result: ScoreResult) -> str:
+    lines = [
+        f"Score status: {result.status}",
+        f"Network: {result.network}",
+        f"Round ID: {result.round_id}",
+        f"Round number: {result.round_number}",
+        f"Sidecar state: {result.sidecar_state}",
+    ]
+    if result.backend_mode is not None:
+        lines.append(f"Backend mode: {result.backend_mode}")
+    lines.append(f"Compared: {result.compared}")
+    if result.compared:
+        lines.append(f"Matched levels: {', '.join(result.matched_levels) or 'none'}")
+    if result.error_category is not None:
+        lines.append(f"Outcome category: {result.error_category}")
+    return "\n".join(lines)
 
 
 def _load_deploy_manifest(args: argparse.Namespace, config) -> dict:

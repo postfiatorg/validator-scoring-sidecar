@@ -11,7 +11,7 @@ The validator-scoring-sidecar runs alongside your Post Fiat Ledger validator. It
 
 ## What the sidecar does NOT do
 
-The sidecar is convenience tooling, not a trust requirement. It does not currently run inference or score validators, hold validator keys, submit on-chain memos, watch chain history, publish convergence reports, or change Validator List authority. These capabilities will be added in later releases.
+The sidecar is convenience tooling, not a trust requirement. The `docker compose` workflow above runs only the unattended input sync. Independent inference and scoring are an opt-in, host-run step — see [`Deployment.md`](Deployment.md) for standing up an inference runtime, after which `score` reproduces a round and records the outcome. The sidecar still does not hold validator keys, submit on-chain memos, watch chain history, publish convergence reports, or change Validator List authority; those will be added in later releases.
 
 ## Setup
 

@@ -17,6 +17,7 @@ from validator_scoring_sidecar.verification import (
     compute_verification_hashes,
     load_validator_map,
     persist_verification_hashes,
+    read_verification_hashes,
     verification_hashes_path,
     verify_round,
 )
@@ -250,6 +251,20 @@ def test_load_validator_map_reads_inputs_file(tmp_path):
     )
 
     assert load_validator_map(package_path) == VALIDATOR_MAP
+
+
+def test_read_verification_hashes_missing_returns_none(tmp_path):
+    assert read_verification_hashes(_config(tmp_path), "a" * 64) is None
+
+
+def test_read_verification_hashes_invalid_json_raises(tmp_path):
+    config = _config(tmp_path)
+    path = verification_hashes_path(config, "a" * 64)
+    path.parent.mkdir(parents=True)
+    path.write_text("{bad", encoding="utf-8")
+
+    with pytest.raises(VerificationError, match="not valid JSON"):
+        read_verification_hashes(config, "a" * 64)
 
 
 def test_load_validator_map_missing_raises(tmp_path):

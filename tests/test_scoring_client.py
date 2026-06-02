@@ -107,3 +107,27 @@ def test_fetch_round_raises_for_network_error():
 
     with pytest.raises(ScoringNetworkError):
         client.fetch_round(123)
+
+
+def test_final_bundle_file_url_uses_round_namespace_without_input_segment():
+    client = ScoringClient(_config(), http_client=httpx.Client())
+
+    assert client.final_bundle_file_url(456, "outputs/verification_hashes.json") == (
+        "https://scoring.example.org/api/scoring/rounds/456"
+        "/outputs/verification_hashes.json"
+    )
+
+
+def test_fetch_final_bundle_file_returns_json_payload():
+    def handler(request):
+        assert request.url.path == (
+            "/api/scoring/rounds/456/outputs/verification_hashes.json"
+        )
+        return httpx.Response(200, json={"model_response_hash": "abc"})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = ScoringClient(_config(), http_client=http_client)
+
+    assert client.fetch_final_bundle_file(
+        456, "outputs/verification_hashes.json"
+    ) == {"model_response_hash": "abc"}

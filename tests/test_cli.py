@@ -628,3 +628,73 @@ def test_start_sglang_gpu_mismatch_exits_operator_error(capsys, monkeypatch, tmp
     assert exit_code == 1
     assert "does not match" in captured.err
     assert captured.out == ""
+
+
+def _score_result(**overrides):
+    from validator_scoring_sidecar.score import ScoreResult
+
+    fields = {
+        "status": "scored",
+        "network": "testnet",
+        "round_id": 123,
+        "round_number": 456,
+        "sidecar_state": "SCORED",
+        "backend_mode": "modal",
+        "compared": True,
+        "matched_levels": ["RAW_MATCH", "PARSED_MATCH"],
+        "error_category": None,
+    }
+    fields.update(overrides)
+    return ScoreResult(**fields)
+
+
+def test_score_command_human_output(capsys, monkeypatch, tmp_path):
+    result = _score_result()
+    monkeypatch.setattr(
+        cli,
+        "score_round",
+        lambda config, client, *, round_id, source, round_limit: result,
+    )
+
+    exit_code = cli.main(["score", "--round-id", "123", "--data-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Score status: scored" in captured.out
+    assert "Sidecar state: SCORED" in captured.out
+    assert "Matched levels: RAW_MATCH, PARSED_MATCH" in captured.out
+    assert captured.err == ""
+
+
+def test_score_command_json_output(capsys, monkeypatch, tmp_path):
+    result = _score_result(status="comparison_pending", compared=False, matched_levels=[])
+    monkeypatch.setattr(
+        cli,
+        "score_round",
+        lambda config, client, *, round_id, source, round_limit: result,
+    )
+
+    exit_code = cli.main(["score", "--data-dir", str(tmp_path), "--json"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out) == result.as_dict()
+    assert captured.err == ""
+
+
+def test_score_command_deployment_error_exits_operator_error(capsys, monkeypatch, tmp_path):
+    from validator_scoring_sidecar.deployment import DeploymentError
+
+    def fake_score(config, client, *, round_id, source, round_limit):
+        raise DeploymentError(
+            "no deployment record found; run `deploy-modal` or `start-sglang` first"
+        )
+
+    monkeypatch.setattr(cli, "score_round", fake_score)
+
+    exit_code = cli.main(["score", "--data-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "no deployment record" in captured.err
+    assert captured.out == ""

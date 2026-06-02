@@ -76,6 +76,14 @@ class ScoringClient:
             f"/input/{quote(file_path, safe='/')}"
         )
 
+    def final_bundle_file_url(self, round_number: int, file_path: str) -> str:
+        if round_number <= 0:
+            raise ValueError("round_number must be greater than zero")
+        return (
+            f"{self._config.scoring_base_url}/api/scoring/rounds/{round_number}"
+            f"/{quote(file_path, safe='/')}"
+        )
+
     def ipfs_package_file_url(
         self,
         gateway_url: str,
@@ -129,6 +137,18 @@ class ScoringClient:
 
         return self._fetch_json(
             self.input_package_file_url(round_number, file_path),
+            service_name="Scoring service",
+        )
+
+    def fetch_final_bundle_file(
+        self,
+        round_number: int,
+        file_path: str,
+    ) -> dict[str, Any] | list[Any]:
+        """Fetch one final audit bundle file from scoring-service HTTPS fallback."""
+
+        return self._fetch_json(
+            self.final_bundle_file_url(round_number, file_path),
             service_name="Scoring service",
         )
 

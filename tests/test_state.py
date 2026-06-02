@@ -1,17 +1,41 @@
-from validator_scoring_sidecar.input_package import FetchedInputPackage
-from validator_scoring_sidecar.round_metadata import RoundMetadata
+import json
 import sqlite3
 
 import pytest
 
+from validator_scoring_sidecar.input_package import FetchedInputPackage
+from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.state import (
+    SCHEMA_VERSION,
+    STATE_DB_FILENAME,
     STATE_DISCOVERED,
     STATE_INPUT_PACKAGE_VERIFIED,
-    STATE_DB_FILENAME,
-    SCHEMA_VERSION,
-    SidecarStateError,
+    STATE_SCORED,
+    STATE_SCORING_FAILED,
+    ScoreOutcome,
     SidecarState,
+    SidecarStateError,
 )
+
+_V1_SCHEMA = """
+CREATE TABLE sidecar_rounds (
+    network TEXT NOT NULL,
+    round_id INTEGER NOT NULL,
+    round_number INTEGER NOT NULL,
+    scoring_status TEXT NOT NULL,
+    sidecar_state TEXT NOT NULL,
+    input_package_cid TEXT NOT NULL,
+    input_package_hash TEXT NOT NULL,
+    input_frozen_at TEXT NOT NULL,
+    local_package_path TEXT,
+    fetch_source TEXT,
+    verified_file_count INTEGER,
+    discovered_at TEXT NOT NULL,
+    input_verified_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (network, round_id)
+)
+"""
 
 
 def _metadata(package_hash="a" * 64):
@@ -88,6 +112,164 @@ def test_state_does_not_treat_changed_frozen_metadata_as_verified(tmp_path):
             changed_metadata,
             cache_path=tmp_path / "packages" / changed_metadata.input_package_hash,
         )
+
+
+def test_record_score_persists_outcome_and_preserves_input_columns(tmp_path):
+    metadata = _metadata()
+    with SidecarState(tmp_path) as state:
+        state.record_input_verified(
+            "testnet", metadata, _fetched_package(tmp_path, metadata)
+        )
+        state.record_score(
+            "testnet",
+            metadata,
+            ScoreOutcome(
+                sidecar_state=STATE_SCORED,
+                backend_mode="local",
+                model_response_hash="m" * 64,
+                validator_scores_hash="v" * 64,
+                comparison_levels_matched=["RAW_MATCH", "PARSED_MATCH"],
+            ),
+        )
+
+        record = state.get_round("testnet", metadata.round_id)
+
+    assert record.sidecar_state == STATE_SCORED
+    assert record.backend_mode == "local"
+    assert record.model_response_hash == "m" * 64
+    assert record.validator_scores_hash == "v" * 64
+    assert record.comparison_levels_matched == "RAW_MATCH,PARSED_MATCH"
+    # input-fetch columns are preserved by the score upsert.
+    assert record.local_package_path == str(
+        tmp_path / "packages" / metadata.input_package_hash
+    )
+    assert record.fetch_source == "https"
+
+
+def test_record_score_pending_leaves_comparison_null(tmp_path):
+    metadata = _metadata()
+    with SidecarState(tmp_path) as state:
+        state.record_input_verified(
+            "testnet", metadata, _fetched_package(tmp_path, metadata)
+        )
+        state.record_score(
+            "testnet",
+            metadata,
+            ScoreOutcome(
+                sidecar_state=STATE_SCORED,
+                backend_mode="modal",
+                model_response_hash="m" * 64,
+                validator_scores_hash="v" * 64,
+                comparison_levels_matched=None,
+            ),
+        )
+
+        record = state.get_round("testnet", metadata.round_id)
+
+    assert record.comparison_levels_matched is None
+
+
+def test_record_score_failed_persists_error(tmp_path):
+    metadata = _metadata()
+    with SidecarState(tmp_path) as state:
+        state.record_input_verified(
+            "testnet", metadata, _fetched_package(tmp_path, metadata)
+        )
+        state.record_score(
+            "testnet",
+            metadata,
+            ScoreOutcome(
+                sidecar_state=STATE_SCORING_FAILED,
+                backend_mode="modal",
+                error_category="INFERENCE_TIMEOUT",
+                error_details={"message": "slow"},
+            ),
+        )
+
+        record = state.get_round("testnet", metadata.round_id)
+
+    assert record.sidecar_state == STATE_SCORING_FAILED
+    assert record.error_category == "INFERENCE_TIMEOUT"
+    assert json.loads(record.error_details) == {"message": "slow"}
+
+
+def test_scored_round_counts_as_input_ready(tmp_path):
+    metadata = _metadata()
+    cache_path = tmp_path / "packages" / metadata.input_package_hash
+    cache_path.mkdir(parents=True)
+    with SidecarState(tmp_path) as state:
+        state.record_input_verified(
+            "testnet", metadata, _fetched_package(tmp_path, metadata)
+        )
+        state.record_score(
+            "testnet",
+            metadata,
+            ScoreOutcome(
+                sidecar_state=STATE_SCORED,
+                model_response_hash="m" * 64,
+                validator_scores_hash="v" * 64,
+                comparison_levels_matched=["RAW_MATCH"],
+            ),
+        )
+
+        assert state.is_input_package_verified(
+            "testnet", metadata, cache_path=cache_path
+        )
+
+
+def test_v1_database_migrates_to_v2_and_preserves_rows(tmp_path):
+    db_path = tmp_path / STATE_DB_FILENAME
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(_V1_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO sidecar_rounds (
+                network, round_id, round_number, scoring_status, sidecar_state,
+                input_package_cid, input_package_hash, input_frozen_at,
+                discovered_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "testnet",
+                123,
+                456,
+                "INPUT_FROZEN",
+                STATE_INPUT_PACKAGE_VERIFIED,
+                "QmInput",
+                "a" * 64,
+                "2026-05-25T00:00:00+00:00",
+                "t",
+                "t",
+            ),
+        )
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round("testnet", 123)
+        assert record is not None
+        assert record.sidecar_state == STATE_INPUT_PACKAGE_VERIFIED
+        assert record.model_response_hash is None  # new v2 column present, NULL
+        # record_score works against the migrated schema.
+        state.record_score(
+            "testnet",
+            _metadata(),
+            ScoreOutcome(
+                sidecar_state=STATE_SCORED,
+                backend_mode="modal",
+                model_response_hash="m" * 64,
+                validator_scores_hash="v" * 64,
+                comparison_levels_matched=["RAW_MATCH", "PARSED_MATCH"],
+            ),
+        )
+        assert state.get_round("testnet", 123).sidecar_state == STATE_SCORED
+
+    # Reopening is idempotent (already at the current version).
+    with SidecarState(tmp_path) as state:
+        assert state.get_round("testnet", 123).sidecar_state == STATE_SCORED
 
 
 def test_state_rejects_newer_schema_version(tmp_path):

@@ -102,6 +102,8 @@ class InferenceBackend(Protocol):
 
     def run(self, model_request: dict[str, Any]) -> InferenceResult: ...
 
+    def close(self) -> None: ...
+
 
 def load_model_request(package_path: Path) -> dict[str, Any]:
     """Load the frozen ``inputs/model_request.json`` from a verified package."""
