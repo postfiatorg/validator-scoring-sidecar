@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 DEFAULT_DATA_DIR_ROOT = "~/.postfiat/validator-scoring-sidecar"
 DEFAULT_NETWORK = "testnet"
 DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_CHAIN_POLL_INTERVAL_SECONDS = 60.0
 NETWORK_SCORING_BASE_URLS = {
     "devnet": "https://scoring-devnet.postfiat.org",
     "testnet": "https://scoring-testnet.postfiat.org",
@@ -25,6 +26,9 @@ ENV_DATA_DIR = "POSTFIAT_SIDECAR_DATA_DIR"
 ENV_IPFS_GATEWAY_URL = "POSTFIAT_SIDECAR_IPFS_GATEWAY_URL"
 ENV_NETWORK = "POSTFIAT_SIDECAR_NETWORK"
 ENV_TIMEOUT_SECONDS = "POSTFIAT_SIDECAR_TIMEOUT_SECONDS"
+ENV_PFTL_RPC_URL = "POSTFIAT_SIDECAR_PFTL_RPC_URL"
+ENV_FOUNDATION_PUBLISHER_ADDRESS = "POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS"
+ENV_CHAIN_POLL_INTERVAL_SECONDS = "POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS"
 
 
 class ConfigError(ValueError):
@@ -40,6 +44,9 @@ class SidecarConfig:
     ipfs_gateway_url: str | None
     network: str
     timeout_seconds: float
+    pftl_rpc_url: str
+    foundation_publisher_address: str | None
+    chain_poll_interval_seconds: float
 
 
 def load_config(
@@ -49,6 +56,9 @@ def load_config(
     ipfs_gateway_url: str | None = None,
     network: str | None = None,
     timeout_seconds: float | str | None = None,
+    pftl_rpc_url: str | None = None,
+    foundation_publisher_address: str | None = None,
+    chain_poll_interval_seconds: float | str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> SidecarConfig:
     """Load configuration using CLI overrides, environment, then defaults."""
@@ -82,6 +92,25 @@ def load_config(
         env_value=env.get(ENV_TIMEOUT_SECONDS),
         default=str(DEFAULT_TIMEOUT_SECONDS),
     )
+    resolved_pftl_rpc_url = _resolve_pftl_rpc_url(
+        cli_value=pftl_rpc_url,
+        env_value=env.get(ENV_PFTL_RPC_URL),
+        network=normalized_network,
+        prefer_network_default=network is not None,
+    )
+    resolved_publisher_address = _resolve_optional(
+        cli_value=foundation_publisher_address,
+        env_value=env.get(ENV_FOUNDATION_PUBLISHER_ADDRESS),
+    )
+    resolved_poll_interval = _resolve_value(
+        cli_value=(
+            str(chain_poll_interval_seconds)
+            if chain_poll_interval_seconds is not None
+            else None
+        ),
+        env_value=env.get(ENV_CHAIN_POLL_INTERVAL_SECONDS),
+        default=str(DEFAULT_CHAIN_POLL_INTERVAL_SECONDS),
+    )
 
     return SidecarConfig(
         scoring_base_url=_normalize_base_url(resolved_base_url),
@@ -93,6 +122,15 @@ def load_config(
         ),
         network=normalized_network,
         timeout_seconds=_parse_timeout(resolved_timeout),
+        pftl_rpc_url=_normalize_url("pftl_rpc_url", resolved_pftl_rpc_url),
+        foundation_publisher_address=(
+            _require_non_empty(
+                "foundation_publisher_address", resolved_publisher_address
+            )
+            if resolved_publisher_address is not None
+            else None
+        ),
+        chain_poll_interval_seconds=_parse_chain_poll_interval(resolved_poll_interval),
     )
 
 
@@ -164,6 +202,34 @@ def _network_default_base_url(network: str) -> str:
         ) from exc
 
 
+def _resolve_pftl_rpc_url(
+    *,
+    cli_value: str | None,
+    env_value: str | None,
+    network: str,
+    prefer_network_default: bool,
+) -> str:
+    if cli_value is not None:
+        return cli_value
+    if prefer_network_default:
+        return _network_default_pftl_rpc_url(network)
+    if env_value is not None and env_value.strip():
+        return env_value
+    return _network_default_pftl_rpc_url(network)
+
+
+def _network_default_pftl_rpc_url(network: str) -> str:
+    return f"https://rpc.{network}.postfiat.org"
+
+
+def _resolve_optional(*, cli_value: str | None, env_value: str | None) -> str | None:
+    if cli_value is not None:
+        return cli_value
+    if env_value is not None and env_value.strip():
+        return env_value.strip()
+    return None
+
+
 def _require_non_empty(name: str, value: str) -> str:
     stripped = value.strip()
     if not stripped:
@@ -195,3 +261,13 @@ def _parse_timeout(value: str) -> float:
     if timeout <= 0:
         raise ConfigError("timeout_seconds must be greater than zero")
     return timeout
+
+
+def _parse_chain_poll_interval(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise ConfigError("chain_poll_interval_seconds must be a number") from exc
+    if interval <= 0:
+        raise ConfigError("chain_poll_interval_seconds must be greater than zero")
+    return interval

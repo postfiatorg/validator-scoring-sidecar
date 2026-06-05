@@ -18,7 +18,7 @@ STATE_INPUT_PACKAGE_VERIFIED = "INPUT_PACKAGE_VERIFIED"
 STATE_SCORED = "SCORED"
 STATE_SCORING_FAILED = "SCORING_FAILED"
 STATE_SKIPPED = "SKIPPED"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # A round in any of these states already has its verified input package, so
 # sync must treat it as handled and not re-fetch it.
@@ -120,6 +120,25 @@ class RoundStateRecord:
             self.input_package_cid == metadata.input_package_cid
             and self.input_package_hash == metadata.input_package_hash
             and self.input_frozen_at == metadata.input_frozen_at
+        )
+
+
+@dataclass(frozen=True)
+class ChainCursor:
+    """Last validated PFTL transaction the watcher has processed for an account."""
+
+    network: str
+    account: str
+    last_processed_ledger_index: int
+    last_processed_tx_hash: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ChainCursor":
+        return cls(
+            network=row["network"],
+            account=row["account"],
+            last_processed_ledger_index=row["last_processed_ledger_index"],
+            last_processed_tx_hash=row["last_processed_tx_hash"],
         )
 
 
@@ -346,6 +365,47 @@ class SidecarState:
             ),
         )
 
+    def get_chain_cursor(self, network: str, account: str) -> ChainCursor | None:
+        row = self._execute_one(
+            """
+            SELECT network, account, last_processed_ledger_index,
+                   last_processed_tx_hash
+            FROM chain_cursor
+            WHERE network = ? AND account = ?
+            """,
+            (network, account),
+        )
+        return ChainCursor.from_row(row) if row is not None else None
+
+    def set_chain_cursor(
+        self,
+        network: str,
+        account: str,
+        last_processed_ledger_index: int,
+        last_processed_tx_hash: str,
+    ) -> None:
+        now = _utc_now()
+        self._execute_write(
+            """
+            INSERT INTO chain_cursor (
+                network, account, last_processed_ledger_index,
+                last_processed_tx_hash, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(network, account) DO UPDATE SET
+                last_processed_ledger_index = excluded.last_processed_ledger_index,
+                last_processed_tx_hash = excluded.last_processed_tx_hash,
+                updated_at = excluded.updated_at
+            """,
+            (
+                network,
+                account,
+                last_processed_ledger_index,
+                last_processed_tx_hash,
+                now,
+            ),
+        )
+
     def _ensure_schema(self) -> None:
         current_version = self._schema_version()
         if current_version > SCHEMA_VERSION:
@@ -359,8 +419,11 @@ class SidecarState:
 
         if current_version == 0:
             self._create_schema()
-        elif current_version == 1:
-            self._migrate_v1_to_v2()
+        else:
+            if current_version < 2:
+                self._migrate_v1_to_v2()
+            if current_version < 3:
+                self._migrate_v2_to_v3()
         self._execute_write(f"PRAGMA user_version = {SCHEMA_VERSION}", ())
 
     def _create_schema(self) -> None:
@@ -401,6 +464,7 @@ class SidecarState:
             """,
             (),
         )
+        self._create_chain_cursor_table()
 
     def _migrate_v1_to_v2(self) -> None:
         existing = self._existing_columns("sidecar_rounds")
@@ -410,6 +474,24 @@ class SidecarState:
                     f"ALTER TABLE sidecar_rounds ADD COLUMN {name} {column_type}",
                     (),
                 )
+
+    def _migrate_v2_to_v3(self) -> None:
+        self._create_chain_cursor_table()
+
+    def _create_chain_cursor_table(self) -> None:
+        self._execute_write(
+            """
+            CREATE TABLE IF NOT EXISTS chain_cursor (
+                network TEXT NOT NULL,
+                account TEXT NOT NULL,
+                last_processed_ledger_index INTEGER NOT NULL,
+                last_processed_tx_hash TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (network, account)
+            )
+            """,
+            (),
+        )
 
     def _existing_columns(self, table: str) -> set[str]:
         connection = self._require_connection()

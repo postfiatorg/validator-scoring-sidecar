@@ -272,6 +272,58 @@ def test_v1_database_migrates_to_v2_and_preserves_rows(tmp_path):
         assert state.get_round("testnet", 123).sidecar_state == STATE_SCORED
 
 
+def test_chain_cursor_round_trip(tmp_path):
+    with SidecarState(tmp_path) as state:
+        assert state.get_chain_cursor("testnet", "rPub") is None
+
+        state.set_chain_cursor("testnet", "rPub", 500, "a" * 64)
+        cursor = state.get_chain_cursor("testnet", "rPub")
+        assert cursor is not None
+        assert cursor.network == "testnet"
+        assert cursor.account == "rPub"
+        assert cursor.last_processed_ledger_index == 500
+        assert cursor.last_processed_tx_hash == "a" * 64
+
+        state.set_chain_cursor("testnet", "rPub", 501, "b" * 64)
+        updated = state.get_chain_cursor("testnet", "rPub")
+        assert updated.last_processed_ledger_index == 501
+        assert updated.last_processed_tx_hash == "b" * 64
+
+
+def test_fresh_database_is_schema_v3(tmp_path):
+    with SidecarState(tmp_path) as state:
+        state.set_chain_cursor("testnet", "rPub", 1, "h")
+
+    connection = sqlite3.connect(tmp_path / STATE_DB_FILENAME)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+    assert version == SCHEMA_VERSION
+
+
+def test_v1_database_migrates_to_v3_adds_chain_cursor(tmp_path):
+    db_path = tmp_path / STATE_DB_FILENAME
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(_V1_SCHEMA)
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with SidecarState(tmp_path) as state:
+        state.set_chain_cursor("testnet", "rPub", 10, "h")
+        assert state.get_chain_cursor("testnet", "rPub").last_processed_ledger_index == 10
+
+    connection = sqlite3.connect(db_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+    assert version == SCHEMA_VERSION
+
+
 def test_state_rejects_newer_schema_version(tmp_path):
     db_path = tmp_path / STATE_DB_FILENAME
     connection = sqlite3.connect(db_path)

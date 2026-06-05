@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.27,<1",
   "pydantic>=2,<3",
+  "xrpl-py>=4,<5",
 ]
 
 [project.optional-dependencies]

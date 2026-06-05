@@ -151,3 +151,40 @@ def test_load_config_allows_unknown_network_with_explicit_ipfs_gateway_url():
     )
 
     assert config.ipfs_gateway_url == "https://custom-ipfs.example.org/ipfs"
+
+
+def test_pftl_rpc_url_defaults_per_network():
+    assert (
+        load_config(network="devnet", environ={}).pftl_rpc_url
+        == "https://rpc.devnet.postfiat.org"
+    )
+    assert (
+        load_config(network="testnet", environ={}).pftl_rpc_url
+        == "https://rpc.testnet.postfiat.org"
+    )
+
+
+def test_pftl_rpc_url_env_override_without_explicit_network():
+    config = load_config(environ={"POSTFIAT_SIDECAR_PFTL_RPC_URL": "https://custom.rpc"})
+    assert config.pftl_rpc_url == "https://custom.rpc"
+
+
+def test_pftl_rpc_url_cli_override_wins():
+    config = load_config(network="testnet", pftl_rpc_url="https://cli.rpc", environ={})
+    assert config.pftl_rpc_url == "https://cli.rpc"
+
+
+def test_foundation_publisher_address_defaults_none_and_reads_env():
+    assert load_config(environ={}).foundation_publisher_address is None
+    config = load_config(
+        environ={"POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS": "rEnvPub"}
+    )
+    assert config.foundation_publisher_address == "rEnvPub"
+
+
+def test_chain_poll_interval_default_and_env():
+    assert load_config(environ={}).chain_poll_interval_seconds == 60.0
+    config = load_config(
+        environ={"POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS": "30"}
+    )
+    assert config.chain_poll_interval_seconds == 30.0

@@ -68,6 +68,9 @@ class ScoringClient:
             f"?limit={limit}&offset={offset}"
         )
 
+    def config_url(self) -> str:
+        return f"{self._config.scoring_base_url}/api/scoring/config"
+
     def input_package_file_url(self, round_number: int, file_path: str) -> str:
         if round_number <= 0:
             raise ValueError("round_number must be greater than zero")
@@ -127,6 +130,17 @@ class ScoringClient:
                 f"Scoring service response for {url} contains a non-object round"
             )
         return rounds
+
+    def fetch_config(self) -> dict[str, Any]:
+        """Fetch the foundation public scoring config (chain-discovery fields)."""
+
+        payload = self._fetch_json(self.config_url(), service_name="Scoring service")
+        if not isinstance(payload, dict):
+            raise ScoringResponseError(
+                "Scoring service returned a non-object JSON body for "
+                f"{self.config_url()}"
+            )
+        return payload
 
     def fetch_input_package_file(
         self,
