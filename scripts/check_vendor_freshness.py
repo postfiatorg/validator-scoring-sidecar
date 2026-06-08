@@ -1,10 +1,12 @@
-"""Drift detection between sidecar vendor and foundation parser/selector.
+"""Drift detection between sidecar vendor and foundation parser/selector/commit-reveal.
 
-Fetches ``scoring_service/services/response_parser.py`` and
-``scoring_service/services/unl_selector.py`` from
+Fetches ``scoring_service/services/response_parser.py``,
+``scoring_service/services/unl_selector.py``, and
+``scoring_service/services/commit_reveal.py`` from
 ``postfiatorg/dynamic-unl-scoring`` at the given branch, computes sha256 over
-each, and compares against the sidecar's ``SUPPORTED_PARSER_CONTENT_HASHES``
-and ``SUPPORTED_SELECTOR_CONTENT_HASHES``.
+each, and compares against the sidecar's ``SUPPORTED_PARSER_CONTENT_HASHES``,
+``SUPPORTED_SELECTOR_CONTENT_HASHES``, and
+``SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES``.
 
 Exit codes:
 
@@ -24,6 +26,7 @@ import urllib.error
 import urllib.request
 
 from validator_scoring_sidecar.scoring import (
+    SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES,
     SUPPORTED_PARSER_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
 )
@@ -33,12 +36,13 @@ FOUNDATION_RAW_BASE = (
 )
 PARSER_PATH = "scoring_service/services/response_parser.py"
 SELECTOR_PATH = "scoring_service/services/unl_selector.py"
+COMMIT_REVEAL_PATH = "scoring_service/services/commit_reveal.py"
 HTTP_TIMEOUT_SECONDS = 30
 HTTP_NOT_FOUND = 404
 EXIT_OK = 0
 EXIT_DRIFT = 1
 EXIT_ERROR = 2
-DESCRIPTION = "Drift detection between sidecar vendor and foundation parser/selector."
+DESCRIPTION = "Drift detection between sidecar vendor and foundation parser/selector/commit-reveal."
 
 
 def _fetch(branch: str, path: str) -> bytes:
@@ -112,11 +116,17 @@ def main(argv: list[str] | None = None) -> int:
             SELECTOR_PATH,
             SUPPORTED_SELECTOR_CONTENT_HASHES,
         )
+        commit_reveal_matched = _check_module(
+            args.branch,
+            "commit-reveal",
+            COMMIT_REVEAL_PATH,
+            SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES,
+        )
     except urllib.error.URLError as exc:
         print(f"ERROR: failed to fetch foundation source: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    if parser_matched and selector_matched:
+    if parser_matched and selector_matched and commit_reveal_matched:
         return EXIT_OK
 
     print()

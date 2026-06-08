@@ -84,6 +84,16 @@ class RoundMetadata:
         }
 
 
+def round_identifier(payload: dict[str, Any]) -> int:
+    """Return the payload's positive integer round id, or 0 if absent/invalid.
+
+    Round-list entries are not guaranteed to carry a usable ``id``; the value is
+    used only to label round-metadata errors.
+    """
+    value = payload.get("id")
+    return value if isinstance(value, int) and value > 0 else 0
+
+
 def _required_frozen_input_fields(
     payload: dict[str, Any],
     requested_round_id: int,

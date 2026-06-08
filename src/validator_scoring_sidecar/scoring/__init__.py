@@ -7,6 +7,15 @@ layer would produce false output-divergence claims for rounds that are in
 agreement, so this package vendors the foundation parser and selector at a
 pinned commit rather than re-implementing them.
 
+The same package also vendors the foundation's ``commit_reveal.py`` protocol
+module, which the chain-integration path uses to decode and validate round
+announcements (and later to build and verify commit/reveal payloads). Unlike
+the parser and selector it imports only the standard library and ``xrpl.core``
+with no foundation-internal dependencies, so it needs no local adaptation: the
+byte-identical copy in ``_vendor_source`` is re-exported here and imported
+directly at runtime, guarded by ``SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES`` and
+the same freshness CI and provenance test as the parser and selector.
+
 Local adaptations are limited to making the modules self-contained:
 
 - The selector's ``cutoff``, ``max_size``, and ``min_gap`` parameters are
@@ -72,6 +81,11 @@ Refresh procedure when the foundation updates parser or selector:
      been successfully verified by a sidecar running the new vendor with no
      manifest-incompatible errors. Only then drop the prior hash.
 
+For ``commit_reveal.py`` the procedure is the same but simpler: it has no local
+adaptation and no separate runnable copy, so a refresh is just replacing the
+file in ``_vendor_source`` and adding the new digest to
+``SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES``.
+
 The CI workflow ``.github/workflows/vendor-freshness.yml`` runs the
 mechanical part of this procedure on every push and pull request against
 ``main``, ``devnet``, and ``testnet``. Drift on ``main`` is reported but
@@ -93,6 +107,7 @@ from validator_scoring_sidecar.scoring.selector import (
     UNLSelectionResult,
     select_unl,
 )
+from validator_scoring_sidecar.scoring._vendor_source import commit_reveal
 
 SUPPORTED_PARSER_CONTENT_HASHES: frozenset[str] = frozenset(
     {
@@ -104,16 +119,23 @@ SUPPORTED_SELECTOR_CONTENT_HASHES: frozenset[str] = frozenset(
         "cdd65a60565ba5ac340b5be60421f770905fc461cefa770c71465a179c2ff9f2",
     }
 )
+SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES: frozenset[str] = frozenset(
+    {
+        "70e6fefc3460a95e6c0cb55dfd0c901dc26ba1b8a1aaeb50cc2829371fb89b07",
+    }
+)
 
 __all__ = [
     "DIMENSIONAL_FIELDS",
     "NetworkReport",
     "NetworkReportCategory",
+    "SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES",
     "SUPPORTED_PARSER_CONTENT_HASHES",
     "SUPPORTED_SELECTOR_CONTENT_HASHES",
     "ScoringResult",
     "UNLSelectionResult",
     "ValidatorScore",
+    "commit_reveal",
     "parse_response",
     "select_unl",
 ]

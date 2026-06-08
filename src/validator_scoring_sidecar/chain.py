@@ -13,11 +13,27 @@ foundation-authored. No application-level signature is checked here.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from validator_scoring_sidecar.config import SidecarConfig
+from validator_scoring_sidecar.failure import FailureCategory
+from validator_scoring_sidecar.input_package import (
+    SOURCE_AUTO,
+    FetchedInputPackage,
+    fetch_input_package,
+)
+from validator_scoring_sidecar.round_metadata import (
+    MissingFrozenInputMetadata,
+    RoundMetadata,
+    RoundMetadataError,
+    round_identifier,
+)
+from validator_scoring_sidecar.scoring import commit_reveal
+from validator_scoring_sidecar.scoring_client import ScoringClient
 from validator_scoring_sidecar.state import ChainCursor, SidecarState
+from validator_scoring_sidecar.sync import DEFAULT_SYNC_ROUND_LIMIT
 
 DEFAULT_ACCOUNT_TX_PAGE_LIMIT = 200
 # xrpl uses -1 to mean "the latest validated ledger" for the upper bound and
@@ -300,6 +316,176 @@ def resolve_foundation_publisher_address(
         "No foundation publisher address available; set "
         "POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS / --foundation-publisher-address "
         "or ensure the scoring service /api/scoring/config exposes it"
+    )
+
+
+ANNOUNCEMENT_MEMO_FIELD = "Memo"
+MEMO_TYPE_FIELD = "MemoType"
+MEMO_DATA_FIELD = "MemoData"
+
+
+class AnnouncementError(ChainWatcherError):
+    """A round announcement could not be decoded, validated, or content-bound.
+
+    Carries a ``FailureCategory`` (``MANIFEST_UNSUPPORTED`` by default) so the
+    caller can record the round as skipped under the shared failure taxonomy.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: FailureCategory = FailureCategory.MANIFEST_UNSUPPORTED,
+    ):
+        super().__init__(message)
+        self.category = category
+
+
+@dataclass(frozen=True)
+class VerifiedAnnouncement:
+    """A decoded round announcement bound to a hash-verified input package."""
+
+    announcement: commit_reveal.RoundAnnouncement
+    package: FetchedInputPackage
+
+
+def decode_round_announcement(
+    transaction: WatchedTransaction,
+) -> commit_reveal.RoundAnnouncement | None:
+    """Decode and validate the round-announcement memo from a transaction.
+
+    Returns ``None`` when the transaction carries no round-announcement memo
+    (the watcher surfaces every trusted-sender transaction, not only
+    announcements). Raises ``AnnouncementError`` when an announcement memo is
+    present but its payload is malformed or fails protocol validation.
+    """
+
+    payload = _select_announcement_payload(transaction)
+    if payload is None:
+        return None
+    try:
+        return commit_reveal.validate_round_announcement(payload)
+    except commit_reveal.CommitRevealValidationError as exc:
+        raise AnnouncementError(f"invalid round announcement: {exc}") from exc
+
+
+def verify_announced_package(
+    announcement: commit_reveal.RoundAnnouncement,
+    config: SidecarConfig,
+    client: ScoringClient,
+    *,
+    package_fetcher=fetch_input_package,
+    round_limit: int = DEFAULT_SYNC_ROUND_LIMIT,
+) -> FetchedInputPackage:
+    """Bind an announcement to a frozen input package the sidecar verifies.
+
+    The memo carries only pointers; the package itself lives in IPFS. This
+    resolves the announced round by ``input_package_hash`` against recent rounds,
+    confirms the ``input_package_cid`` and network agree, and fetches-and-verifies
+    the package by hash through the existing M2.4 retrieval path. Raises
+    ``AnnouncementError`` on any mismatch.
+    """
+
+    if announcement.network != config.network:
+        raise AnnouncementError(
+            f"announcement network {announcement.network!r} does not match "
+            f"configured network {config.network!r}"
+        )
+    metadata = _resolve_announced_round(announcement, client, round_limit)
+    if metadata.input_package_cid != announcement.input_package_cid:
+        raise AnnouncementError(
+            "announcement input_package_cid does not match the round's "
+            "input_package_cid"
+        )
+    return package_fetcher(metadata, config, client, source=SOURCE_AUTO, force=False)
+
+
+def decode_and_verify_announcement(
+    transaction: WatchedTransaction,
+    config: SidecarConfig,
+    client: ScoringClient,
+    *,
+    package_fetcher=fetch_input_package,
+    round_limit: int = DEFAULT_SYNC_ROUND_LIMIT,
+) -> VerifiedAnnouncement | None:
+    """Decode, validate, and content-bind a watcher-surfaced transaction.
+
+    Returns ``None`` if the transaction is not a round announcement, a
+    ``VerifiedAnnouncement`` when it decodes and binds to a verified package, and
+    raises ``AnnouncementError`` on a malformed or unbindable announcement.
+    """
+
+    announcement = decode_round_announcement(transaction)
+    if announcement is None:
+        return None
+    package = verify_announced_package(
+        announcement,
+        config,
+        client,
+        package_fetcher=package_fetcher,
+        round_limit=round_limit,
+    )
+    return VerifiedAnnouncement(announcement=announcement, package=package)
+
+
+def _select_announcement_payload(
+    transaction: WatchedTransaction,
+) -> dict[str, Any] | None:
+    for memo in transaction.memos:
+        inner = memo.get(ANNOUNCEMENT_MEMO_FIELD) if isinstance(memo, dict) else None
+        if not isinstance(inner, dict):
+            continue
+        memo_type_hex = inner.get(MEMO_TYPE_FIELD)
+        if not isinstance(memo_type_hex, str):
+            continue
+        if _decode_hex_text(memo_type_hex) != commit_reveal.ROUND_ANNOUNCEMENT_TYPE:
+            continue
+        return _decode_announcement_memo_data(inner.get(MEMO_DATA_FIELD))
+    return None
+
+
+def _decode_announcement_memo_data(memo_data_hex: Any) -> dict[str, Any]:
+    if not isinstance(memo_data_hex, str):
+        raise AnnouncementError("round announcement memo is missing MemoData")
+    text = _decode_hex_text(memo_data_hex)
+    if text is None:
+        raise AnnouncementError("round announcement MemoData is not valid hex/UTF-8")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AnnouncementError(
+            f"round announcement MemoData is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise AnnouncementError("round announcement MemoData must be a JSON object")
+    return payload
+
+
+def _decode_hex_text(value: str) -> str | None:
+    try:
+        return bytes.fromhex(value).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _resolve_announced_round(
+    announcement: commit_reveal.RoundAnnouncement,
+    client: ScoringClient,
+    round_limit: int,
+) -> RoundMetadata:
+    for payload in client.fetch_rounds(limit=round_limit):
+        try:
+            metadata = RoundMetadata.from_api_payload(
+                payload,
+                requested_round_id=round_identifier(payload),
+            )
+        except (MissingFrozenInputMetadata, RoundMetadataError):
+            continue
+        if metadata.input_package_hash == announcement.input_package_hash:
+            return metadata
+    raise AnnouncementError(
+        "no recent round matches announced input_package_hash "
+        f"{announcement.input_package_hash}"
     )
 
 

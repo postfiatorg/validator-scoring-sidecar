@@ -20,6 +20,7 @@ from validator_scoring_sidecar.input_package import (
 from validator_scoring_sidecar.round_metadata import (
     MissingFrozenInputMetadata,
     RoundMetadata,
+    round_identifier,
 )
 from validator_scoring_sidecar.scoring_client import ScoringClient
 from validator_scoring_sidecar.state import SidecarState
@@ -126,7 +127,7 @@ def sync_input_package(
             try:
                 metadata = RoundMetadata.from_api_payload(
                     payload,
-                    requested_round_id=_round_identifier(payload),
+                    requested_round_id=round_identifier(payload),
                 )
             except MissingFrozenInputMetadata:
                 continue
@@ -171,8 +172,3 @@ def sync_input_package(
         network=config.network,
         scanned_rounds=len(round_payloads),
     )
-
-
-def _round_identifier(payload: dict[str, Any]) -> int:
-    value = payload.get("id")
-    return value if isinstance(value, int) and value > 0 else 0
