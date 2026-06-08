@@ -188,3 +188,19 @@ def test_chain_poll_interval_default_and_env():
         environ={"POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS": "30"}
     )
     assert config.chain_poll_interval_seconds == 30.0
+
+
+def test_validator_wallet_seed_read_from_env_only():
+    assert load_config(environ={}).validator_wallet_seed is None
+    config = load_config(
+        environ={"POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED": "sEdTESTseed"}
+    )
+    assert config.validator_wallet_seed == "sEdTESTseed"
+
+
+def test_validator_keys_path_read_from_env():
+    assert load_config(environ={}).validator_keys_path is None
+    config = load_config(
+        environ={"POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH": "/keys/validator-keys.json"}
+    )
+    assert config.validator_keys_path == "/keys/validator-keys.json"

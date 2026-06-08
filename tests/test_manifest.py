@@ -9,7 +9,9 @@ from validator_scoring_sidecar.failure import FailureCategory
 from validator_scoring_sidecar.manifest import (
     SUPPORTED_MANIFEST_SCHEMA_VERSIONS,
     CompatibilityResult,
+    ManifestError,
     check_compatibility,
+    selector_parameters,
 )
 from validator_scoring_sidecar.scoring import (
     SUPPORTED_PARSER_CONTENT_HASHES,
@@ -611,3 +613,28 @@ def test_fixture_builders_produce_compatible_records():
     assert deepcopy(manifest) == _manifest()
     assert deepcopy(deployment) == _deployment()
     assert SUPPORTED_MANIFEST_SCHEMA_VERSIONS
+
+
+def test_selector_parameters_extracts_integers():
+    manifest = {
+        "code": {
+            "selector": {
+                "parameters": {
+                    "score_cutoff": 40,
+                    "max_size": 35,
+                    "min_score_gap": 5,
+                }
+            }
+        }
+    }
+    assert selector_parameters(manifest) == {
+        "score_cutoff": 40,
+        "max_size": 35,
+        "min_score_gap": 5,
+    }
+
+
+def test_selector_parameters_rejects_missing_value():
+    manifest = {"code": {"selector": {"parameters": {"score_cutoff": 40}}}}
+    with pytest.raises(ManifestError):
+        selector_parameters(manifest)

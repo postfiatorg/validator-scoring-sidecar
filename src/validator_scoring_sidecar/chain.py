@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol
 
 from validator_scoring_sidecar.config import SidecarConfig
@@ -47,6 +48,10 @@ class ChainWatcherError(RuntimeError):
 
 class PftlRpcError(ChainWatcherError):
     """Raised when the PFTL RPC endpoint cannot be reached or returns an error."""
+
+
+class PftlInsufficientFundsError(PftlRpcError):
+    """Raised when a transaction is rejected for insufficient balance or fee."""
 
 
 @dataclass(frozen=True)
@@ -107,6 +112,17 @@ class PftlRpcClient(Protocol):
         marker: Any | None,
     ) -> dict[str, Any]: ...
 
+    def latest_validated_ledger_close_time(self) -> datetime: ...
+
+    def submit_memo(
+        self,
+        *,
+        wallet_seed: str,
+        destination: str,
+        memo_type: str,
+        memo_data: str,
+    ) -> str: ...
+
 
 class XrplPftlRpcClient:
     """``PftlRpcClient`` backed by xrpl-py's JSON-RPC client.
@@ -157,6 +173,68 @@ class XrplPftlRpcClient:
                 f"PFTL account_tx returned an error for {account}: {response.result}"
             )
         return response.result
+
+    def latest_validated_ledger_close_time(self) -> datetime:
+        from xrpl.models.requests import Ledger
+        from xrpl.utils import ripple_time_to_datetime
+
+        try:
+            response = self._ensure_client().request(Ledger(ledger_index="validated"))
+        except Exception as exc:  # noqa: BLE001 - surface any transport failure uniformly
+            raise PftlRpcError(f"PFTL ledger request failed: {exc}") from exc
+        if not response.is_successful():
+            raise PftlRpcError(
+                f"PFTL ledger request returned an error: {response.result}"
+            )
+        try:
+            close_time = response.result["ledger"]["close_time"]
+        except (KeyError, TypeError) as exc:
+            raise PftlRpcError("PFTL ledger response has no close_time") from exc
+        return ripple_time_to_datetime(int(close_time))
+
+    def submit_memo(
+        self,
+        *,
+        wallet_seed: str,
+        destination: str,
+        memo_type: str,
+        memo_data: str,
+    ) -> str:
+        from xrpl.models.transactions import Memo, Payment
+        from xrpl.transaction import submit_and_wait
+        from xrpl.utils import str_to_hex
+        from xrpl.wallet import Wallet
+
+        wallet = Wallet.from_seed(wallet_seed)
+        payment = Payment(
+            account=wallet.classic_address,
+            destination=destination,
+            amount="1",
+            memos=[
+                Memo(
+                    memo_type=str_to_hex(memo_type),
+                    memo_data=str_to_hex(memo_data),
+                )
+            ],
+        )
+        try:
+            response = submit_and_wait(payment, self._ensure_client(), wallet)
+        except Exception as exc:  # noqa: BLE001 - normalize xrpl submission failures
+            if _is_insufficient_funds(str(exc)):
+                raise PftlInsufficientFundsError(str(exc)) from exc
+            raise PftlRpcError(f"PFTL commit submission failed: {exc}") from exc
+        result = response.result
+        engine_result = result.get("meta", {}).get("TransactionResult") or result.get(
+            "engine_result"
+        )
+        if engine_result not in (None, "tesSUCCESS"):
+            if _is_insufficient_funds(str(engine_result)):
+                raise PftlInsufficientFundsError(f"PFTL commit rejected: {engine_result}")
+            raise PftlRpcError(f"PFTL commit rejected: {engine_result}")
+        tx_hash = result.get("hash") or result.get("tx_json", {}).get("hash")
+        if not isinstance(tx_hash, str):
+            raise PftlRpcError("PFTL commit submission returned no transaction hash")
+        return tx_hash
 
 
 class PftlAccountWatcher:
@@ -466,6 +544,50 @@ def _decode_hex_text(value: str) -> str | None:
         return bytes.fromhex(value).decode("utf-8")
     except (ValueError, UnicodeDecodeError):
         return None
+
+
+def _is_insufficient_funds(text: str) -> bool:
+    lowered = text.lower()
+    return "insuf" in lowered or "unfunded" in lowered
+
+
+def find_memo_payload(
+    memos: list[Any],
+    memo_type: str,
+) -> dict[str, Any] | None:
+    """Return the JSON payload of the first memo of ``memo_type``, leniently.
+
+    Malformed or non-matching memos are skipped (no raise), so this is safe for
+    scanning historical transactions — e.g. checking whether a commit already
+    exists for a round before submitting another.
+    """
+
+    for memo in memos:
+        decoded = _decode_memo(memo)
+        if decoded is not None and decoded[0] == memo_type:
+            return decoded[1]
+    return None
+
+
+def _decode_memo(memo: Any) -> tuple[str, dict[str, Any]] | None:
+    inner = memo.get(ANNOUNCEMENT_MEMO_FIELD) if isinstance(memo, dict) else None
+    if not isinstance(inner, dict):
+        return None
+    memo_type_hex = inner.get(MEMO_TYPE_FIELD)
+    memo_data_hex = inner.get(MEMO_DATA_FIELD)
+    if not isinstance(memo_type_hex, str) or not isinstance(memo_data_hex, str):
+        return None
+    memo_type = _decode_hex_text(memo_type_hex)
+    text = _decode_hex_text(memo_data_hex)
+    if memo_type is None or text is None:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return memo_type, payload
 
 
 def _resolve_announced_round(

@@ -609,3 +609,30 @@ def _incompatible(field_name: str, message: str) -> Failure:
         field=field_name,
         message=message,
     )
+
+
+class ManifestError(ValueError):
+    """Raised when a required manifest value is missing or malformed."""
+
+
+def selector_parameters(manifest: dict[str, Any]) -> dict[str, int]:
+    """Return the UNL selector parameters frozen in the execution manifest.
+
+    Reads ``code.selector.parameters`` and returns ``score_cutoff``,
+    ``max_size``, and ``min_score_gap`` as integers. Raises ``ManifestError`` if
+    any is absent or not an integer.
+    """
+    code = manifest.get("code", {}) if isinstance(manifest, dict) else {}
+    selector = code.get("selector", {}) if isinstance(code, dict) else {}
+    params = selector.get("parameters", {}) if isinstance(selector, dict) else {}
+    if not isinstance(params, dict):
+        raise ManifestError("manifest code.selector.parameters must be an object")
+    result: dict[str, int] = {}
+    for name in ("score_cutoff", "max_size", "min_score_gap"):
+        value = params.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ManifestError(
+                f"manifest code.selector.parameters.{name} must be an integer"
+            )
+        result[name] = value
+    return result

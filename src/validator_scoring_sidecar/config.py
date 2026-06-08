@@ -29,6 +29,8 @@ ENV_TIMEOUT_SECONDS = "POSTFIAT_SIDECAR_TIMEOUT_SECONDS"
 ENV_PFTL_RPC_URL = "POSTFIAT_SIDECAR_PFTL_RPC_URL"
 ENV_FOUNDATION_PUBLISHER_ADDRESS = "POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS"
 ENV_CHAIN_POLL_INTERVAL_SECONDS = "POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS"
+ENV_VALIDATOR_WALLET_SEED = "POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED"
+ENV_VALIDATOR_KEYS_PATH = "POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH"
 
 
 class ConfigError(ValueError):
@@ -47,6 +49,8 @@ class SidecarConfig:
     pftl_rpc_url: str
     foundation_publisher_address: str | None
     chain_poll_interval_seconds: float
+    validator_wallet_seed: str | None
+    validator_keys_path: str | None
 
 
 def load_config(
@@ -111,6 +115,16 @@ def load_config(
         env_value=env.get(ENV_CHAIN_POLL_INTERVAL_SECONDS),
         default=str(DEFAULT_CHAIN_POLL_INTERVAL_SECONDS),
     )
+    # Wallet seed and key path are read from the environment only — never from a
+    # CLI flag — so secret material does not land in shell history or argv.
+    resolved_wallet_seed = _resolve_optional(
+        cli_value=None,
+        env_value=env.get(ENV_VALIDATOR_WALLET_SEED),
+    )
+    resolved_validator_keys_path = _resolve_optional(
+        cli_value=None,
+        env_value=env.get(ENV_VALIDATOR_KEYS_PATH),
+    )
 
     return SidecarConfig(
         scoring_base_url=_normalize_base_url(resolved_base_url),
@@ -131,6 +145,8 @@ def load_config(
             else None
         ),
         chain_poll_interval_seconds=_parse_chain_poll_interval(resolved_poll_interval),
+        validator_wallet_seed=resolved_wallet_seed,
+        validator_keys_path=resolved_validator_keys_path,
     )
 
 

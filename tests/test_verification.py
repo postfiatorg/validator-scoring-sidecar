@@ -8,19 +8,26 @@ from validator_scoring_sidecar.input_package import canonical_json_hash
 from validator_scoring_sidecar.scoring import parse_response
 from validator_scoring_sidecar.verification import (
     HASH_MODEL_RESPONSE,
+    HASH_SELECTED_UNL,
     HASH_VALIDATOR_SCORES,
     LEVEL_PARSED,
     LEVEL_RAW,
+    LEVEL_SELECTED_UNL,
     VerificationError,
     build_model_response_document,
+    build_selected_unl_document,
     build_validator_scores_document,
+    compare_hashes,
     compute_verification_hashes,
+    load_previous_unl,
     load_validator_map,
     persist_verification_hashes,
     read_verification_hashes,
     verification_hashes_path,
     verify_round,
 )
+
+SELECTOR_PARAMETERS = {"score_cutoff": 40, "max_size": 35, "min_score_gap": 5}
 
 MASTER_KEY = "nHBoneMasterKey"
 VALIDATOR_MAP = {"v1": {"master_key": MASTER_KEY}}
@@ -279,3 +286,53 @@ def test_load_validator_map_invalid_json_raises(tmp_path):
 
     with pytest.raises(VerificationError, match="not valid JSON"):
         load_validator_map(tmp_path)
+
+
+def test_build_selected_unl_document_mirrors_foundation():
+    class _Result:
+        unl = ["nHa", "nHb"]
+        alternates = ["nHc"]
+
+    assert build_selected_unl_document(_Result()) == {
+        "unl": ["nHa", "nHb"],
+        "alternates": ["nHc"],
+    }
+
+
+def test_compute_verification_hashes_includes_selected_unl_when_enabled():
+    hashes = compute_verification_hashes(
+        _raw_response(),
+        VALIDATOR_MAP,
+        previous_unl=[],
+        selector_parameters=SELECTOR_PARAMETERS,
+    )
+    # v1 scores 80 (>= cutoff 40), first round → it is the only UNL member.
+    assert hashes[HASH_SELECTED_UNL] == canonical_json_hash(
+        {"unl": [MASTER_KEY], "alternates": []}
+    )
+
+
+def test_compute_verification_hashes_omits_selected_unl_without_inputs():
+    hashes = compute_verification_hashes(_raw_response(), VALIDATOR_MAP)
+    assert HASH_SELECTED_UNL not in hashes
+    assert HASH_MODEL_RESPONSE in hashes
+    assert HASH_VALIDATOR_SCORES in hashes
+
+
+def test_compare_hashes_skips_selected_unl_the_sidecar_did_not_compute():
+    sidecar = compute_verification_hashes(_raw_response(), VALIDATOR_MAP)  # 2 hashes
+    foundation = dict(sidecar)
+    foundation[HASH_SELECTED_UNL] = "f" * 64  # foundation has it; sidecar does not
+    result = compare_hashes(INPUT_PACKAGE_HASH, sidecar, foundation)
+    assert LEVEL_SELECTED_UNL not in result.matched_levels
+    assert LEVEL_SELECTED_UNL not in result.diverged_levels
+    assert result.failure is None
+
+
+def test_load_previous_unl_reads_frozen_file(tmp_path):
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    (inputs_dir / "previous_unl.json").write_text(
+        '{"previous_unl": ["nHx", "nHy"]}', encoding="utf-8"
+    )
+    assert load_previous_unl(tmp_path) == ["nHx", "nHy"]

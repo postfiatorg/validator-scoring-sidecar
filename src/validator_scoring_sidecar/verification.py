@@ -13,17 +13,18 @@ package:
 - ``validator_scores`` — the vendored parser's output rendered into the
   foundation's ``validator_scores`` document and hashed.
 
-The ``selected_unl`` level is intentionally not handled here: UNL selection
-needs the previous round's UNL, which the foundation reads from its database at
-scoring time and does not freeze into the input package, so it is not yet
-reproducible (see ``docs/phase2/SidecarScoringSpec.md`` in the foundation
-repo). ``signed_validator_list`` is foundation-only; the sidecar never signs.
+- ``selected_unl`` — the vendored selector run on the parsed scores with the
+  previous UNL (now frozen into the input package as ``inputs/previous_unl.json``)
+  and the manifest's selector parameters, rendered into the foundation's
+  ``selected_unl`` document and hashed. It is computed only when the caller
+  supplies the previous UNL and selector parameters.
 
-The document builders here mirror the foundation's ``_build_raw_response`` and
-``_build_scores`` in ``scoring_service/services/ipfs_publisher.py``. They must
-stay byte-for-byte in sync with those, since the hashes are taken over their
-output; unlike the parser and selector they are not yet pinned by a manifest
-content hash.
+``signed_validator_list`` is foundation-only; the sidecar never signs.
+
+The document builders here mirror the foundation's ``_build_raw_response``,
+``_build_scores``, and ``_build_unl`` in
+``scoring_service/services/ipfs_publisher.py``. They must stay byte-for-byte in
+sync with those, since the hashes are taken over their output.
 
 This module is pure: it does no network I/O. Fetching the foundation's
 ``outputs/verification_hashes.json`` and recording state belong to the
@@ -41,22 +42,28 @@ from typing import Any
 from validator_scoring_sidecar.config import SidecarConfig
 from validator_scoring_sidecar.failure import Failure, FailureCategory
 from validator_scoring_sidecar.input_package import canonical_json_hash
-from validator_scoring_sidecar.scoring import ScoringResult, parse_response
+from validator_scoring_sidecar.scoring import ScoringResult, parse_response, select_unl
 
 VALIDATOR_MAP_RELATIVE_PATH = "inputs/validator_map.json"
+PREVIOUS_UNL_RELATIVE_PATH = "inputs/previous_unl.json"
 SCORED_DIR_NAME = "scored"
 VERIFICATION_HASHES_FILE_NAME = "verification_hashes.json"
 
 LEVEL_RAW = "RAW_MATCH"
 LEVEL_PARSED = "PARSED_MATCH"
+LEVEL_SELECTED_UNL = "SELECTED_UNL_MATCH"
 HASH_MODEL_RESPONSE = "model_response_hash"
 HASH_VALIDATOR_SCORES = "validator_scores_hash"
+HASH_SELECTED_UNL = "selected_unl_hash"
 
 # Sidecar-comparable levels, in priority order, mapped to the corresponding key
-# in the foundation's outputs/verification_hashes.json.
+# in the foundation's outputs/verification_hashes.json. ``selected_unl`` is
+# reproducible only once the previous UNL is frozen into the input package, so it
+# is computed when the caller supplies the previous UNL and selector parameters.
 COMPARABLE_LEVELS: tuple[tuple[str, str], ...] = (
     (LEVEL_RAW, HASH_MODEL_RESPONSE),
     (LEVEL_PARSED, HASH_VALIDATOR_SCORES),
+    (LEVEL_SELECTED_UNL, HASH_SELECTED_UNL),
 )
 
 
@@ -112,6 +119,36 @@ def load_validator_map(package_path: Path) -> dict[str, Any]:
     return content
 
 
+def load_previous_unl(package_path: Path) -> list[str]:
+    """Load the frozen ``inputs/previous_unl.json`` from a verified package.
+
+    Returns the previous round's UNL (validator master keys; empty for the first
+    round). The foundation freezes this at INPUT_FROZEN so UNL selection is
+    reproducible from the package alone.
+    """
+
+    target = Path(package_path).joinpath(*PREVIOUS_UNL_RELATIVE_PATH.split("/"))
+    try:
+        content = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise VerificationError(f"frozen previous UNL not found: {target}") from exc
+    except json.JSONDecodeError as exc:
+        raise VerificationError(
+            f"frozen previous UNL is not valid JSON: {target}"
+        ) from exc
+    if not isinstance(content, dict):
+        raise VerificationError(f"frozen previous UNL must be a JSON object: {target}")
+    previous_unl = content.get("previous_unl")
+    if not isinstance(previous_unl, list) or any(
+        not isinstance(key, str) for key in previous_unl
+    ):
+        raise VerificationError(
+            "frozen previous UNL must contain a 'previous_unl' list of strings: "
+            f"{target}"
+        )
+    return previous_unl
+
+
 def build_model_response_document(raw_text: str) -> dict[str, Any]:
     """Mirror the foundation's ``_build_raw_response``."""
 
@@ -143,14 +180,33 @@ def build_validator_scores_document(scoring_result: ScoringResult) -> dict[str, 
     return scores
 
 
+def build_selected_unl_document(unl_result) -> dict[str, Any]:
+    """Mirror the foundation's ``_build_unl``."""
+
+    return {
+        "unl": list(unl_result.unl),
+        "alternates": list(unl_result.alternates),
+    }
+
+
 def compute_verification_hashes(
     raw_text: str,
     validator_id_map: dict[str, Any],
+    *,
+    previous_unl: list[str] | None = None,
+    selector_parameters: dict[str, int] | None = None,
 ) -> dict[str, str]:
-    """Compute the sidecar's reproducible verification hashes from a response."""
+    """Compute the sidecar's reproducible verification hashes from a response.
+
+    ``model_response`` and ``validator_scores`` are always computed.
+    ``selected_unl`` is computed only when both ``previous_unl`` and
+    ``selector_parameters`` are supplied — the previous UNL comes from the frozen
+    ``inputs/previous_unl.json`` and the parameters from the execution manifest's
+    ``code.selector.parameters``.
+    """
 
     scoring_result = parse_response(raw_text, validator_id_map)
-    return {
+    hashes = {
         HASH_MODEL_RESPONSE: canonical_json_hash(
             build_model_response_document(raw_text)
         ),
@@ -158,6 +214,18 @@ def compute_verification_hashes(
             build_validator_scores_document(scoring_result)
         ),
     }
+    if previous_unl is not None and selector_parameters is not None:
+        unl_result = select_unl(
+            scoring_result,
+            cutoff=selector_parameters["score_cutoff"],
+            max_size=selector_parameters["max_size"],
+            min_gap=selector_parameters["min_score_gap"],
+            previous_unl=previous_unl,
+        )
+        hashes[HASH_SELECTED_UNL] = canonical_json_hash(
+            build_selected_unl_document(unl_result)
+        )
+    return hashes
 
 
 def verify_round(
@@ -166,15 +234,26 @@ def verify_round(
     *,
     input_package_hash: str,
     foundation_hashes: dict[str, Any] | None = None,
+    previous_unl: list[str] | None = None,
+    selector_parameters: dict[str, int] | None = None,
 ) -> VerificationResult:
     """Compute the sidecar hashes and compare them to the foundation's, if given.
 
     When ``foundation_hashes`` is ``None`` (the foundation final bundle is not
     available yet), the sidecar hashes are computed but no comparison is made;
     the caller persists them and retries the comparison on a later pass.
+
+    ``previous_unl`` and ``selector_parameters`` enable the ``selected_unl``
+    level; omit them to compute only the model-response and validator-scores
+    levels.
     """
 
-    hashes = compute_verification_hashes(raw_text, validator_id_map)
+    hashes = compute_verification_hashes(
+        raw_text,
+        validator_id_map,
+        previous_unl=previous_unl,
+        selector_parameters=selector_parameters,
+    )
     if foundation_hashes is None:
         return VerificationResult(
             input_package_hash=input_package_hash,
@@ -203,9 +282,13 @@ def compare_hashes(
     diverged: list[str] = []
     for level, hash_name in COMPARABLE_LEVELS:
         foundation_hash = foundation_hashes.get(hash_name)
-        if not isinstance(foundation_hash, str):
+        sidecar_hash = sidecar_hashes.get(hash_name)
+        # Skip a level unless both sides produced it: a level the sidecar did
+        # not reproduce (e.g. selected_unl without a frozen previous UNL) is not
+        # a divergence.
+        if not isinstance(foundation_hash, str) or not isinstance(sidecar_hash, str):
             continue
-        if sidecar_hashes.get(hash_name) == foundation_hash:
+        if sidecar_hash == foundation_hash:
             matched.append(level)
         else:
             diverged.append(level)

@@ -12,6 +12,7 @@ from validator_scoring_sidecar.state import (
     STATE_INPUT_PACKAGE_VERIFIED,
     STATE_SCORED,
     STATE_SCORING_FAILED,
+    CommitOutcome,
     ScoreOutcome,
     SidecarState,
     SidecarStateError,
@@ -290,7 +291,7 @@ def test_chain_cursor_round_trip(tmp_path):
         assert updated.last_processed_tx_hash == "b" * 64
 
 
-def test_fresh_database_is_schema_v3(tmp_path):
+def test_fresh_database_is_schema_v4(tmp_path):
     with SidecarState(tmp_path) as state:
         state.set_chain_cursor("testnet", "rPub", 1, "h")
 
@@ -302,7 +303,39 @@ def test_fresh_database_is_schema_v3(tmp_path):
     assert version == SCHEMA_VERSION
 
 
-def test_v1_database_migrates_to_v3_adds_chain_cursor(tmp_path):
+def test_record_commit_persists_commit_state_and_preserves_inputs(tmp_path):
+    metadata = _metadata()
+    cache_path = tmp_path / "packages" / metadata.input_package_hash
+    cache_path.mkdir(parents=True)
+    with SidecarState(tmp_path) as state:
+        state.record_input_verified(
+            "testnet", metadata, _fetched_package(tmp_path, metadata)
+        )
+        state.record_commit(
+            "testnet",
+            metadata,
+            CommitOutcome(
+                validator_master_key="nHValidatorKey",
+                salt="d" * 64,
+                commit_tx_hash="TX1",
+                commit_opens_at="2026-05-25T00:00:00+00:00",
+                commit_closes_at="2026-05-25T00:30:00+00:00",
+                reveal_opens_at="2026-05-25T00:30:00+00:00",
+                reveal_closes_at="2026-05-25T01:00:00+00:00",
+            ),
+        )
+        record = state.get_round("testnet", metadata.round_id)
+
+    assert record.commit_tx_hash == "TX1"
+    assert record.salt == "d" * 64
+    assert record.validator_master_key == "nHValidatorKey"
+    assert record.reveal_closes_at == "2026-05-25T01:00:00+00:00"
+    # The commit upsert preserves the input-fetch columns.
+    assert record.local_package_path == str(cache_path)
+    assert record.fetch_source == "https"
+
+
+def test_v1_database_migrates_to_v4(tmp_path):
     db_path = tmp_path / STATE_DB_FILENAME
     connection = sqlite3.connect(db_path)
     try:
@@ -313,8 +346,24 @@ def test_v1_database_migrates_to_v3_adds_chain_cursor(tmp_path):
         connection.close()
 
     with SidecarState(tmp_path) as state:
+        # v3 adds the chain_cursor table.
         state.set_chain_cursor("testnet", "rPub", 10, "h")
         assert state.get_chain_cursor("testnet", "rPub").last_processed_ledger_index == 10
+        # v4 commit columns exist via the ALTER path, not only fresh _create_schema.
+        state.record_commit(
+            "testnet",
+            _metadata(),
+            CommitOutcome(
+                validator_master_key="nHValidatorKey",
+                salt="d" * 64,
+                commit_tx_hash="TX1",
+                commit_opens_at="2026-05-25T00:00:00+00:00",
+                commit_closes_at="2026-05-25T00:30:00+00:00",
+                reveal_opens_at="2026-05-25T00:30:00+00:00",
+                reveal_closes_at="2026-05-25T01:00:00+00:00",
+            ),
+        )
+        assert state.get_round("testnet", _metadata().round_id).commit_tx_hash == "TX1"
 
     connection = sqlite3.connect(db_path)
     try:

@@ -45,7 +45,7 @@ from validator_scoring_sidecar.inference import (
     load_model_request,
 )
 from validator_scoring_sidecar.input_package import SOURCE_AUTO, fetch_input_package
-from validator_scoring_sidecar.manifest import check_compatibility
+from validator_scoring_sidecar.manifest import check_compatibility, selector_parameters
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.scoring_client import ScoringClient, ScoringClientError
 from validator_scoring_sidecar.state import (
@@ -60,7 +60,9 @@ from validator_scoring_sidecar.sync import DEFAULT_SYNC_ROUND_LIMIT, SidecarLock
 from validator_scoring_sidecar.verification import (
     HASH_MODEL_RESPONSE,
     HASH_VALIDATOR_SCORES,
+    HASH_SELECTED_UNL,
     compare_hashes,
+    load_previous_unl,
     load_validator_map,
     persist_verification_hashes,
     read_verification_hashes,
@@ -266,12 +268,22 @@ def _full_score(
             backend.close()
 
     validator_map = load_validator_map(fetched.local_path)
+    # The selected_unl level is reproducible only when the foundation froze the
+    # previous UNL into the package. Older packages lack it, so fall back to
+    # the model-response and validator-scores levels.
+    previous_unl = None
+    selector_params = None
+    if (fetched.local_path / "inputs" / "previous_unl.json").exists():
+        previous_unl = load_previous_unl(fetched.local_path)
+        selector_params = selector_parameters(manifest)
     foundation = fetch_foundation(client, metadata, config)
     verification = verify_round(
         inference.content,
         validator_map,
         input_package_hash=metadata.input_package_hash,
         foundation_hashes=foundation,
+        previous_unl=previous_unl,
+        selector_parameters=selector_params,
     )
     persist_verification_hashes(config, metadata.input_package_hash, verification.hashes)
     outcome = _scored_outcome(compat.effective_mode, verification.hashes, verification)
@@ -387,6 +399,7 @@ def _scored_outcome(
         backend_mode=backend_mode,
         model_response_hash=hashes.get(HASH_MODEL_RESPONSE),
         validator_scores_hash=hashes.get(HASH_VALIDATOR_SCORES),
+        selected_unl_hash=hashes.get(HASH_SELECTED_UNL),
         comparison_levels_matched=(
             verification.matched_levels if verification.compared else None
         ),
