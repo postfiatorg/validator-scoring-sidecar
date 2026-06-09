@@ -1,0 +1,366 @@
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+from xrpl.core import keypairs
+from xrpl.core.addresscodec import encode_node_public_key
+
+from validator_scoring_sidecar.chain import VerifiedAnnouncement
+from validator_scoring_sidecar.config import load_config
+from validator_scoring_sidecar.deployment import NoEligibleRoundError
+from validator_scoring_sidecar.input_package import FetchedInputPackage
+from validator_scoring_sidecar.participate import ParticipationConfigError, participate
+from validator_scoring_sidecar.round_metadata import RoundMetadata
+from validator_scoring_sidecar.score import ScoreResult
+from validator_scoring_sidecar.scoring import commit_reveal
+from validator_scoring_sidecar.state import (
+    STATE_COMMITTED,
+    STATE_REVEALED,
+    STATE_SCORED,
+    ScoreOutcome,
+    SidecarState,
+)
+from validator_scoring_sidecar.verification import (
+    HASH_MODEL_RESPONSE,
+    HASH_SELECTED_UNL,
+    HASH_VALIDATOR_SCORES,
+)
+
+NETWORK = "testnet"
+PUBLISHER = "rFoundationPublisher"
+CID = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+INPUT_HASH = "a" * 64
+ROUND_NUMBER = 456
+ROUND_ID = 123
+OUTPUT_HASHES = {
+    HASH_MODEL_RESPONSE: "1" * 64,
+    HASH_VALIDATOR_SCORES: "2" * 64,
+    HASH_SELECTED_UNL: "3" * 64,
+}
+
+# commit window [00:00, 00:30); reveal window [00:30, 01:00).
+COMMIT_TIME = datetime(2026, 5, 25, 0, 15, tzinfo=timezone.utc)
+REVEAL_TIME = datetime(2026, 5, 25, 0, 45, tzinfo=timezone.utc)
+AFTER_REVEAL = datetime(2026, 5, 25, 1, 5, tzinfo=timezone.utc)
+
+ANNOUNCEMENT_TX = {
+    "validated": True,
+    "tx_json": {"Account": PUBLISHER, "Memos": []},
+    "hash": "ANNTX",
+    "ledger_index": 100,
+}
+
+
+class FakeSigner:
+    def __init__(self):
+        seed = keypairs.generate_seed()
+        self._public, self._private = keypairs.derive_keypair(seed)
+        self._master_key = encode_node_public_key(bytes.fromhex(self._public))
+
+    @property
+    def master_key(self) -> str:
+        return self._master_key
+
+    def sign(self, message: bytes) -> str:
+        return keypairs.sign(message, self._private)
+
+
+class FakeRpc:
+    def __init__(self, *, close_time, transactions=None):
+        self.close_time = close_time
+        self.transactions = transactions or []
+        self.submitted = []
+        self._counter = 0
+
+    def latest_validated_ledger_close_time(self):
+        return self.close_time
+
+    def account_tx(self, *, account, ledger_index_min, ledger_index_max, forward, limit, marker):
+        return {"transactions": self.transactions}
+
+    def submit_memo(self, *, wallet_seed, destination, memo_type, memo_data):
+        self._counter += 1
+        tx_hash = f"TX{self._counter}"
+        self.submitted.append({"memo_type": memo_type, "destination": destination, "hash": tx_hash})
+        return tx_hash
+
+
+class FakeClient:
+    def fetch_config(self):
+        return {
+            "foundation_publisher_address": PUBLISHER,
+            "announcement_memo_type": commit_reveal.ROUND_ANNOUNCEMENT_TYPE,
+            "announcement_commit_window_seconds": 1800,
+            "announcement_reveal_window_seconds": 1800,
+            "announcement_reveal_gap_seconds": 0,
+        }
+
+
+def _announcement():
+    return commit_reveal.build_round_announcement(
+        network=NETWORK,
+        round_number=ROUND_NUMBER,
+        input_package_cid=CID,
+        input_package_hash=INPUT_HASH,
+        commit_opens_at="2026-05-25T00:00:00+00:00",
+        commit_closes_at="2026-05-25T00:30:00+00:00",
+        reveal_opens_at="2026-05-25T00:30:00+00:00",
+        reveal_closes_at="2026-05-25T01:00:00+00:00",
+    )
+
+
+def _package():
+    return FetchedInputPackage(
+        round_id=ROUND_ID,
+        round_number=ROUND_NUMBER,
+        network=NETWORK,
+        input_package_cid=CID,
+        input_package_hash=INPUT_HASH,
+        input_frozen_at="2026-05-25T00:00:00+00:00",
+        source="https",
+        cached=False,
+        local_path=Path("/unused"),
+        verified_file_count=3,
+    )
+
+
+def fake_decoder(transaction, config, client, *, package_fetcher=None, round_limit=None):
+    if transaction.tx_hash == "ANNTX":
+        return VerifiedAnnouncement(announcement=_announcement(), package=_package())
+    return None
+
+
+def fake_score_runner(config, client, *, source=None, round_limit=None):
+    return ScoreResult(
+        status="already_scored",
+        network=NETWORK,
+        round_id=ROUND_ID,
+        round_number=ROUND_NUMBER,
+        sidecar_state=STATE_SCORED,
+        backend_mode="modal",
+        compared=True,
+        matched_levels=[],
+        error_category=None,
+    )
+
+
+def _no_score(*args, **kwargs):
+    raise AssertionError("must not score before the config gate passes")
+
+
+def _metadata():
+    return RoundMetadata(
+        round_id=ROUND_ID,
+        round_number=ROUND_NUMBER,
+        status="INPUT_FROZEN",
+        input_package_cid=CID,
+        input_package_hash=INPUT_HASH,
+        input_frozen_at="2026-05-25T00:00:00+00:00",
+        final_bundle_cid=None,
+    )
+
+
+def _config(tmp_path, *, with_seed=True, with_keys=True):
+    environ = {}
+    if with_seed:
+        environ["POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED"] = "sEdTESTseed"
+    if with_keys:
+        environ["POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH"] = "/keys/validator-keys.json"
+    return load_config(network=NETWORK, data_dir=tmp_path, environ=environ)
+
+
+def _seed_scored(tmp_path):
+    with SidecarState(tmp_path) as state:
+        state.record_score(
+            NETWORK,
+            _metadata(),
+            ScoreOutcome(
+                sidecar_state=STATE_SCORED,
+                backend_mode="modal",
+                model_response_hash=OUTPUT_HASHES[HASH_MODEL_RESPONSE],
+                validator_scores_hash=OUTPUT_HASHES[HASH_VALIDATOR_SCORES],
+                selected_unl_hash=OUTPUT_HASHES[HASH_SELECTED_UNL],
+            ),
+        )
+
+
+def _participate(tmp_path, signer, rpc, *, score_runner=fake_score_runner):
+    return participate(
+        _config(tmp_path),
+        FakeClient(),
+        rpc_client=rpc,
+        signer=signer,
+        score_runner=score_runner,
+        announcement_decoder=fake_decoder,
+    )
+
+
+def test_participate_commits_in_commit_window(tmp_path):
+    _seed_scored(tmp_path)
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    result = _participate(tmp_path, FakeSigner(), rpc)
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert record.sidecar_state == STATE_COMMITTED
+    assert record.commit_tx_hash is not None
+    assert any(entry["status"] == "committed" for entry in result.commits)
+    assert len(rpc.submitted) == 1
+    assert rpc.submitted[0]["memo_type"] == commit_reveal.VALIDATOR_COMMIT_TYPE
+    # The reveal window has not opened, so no reveal is broadcast.
+    assert all(entry["status"] != "revealed" for entry in result.reveals)
+
+
+def test_participate_reveals_in_reveal_window(tmp_path):
+    _seed_scored(tmp_path)
+    signer = FakeSigner()
+    _participate(tmp_path, signer, FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX]))
+
+    rpc = FakeRpc(close_time=REVEAL_TIME, transactions=[ANNOUNCEMENT_TX])
+    result = _participate(tmp_path, signer, rpc)
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert record.sidecar_state == STATE_REVEALED
+    assert record.reveal_tx_hash is not None
+    assert any(entry["status"] == "revealed" for entry in result.reveals)
+    assert any(s["memo_type"] == commit_reveal.VALIDATOR_REVEAL_TYPE for s in rpc.submitted)
+
+
+def test_participate_records_reveal_miss_after_window(tmp_path):
+    _seed_scored(tmp_path)
+    signer = FakeSigner()
+    _participate(tmp_path, signer, FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX]))
+
+    rpc = FakeRpc(close_time=AFTER_REVEAL, transactions=[])
+    result = _participate(tmp_path, signer, rpc)
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert record.sidecar_state == STATE_COMMITTED
+    assert record.reveal_error_category == "REVEAL_WINDOW_MISSED"
+    assert any(entry["status"] == "reveal_window_missed" for entry in result.reveals)
+    assert rpc.submitted == []
+
+
+def test_participate_restart_does_not_double_commit(tmp_path):
+    _seed_scored(tmp_path)
+    signer = FakeSigner()
+    _participate(tmp_path, signer, FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX]))
+    with SidecarState(tmp_path) as state:
+        first_commit = state.get_round(NETWORK, ROUND_ID).commit_tx_hash
+
+    # A clean restart: the chain cursor advanced past the announcement, so it is
+    # not reprocessed and nothing is re-submitted.
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    _participate(tmp_path, signer, rpc)
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+    assert rpc.submitted == []
+    assert record.sidecar_state == STATE_COMMITTED
+    assert record.commit_tx_hash == first_commit
+
+
+def test_participate_reprocessed_announcement_is_idempotent(tmp_path):
+    _seed_scored(tmp_path)
+    signer = FakeSigner()
+    _participate(tmp_path, signer, FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX]))
+
+    # Simulate a crash after committing but before the cursor advanced: rewind the
+    # cursor so the announcement re-surfaces. The local commit state must stop a
+    # second submission.
+    with SidecarState(tmp_path) as state:
+        state.set_chain_cursor(NETWORK, PUBLISHER, 99, "OLDER")
+
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    result = _participate(tmp_path, signer, rpc)
+
+    assert rpc.submitted == []
+    assert any(entry["status"] == "already_committed" for entry in result.commits)
+
+
+def test_participate_skips_announcement_for_unscored_round(tmp_path):
+    # No seeded score: the announced round is not yet scored, so no commit.
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    result = _participate(tmp_path, FakeSigner(), rpc)
+
+    assert rpc.submitted == []
+    assert any(entry["status"] == "round_not_scored" for entry in result.commits)
+
+
+def test_participate_reveals_when_no_eligible_round(tmp_path):
+    _seed_scored(tmp_path)
+    signer = FakeSigner()
+    _participate(tmp_path, signer, FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX]))
+
+    def _raises(config, client, **kwargs):
+        raise NoEligibleRoundError("no eligible round")
+
+    rpc = FakeRpc(close_time=REVEAL_TIME, transactions=[])
+    result = participate(
+        _config(tmp_path),
+        FakeClient(),
+        rpc_client=rpc,
+        signer=signer,
+        score_runner=_raises,
+        announcement_decoder=fake_decoder,
+    )
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert result.score_status == "no_eligible_round"
+    assert record.sidecar_state == STATE_REVEALED
+    assert any(s["memo_type"] == commit_reveal.VALIDATOR_REVEAL_TYPE for s in rpc.submitted)
+
+
+def test_participate_holds_cursor_until_commit_window_opens(tmp_path):
+    _seed_scored(tmp_path)
+    signer = FakeSigner()
+    before_commit = datetime(2026, 5, 24, 23, 0, tzinfo=timezone.utc)
+
+    rpc1 = FakeRpc(close_time=before_commit, transactions=[ANNOUNCEMENT_TX])
+    first = _participate(tmp_path, signer, rpc1)
+
+    assert rpc1.submitted == []
+    assert any(entry["status"] == "commit_window_not_open" for entry in first.commits)
+    with SidecarState(tmp_path) as state:
+        assert state.get_round(NETWORK, ROUND_ID).sidecar_state == STATE_SCORED
+
+    # The announcement was not consumed, so a later pass with the window open
+    # commits it.
+    rpc2 = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    _participate(tmp_path, signer, rpc2)
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+    assert record.sidecar_state == STATE_COMMITTED
+    assert len(rpc2.submitted) == 1
+
+
+def test_participate_requires_wallet_seed(tmp_path):
+    with pytest.raises(ParticipationConfigError):
+        participate(
+            _config(tmp_path, with_seed=False),
+            FakeClient(),
+            rpc_client=FakeRpc(close_time=COMMIT_TIME),
+            signer=FakeSigner(),
+            score_runner=_no_score,
+            announcement_decoder=fake_decoder,
+        )
+
+
+def test_participate_requires_validator_keys(tmp_path):
+    with pytest.raises(ParticipationConfigError):
+        participate(
+            _config(tmp_path, with_keys=False),
+            FakeClient(),
+            rpc_client=FakeRpc(close_time=COMMIT_TIME),
+            signer=FakeSigner(),
+            score_runner=_no_score,
+            announcement_decoder=fake_decoder,
+        )

@@ -7,8 +7,10 @@ import json
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
+from validator_scoring_sidecar.chain import ChainWatcherError, XrplPftlRpcClient
+from validator_scoring_sidecar.commit import ValidatorKeysSigner
 from validator_scoring_sidecar.config import ConfigError, load_config
 from validator_scoring_sidecar.deployment import (
     DEFAULT_LOCAL_PORT,
@@ -42,6 +44,12 @@ from validator_scoring_sidecar.scoring_client import (
 )
 from validator_scoring_sidecar.state import SidecarStateError
 from validator_scoring_sidecar.score import ScoreResult, score_round
+from validator_scoring_sidecar.participate import (
+    ParticipateResult,
+    ParticipationConfigError,
+    participate,
+    require_participation_config,
+)
 from validator_scoring_sidecar.sync import (
     DEFAULT_SYNC_ROUND_LIMIT,
     MAX_SYNC_ROUND_LIMIT,
@@ -234,6 +242,43 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_config_arguments(score)
     _add_json_argument(score)
     score.set_defaults(handler=score_command)
+
+    participate_parser = subparsers.add_parser(
+        "participate",
+        help=(
+            "Run one unattended participation pass: score the latest round and "
+            "advance its on-chain commit and reveal."
+        ),
+    )
+    participate_parser.add_argument(
+        "--source",
+        choices=PACKAGE_SOURCE_CHOICES,
+        default="auto",
+        help="Package retrieval source for round fetches. Defaults to auto.",
+    )
+    participate_parser.add_argument(
+        "--round-limit",
+        type=_round_limit,
+        default=DEFAULT_SYNC_ROUND_LIMIT,
+        help=(
+            "Recent rounds to scan for the latest eligible round. Defaults to "
+            f"{DEFAULT_SYNC_ROUND_LIMIT}."
+        ),
+    )
+    _add_common_config_arguments(participate_parser)
+    participate_parser.add_argument(
+        "--pftl-rpc-url",
+        help="PFTL JSON-RPC URL. Overrides POSTFIAT_SIDECAR_PFTL_RPC_URL.",
+    )
+    participate_parser.add_argument(
+        "--foundation-publisher-address",
+        help=(
+            "Foundation publisher r-address. Overrides "
+            "POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS and config discovery."
+        ),
+    )
+    _add_json_argument(participate_parser)
+    participate_parser.set_defaults(handler=participate_command)
     return parser
 
 
@@ -528,6 +573,106 @@ def _format_score_result(result: ScoreResult) -> str:
     if result.error_category is not None:
         lines.append(f"Outcome category: {result.error_category}")
     return "\n".join(lines)
+
+
+def participate_command(args: argparse.Namespace) -> int:
+    config = load_config(
+        base_url=args.base_url,
+        data_dir=args.data_dir,
+        ipfs_gateway_url=args.ipfs_gateway_url,
+        network=args.network,
+        timeout_seconds=args.timeout,
+        pftl_rpc_url=args.pftl_rpc_url,
+        foundation_publisher_address=args.foundation_publisher_address,
+    )
+    try:
+        _wallet_seed, keys_path = require_participation_config(config)
+    except ParticipationConfigError as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+
+    client = ScoringClient(config)
+    rpc_client = XrplPftlRpcClient(config.pftl_rpc_url)
+    signer = ValidatorKeysSigner(validator_keys_path=keys_path)
+    try:
+        result = participate(
+            config,
+            client,
+            rpc_client=rpc_client,
+            signer=signer,
+            source=args.source,
+            round_limit=args.round_limit,
+        )
+    except SyncLockError as exc:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "status": "locked",
+                        "network": config.network,
+                        "lock_path": str(exc.lock_path),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            _print_error(str(exc))
+        return EXIT_LOCKED
+    except (ParticipationConfigError, SyncSetupError) as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except MissingFrozenInputMetadata as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except RoundMetadataError as exc:
+        _print_error(f"Malformed round metadata: {exc}")
+        return EXIT_NETWORK_ERROR
+    except (
+        InputPackageVerificationError,
+        InputPackageCacheError,
+        SidecarStateError,
+        VerificationError,
+    ) as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except DeploymentError as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except (InputPackageDownloadError, ScoringClientError, ChainWatcherError) as exc:
+        _print_error(str(exc))
+        return EXIT_NETWORK_ERROR
+    finally:
+        client.close()
+
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(_format_participate_result(result))
+
+    return EXIT_OK
+
+
+def _format_participate_result(result: ParticipateResult) -> str:
+    return "\n".join(
+        [
+            f"Participate status: score={result.score_status}",
+            f"Network: {result.network}",
+            f"Round ID: {result.round_id}",
+            f"Round number: {result.round_number}",
+            f"Commits: {_format_advance(result.commits)}",
+            f"Reveals: {_format_advance(result.reveals)}",
+        ]
+    )
+
+
+def _format_advance(entries: list[dict[str, Any]]) -> str:
+    if not entries:
+        return "none"
+    return ", ".join(
+        f"round {entry.get('round_number', '?')}: {entry['status']}"
+        for entry in entries
+    )
 
 
 def _load_deploy_manifest(args: argparse.Namespace, config) -> dict:

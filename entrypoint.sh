@@ -10,25 +10,43 @@ log() {
     printf '%s validator-scoring-sidecar: %s\n' "$(date -Iseconds)" "$1"
 }
 
-interval="${POSTFIAT_SIDECAR_SYNC_INTERVAL_SECONDS:-3600}"
-case "$interval" in
-    ''|*[!0-9]*)
-        log "POSTFIAT_SIDECAR_SYNC_INTERVAL_SECONDS must be a positive integer, got '${interval}'"
+# The default loop verifies frozen input packages only. Set MODE=participate to
+# run the full on-chain commit-reveal participation pass at the chain-poll cadence
+# (requires the participation prerequisites; the command fails fast otherwise).
+mode="${POSTFIAT_SIDECAR_MODE:-sync}"
+case "$mode" in
+    sync)
+        command="sync"
+        interval="${POSTFIAT_SIDECAR_SYNC_INTERVAL_SECONDS:-3600}"
+        ;;
+    participate)
+        command="participate"
+        interval="${POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS:-60}"
+        ;;
+    *)
+        log "POSTFIAT_SIDECAR_MODE must be 'sync' or 'participate', got '${mode}'"
         exit 2
         ;;
 esac
 
-log "starting sync loop (interval=${interval}s)"
+case "$interval" in
+    ''|*[!0-9]*)
+        log "loop interval must be a positive integer, got '${interval}'"
+        exit 2
+        ;;
+esac
+
+log "starting ${mode} loop (interval=${interval}s)"
 
 trap 'log "received shutdown signal"; exit 0' TERM INT
 
 while true; do
-    validator-scoring-sidecar sync &
-    sync_pid=$!
-    if wait "$sync_pid"; then
-        log "sync completed; sleeping ${interval}s"
+    validator-scoring-sidecar "$command" &
+    run_pid=$!
+    if wait "$run_pid"; then
+        log "${command} completed; sleeping ${interval}s"
     else
-        log "sync failed; sleeping ${interval}s before retry"
+        log "${command} failed; sleeping ${interval}s before retry"
     fi
     sleep "$interval" &
     wait $!

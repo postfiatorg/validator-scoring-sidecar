@@ -35,6 +35,10 @@ INPUT_READY_STATES = frozenset(
     }
 )
 
+# A round at or beyond SCORED has produced its output fingerprints: rescoring is
+# unnecessary, and the round is eligible to commit/reveal.
+SCORED_OR_FURTHER_STATES = frozenset({STATE_SCORED, STATE_COMMITTED, STATE_REVEALED})
+
 _V2_COLUMNS: tuple[tuple[str, str], ...] = (
     ("scored_at", "TEXT"),
     ("backend_mode", "TEXT"),
@@ -60,6 +64,21 @@ _V5_COLUMNS: tuple[tuple[str, str], ...] = (
     ("reveal_tx_hash", "TEXT"),
     ("commitment_hash", "TEXT"),
     ("reveal_error_category", "TEXT"),
+)
+
+# The full sidecar_rounds column list, in RoundStateRecord.from_row order, shared
+# by every round read so the SELECT and the row mapping cannot drift apart.
+_ROUND_COLUMNS = (
+    "network, round_id, round_number, scoring_status, sidecar_state, "
+    "input_package_cid, input_package_hash, input_frozen_at, "
+    "local_package_path, fetch_source, verified_file_count, "
+    "scored_at, backend_mode, model_response_hash, "
+    "validator_scores_hash, selected_unl_hash, "
+    "comparison_levels_matched, error_category, error_details, "
+    "salt, commit_tx_hash, validator_master_key, "
+    "commit_opens_at, commit_closes_at, reveal_opens_at, "
+    "reveal_closes_at, reveal_tx_hash, commitment_hash, "
+    "reveal_error_category"
 )
 
 
@@ -241,23 +260,28 @@ class SidecarState:
 
     def get_round(self, network: str, round_id: int) -> RoundStateRecord | None:
         row = self._execute_one(
-            """
-            SELECT network, round_id, round_number, scoring_status, sidecar_state,
-                   input_package_cid, input_package_hash, input_frozen_at,
-                   local_package_path, fetch_source, verified_file_count,
-                   scored_at, backend_mode, model_response_hash,
-                   validator_scores_hash, selected_unl_hash,
-                   comparison_levels_matched, error_category, error_details,
-                   salt, commit_tx_hash, validator_master_key,
-                   commit_opens_at, commit_closes_at, reveal_opens_at,
-                   reveal_closes_at, reveal_tx_hash, commitment_hash,
-                   reveal_error_category
+            f"""
+            SELECT {_ROUND_COLUMNS}
             FROM sidecar_rounds
             WHERE network = ? AND round_id = ?
             """,
             (network, round_id),
         )
         return RoundStateRecord.from_row(row) if row is not None else None
+
+    def get_rounds_pending_reveal(self, network: str) -> list[RoundStateRecord]:
+        """Return committed rounds that have not yet revealed, oldest first."""
+
+        rows = self._execute_all(
+            f"""
+            SELECT {_ROUND_COLUMNS}
+            FROM sidecar_rounds
+            WHERE network = ? AND sidecar_state = ? AND reveal_tx_hash IS NULL
+            ORDER BY round_number ASC
+            """,
+            (network, STATE_COMMITTED),
+        )
+        return [RoundStateRecord.from_row(row) for row in rows]
 
     def is_input_package_verified(
         self,
@@ -817,6 +841,18 @@ class SidecarState:
         try:
             cursor = connection.execute(sql, parameters)
             return cursor.fetchone()
+        except sqlite3.Error as exc:
+            raise SidecarStateError(f"Failed to read sidecar state: {exc}") from exc
+
+    def _execute_all(
+        self,
+        sql: str,
+        parameters: tuple[Any, ...],
+    ) -> list[sqlite3.Row]:
+        connection = self._require_connection()
+        try:
+            cursor = connection.execute(sql, parameters)
+            return cursor.fetchall()
         except sqlite3.Error as exc:
             raise SidecarStateError(f"Failed to read sidecar state: {exc}") from exc
 

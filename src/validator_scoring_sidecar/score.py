@@ -49,8 +49,7 @@ from validator_scoring_sidecar.manifest import check_compatibility, selector_par
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.scoring_client import ScoringClient, ScoringClientError
 from validator_scoring_sidecar.state import (
-    STATE_COMMITTED,
-    STATE_REVEALED,
+    SCORED_OR_FURTHER_STATES,
     STATE_SCORED,
     STATE_SCORING_FAILED,
     STATE_SKIPPED,
@@ -87,9 +86,6 @@ _SKIP_CATEGORIES = frozenset(
     }
 )
 
-# A round at or beyond SCORED has already produced its fingerprints; rescoring is
-# unnecessary, but its (orthogonal) foundation comparison may still be completed.
-_SCORED_OR_FURTHER = frozenset({STATE_SCORED, STATE_COMMITTED, STATE_REVEALED})
 
 
 @dataclass(frozen=True)
@@ -142,7 +138,7 @@ def score_round(
 
         if (
             existing is not None
-            and existing.sidecar_state in _SCORED_OR_FURTHER
+            and existing.sidecar_state in SCORED_OR_FURTHER_STATES
             and existing.matches_frozen_input(metadata)
         ):
             if existing.comparison_levels_matched is not None:
