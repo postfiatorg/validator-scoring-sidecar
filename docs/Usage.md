@@ -11,7 +11,9 @@ The validator-scoring-sidecar runs alongside your Post Fiat Ledger validator. It
 
 ## What the sidecar does NOT do
 
-The sidecar is convenience tooling, not a trust requirement. The `docker compose` workflow above runs only the unattended input sync. Independent inference and scoring are an opt-in, host-run step — see [`Deployment.md`](Deployment.md) for standing up an inference runtime, after which `score` reproduces a round and records the outcome. The sidecar still does not hold validator keys, submit on-chain memos, watch chain history, publish convergence reports, or change Validator List authority; those will be added in later releases.
+The sidecar is convenience tooling, not a trust requirement. The `docker compose` workflow above runs only the unattended input sync. Independent inference and scoring are an opt-in, host-run step — see [`Deployment.md`](Deployment.md) for standing up an inference runtime, after which `score` reproduces a round and records the outcome.
+
+A later release will let the sidecar participate in the on-chain commit-reveal protocol: watching the foundation publisher account for round announcements and submitting your validator's salted output commitment on PFTL. Even then, the sidecar does **not** hold your validator master key. Commit authorship is signed through the postfiatd `validator-keys` tool, and the on-chain transaction is paid for and submitted by a **separate funded operator wallet** — an ordinary `r...` PFTL address whose seed you supply — never your validator identity. The sidecar still does not sign or publish Validator Lists, publish convergence reports, or change Validator List authority.
 
 ## Setup
 
