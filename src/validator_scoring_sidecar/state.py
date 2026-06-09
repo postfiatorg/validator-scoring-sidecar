@@ -16,9 +16,11 @@ STATE_DB_FILENAME = "sidecar.db"
 STATE_DISCOVERED = "DISCOVERED"
 STATE_INPUT_PACKAGE_VERIFIED = "INPUT_PACKAGE_VERIFIED"
 STATE_SCORED = "SCORED"
+STATE_COMMITTED = "COMMITTED"
+STATE_REVEALED = "REVEALED"
 STATE_SCORING_FAILED = "SCORING_FAILED"
 STATE_SKIPPED = "SKIPPED"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # A round in any of these states already has its verified input package, so
 # sync must treat it as handled and not re-fetch it.
@@ -26,6 +28,8 @@ INPUT_READY_STATES = frozenset(
     {
         STATE_INPUT_PACKAGE_VERIFIED,
         STATE_SCORED,
+        STATE_COMMITTED,
+        STATE_REVEALED,
         STATE_SCORING_FAILED,
         STATE_SKIPPED,
     }
@@ -50,6 +54,12 @@ _V4_COLUMNS: tuple[tuple[str, str], ...] = (
     ("commit_closes_at", "TEXT"),
     ("reveal_opens_at", "TEXT"),
     ("reveal_closes_at", "TEXT"),
+)
+
+_V5_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("reveal_tx_hash", "TEXT"),
+    ("commitment_hash", "TEXT"),
+    ("reveal_error_category", "TEXT"),
 )
 
 
@@ -88,6 +98,7 @@ class CommitOutcome:
     validator_master_key: str
     salt: str
     commit_tx_hash: str
+    commitment_hash: str
     commit_opens_at: str
     commit_closes_at: str
     reveal_opens_at: str
@@ -124,6 +135,9 @@ class RoundStateRecord:
     commit_closes_at: str | None
     reveal_opens_at: str | None
     reveal_closes_at: str | None
+    reveal_tx_hash: str | None
+    commitment_hash: str | None
+    reveal_error_category: str | None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "RoundStateRecord":
@@ -154,6 +168,9 @@ class RoundStateRecord:
             commit_closes_at=row["commit_closes_at"],
             reveal_opens_at=row["reveal_opens_at"],
             reveal_closes_at=row["reveal_closes_at"],
+            reveal_tx_hash=row["reveal_tx_hash"],
+            commitment_hash=row["commitment_hash"],
+            reveal_error_category=row["reveal_error_category"],
         )
 
     def matches_frozen_input(self, metadata: RoundMetadata) -> bool:
@@ -233,7 +250,8 @@ class SidecarState:
                    comparison_levels_matched, error_category, error_details,
                    salt, commit_tx_hash, validator_master_key,
                    commit_opens_at, commit_closes_at, reveal_opens_at,
-                   reveal_closes_at
+                   reveal_closes_at, reveal_tx_hash, commitment_hash,
+                   reveal_error_category
             FROM sidecar_rounds
             WHERE network = ? AND round_id = ?
             """,
@@ -415,10 +433,11 @@ class SidecarState:
         metadata: RoundMetadata,
         outcome: CommitOutcome,
     ) -> None:
-        """Persist an on-chain commit, preserving the round's scored state.
+        """Advance a scored round to ``COMMITTED`` and persist its commit.
 
-        Only the commit columns are written; ``sidecar_state`` and the scored
-        output hashes set by ``record_score`` are left untouched.
+        Writes the commit columns and the committed ``commitment_hash`` (needed
+        by the reveal integrity check), and moves the round to ``COMMITTED``. The
+        scored output hashes set by ``record_score`` are left untouched.
         """
 
         now = _utc_now()
@@ -427,20 +446,22 @@ class SidecarState:
             INSERT INTO sidecar_rounds (
                 network, round_id, round_number, scoring_status, sidecar_state,
                 input_package_cid, input_package_hash, input_frozen_at,
-                salt, commit_tx_hash, validator_master_key,
+                salt, commit_tx_hash, validator_master_key, commitment_hash,
                 commit_opens_at, commit_closes_at, reveal_opens_at,
                 reveal_closes_at, discovered_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(network, round_id) DO UPDATE SET
                 round_number = excluded.round_number,
                 scoring_status = excluded.scoring_status,
+                sidecar_state = excluded.sidecar_state,
                 input_package_cid = excluded.input_package_cid,
                 input_package_hash = excluded.input_package_hash,
                 input_frozen_at = excluded.input_frozen_at,
                 salt = excluded.salt,
                 commit_tx_hash = excluded.commit_tx_hash,
                 validator_master_key = excluded.validator_master_key,
+                commitment_hash = excluded.commitment_hash,
                 commit_opens_at = excluded.commit_opens_at,
                 commit_closes_at = excluded.commit_closes_at,
                 reveal_opens_at = excluded.reveal_opens_at,
@@ -452,13 +473,14 @@ class SidecarState:
                 metadata.round_id,
                 metadata.round_number,
                 metadata.status,
-                STATE_SCORED,
+                STATE_COMMITTED,
                 metadata.input_package_cid,
                 metadata.input_package_hash,
                 metadata.input_frozen_at,
                 outcome.salt,
                 outcome.commit_tx_hash,
                 outcome.validator_master_key,
+                outcome.commitment_hash,
                 outcome.commit_opens_at,
                 outcome.commit_closes_at,
                 outcome.reveal_opens_at,
@@ -513,6 +535,91 @@ class SidecarState:
                 metadata.input_frozen_at,
                 error_category,
                 details,
+                now,
+                now,
+            ),
+        )
+
+    def record_reveal(
+        self,
+        network: str,
+        metadata: RoundMetadata,
+        *,
+        reveal_tx_hash: str,
+    ) -> None:
+        """Advance a committed round to ``REVEALED`` and store its reveal tx.
+
+        Only the lifecycle state and ``reveal_tx_hash`` are written; the commit
+        columns and scored output hashes are left untouched.
+        """
+
+        now = _utc_now()
+        self._execute_write(
+            """
+            INSERT INTO sidecar_rounds (
+                network, round_id, round_number, scoring_status, sidecar_state,
+                input_package_cid, input_package_hash, input_frozen_at,
+                reveal_tx_hash, discovered_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(network, round_id) DO UPDATE SET
+                sidecar_state = excluded.sidecar_state,
+                reveal_tx_hash = excluded.reveal_tx_hash,
+                updated_at = excluded.updated_at
+            """,
+            (
+                network,
+                metadata.round_id,
+                metadata.round_number,
+                metadata.status,
+                STATE_REVEALED,
+                metadata.input_package_cid,
+                metadata.input_package_hash,
+                metadata.input_frozen_at,
+                reveal_tx_hash,
+                now,
+                now,
+            ),
+        )
+
+    def record_reveal_miss(
+        self,
+        network: str,
+        metadata: RoundMetadata,
+        *,
+        error_category: str,
+    ) -> None:
+        """Flag a committed round whose reveal window closed unrevealed.
+
+        Leaves the round at ``COMMITTED`` and writes only ``reveal_error_category``.
+        A missed reveal is a chain-participation miss, not a scoring failure, and
+        is kept in its own column so a later foundation comparison — which owns
+        ``error_category`` — cannot erase it.
+        """
+
+        now = _utc_now()
+        self._execute_write(
+            """
+            INSERT INTO sidecar_rounds (
+                network, round_id, round_number, scoring_status, sidecar_state,
+                input_package_cid, input_package_hash, input_frozen_at,
+                reveal_error_category, discovered_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(network, round_id) DO UPDATE SET
+                reveal_error_category = excluded.reveal_error_category,
+                updated_at = excluded.updated_at
+            """,
+            (
+                network,
+                metadata.round_id,
+                metadata.round_number,
+                metadata.status,
+                STATE_COMMITTED,
+                metadata.input_package_cid,
+                metadata.input_package_hash,
+                metadata.input_frozen_at,
+                error_category,
                 now,
                 now,
             ),
@@ -579,6 +686,8 @@ class SidecarState:
                 self._migrate_v2_to_v3()
             if current_version < 4:
                 self._migrate_v3_to_v4()
+            if current_version < 5:
+                self._migrate_v4_to_v5()
         self._execute_write(f"PRAGMA user_version = {SCHEMA_VERSION}", ())
 
     def _create_schema(self) -> None:
@@ -611,6 +720,9 @@ class SidecarState:
                 commit_closes_at TEXT,
                 reveal_opens_at TEXT,
                 reveal_closes_at TEXT,
+                reveal_tx_hash TEXT,
+                commitment_hash TEXT,
+                reveal_error_category TEXT,
                 discovered_at TEXT NOT NULL,
                 input_verified_at TEXT,
                 updated_at TEXT NOT NULL,
@@ -643,6 +755,15 @@ class SidecarState:
     def _migrate_v3_to_v4(self) -> None:
         existing = self._existing_columns("sidecar_rounds")
         for name, column_type in _V4_COLUMNS:
+            if name not in existing:
+                self._execute_write(
+                    f"ALTER TABLE sidecar_rounds ADD COLUMN {name} {column_type}",
+                    (),
+                )
+
+    def _migrate_v4_to_v5(self) -> None:
+        existing = self._existing_columns("sidecar_rounds")
+        for name, column_type in _V5_COLUMNS:
             if name not in existing:
                 self._execute_write(
                     f"ALTER TABLE sidecar_rounds ADD COLUMN {name} {column_type}",

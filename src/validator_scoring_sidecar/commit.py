@@ -24,7 +24,7 @@ from validator_scoring_sidecar.chain import (
     ChainWatcherError,
     PftlInsufficientFundsError,
     PftlRpcClient,
-    find_memo_payload,
+    find_authored_memo_tx_hash,
 )
 from validator_scoring_sidecar.config import SidecarConfig
 from validator_scoring_sidecar.failure import FailureCategory
@@ -178,9 +178,11 @@ def submit_commit(
     if close_time >= announcement.commit_closes_at:
         return CommitResult(COMMIT_STATUS_WINDOW_CLOSED, announcement.round_number)
 
-    onchain_hash = _find_existing_commit(
+    onchain_hash = find_authored_memo_tx_hash(
         rpc_client,
         account=foundation_publisher_address,
+        memo_type=commit_reveal.VALIDATOR_COMMIT_TYPE,
+        validate=commit_reveal.validate_commit_payload,
         network=announcement.network,
         round_number=announcement.round_number,
         input_package_hash=announcement.input_package_hash,
@@ -262,6 +264,7 @@ def submit_commit(
             validator_master_key=master_key,
             salt=salt,
             commit_tx_hash=tx_hash,
+            commitment_hash=commitment_hash,
             commit_opens_at=announcement.commit_opens_at.isoformat(),
             commit_closes_at=announcement.commit_closes_at.isoformat(),
             reveal_opens_at=announcement.reveal_opens_at.isoformat(),
@@ -269,51 +272,3 @@ def submit_commit(
         ),
     )
     return CommitResult(COMMIT_STATUS_SUBMITTED, announcement.round_number, tx_hash)
-
-
-def _find_existing_commit(
-    rpc_client: PftlRpcClient,
-    *,
-    account: str,
-    network: str,
-    round_number: int,
-    input_package_hash: str,
-    validator_master_key: str,
-    limit: int,
-) -> str | None:
-    result = rpc_client.account_tx(
-        account=account,
-        ledger_index_min=-1,
-        ledger_index_max=-1,
-        forward=False,
-        limit=limit,
-        marker=None,
-    )
-    entries = result.get("transactions")
-    if not isinstance(entries, list):
-        return None
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        tx = entry.get("tx_json") or entry.get("tx")
-        memos = tx.get("Memos") if isinstance(tx, dict) else None
-        if not isinstance(memos, list):
-            continue
-        payload = find_memo_payload(memos, commit_reveal.VALIDATOR_COMMIT_TYPE)
-        if payload is None:
-            continue
-        try:
-            commit = commit_reveal.validate_commit_payload(payload)
-        except commit_reveal.CommitRevealValidationError:
-            continue
-        if (
-            commit.network == network
-            and commit.round_number == round_number
-            and commit.input_package_hash == input_package_hash
-            and commit.validator_master_key == validator_master_key
-        ):
-            tx_hash = entry.get("hash") or (
-                tx.get("hash") if isinstance(tx, dict) else None
-            )
-            return tx_hash if isinstance(tx_hash, str) else None
-    return None

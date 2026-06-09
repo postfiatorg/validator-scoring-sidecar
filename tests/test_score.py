@@ -21,10 +21,13 @@ from validator_scoring_sidecar.scoring import (
     SUPPORTED_PARSER_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
 )
+from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.state import (
+    STATE_COMMITTED,
     STATE_SCORED,
     STATE_SCORING_FAILED,
     STATE_SKIPPED,
+    CommitOutcome,
     SidecarState,
 )
 from validator_scoring_sidecar.verification import (
@@ -388,6 +391,74 @@ def test_deferred_comparison_completes_without_reinference(tmp_path):
     assert second.status == SCORE_STATUS_SCORED
     assert second.matched_levels == ["RAW_MATCH", "PARSED_MATCH"]
     assert backend.run_count == 1
+
+
+def test_deferred_comparison_preserves_committed_state_and_reveal_miss(tmp_path):
+    config = _setup(tmp_path)
+
+    first = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=lambda record: FakeBackend(),
+        foundation_hash_fetcher=lambda *args: None,
+        package_fetcher=_make_package_fetcher(_manifest()),
+    )
+    assert first.status == SCORE_STATUS_COMPARISON_PENDING
+
+    # The round then commits and misses its reveal window before the foundation
+    # publishes its hashes.
+    with SidecarState(tmp_path) as state:
+        existing = state.get_round("testnet", 123)
+        metadata = RoundMetadata(
+            round_id=existing.round_id,
+            round_number=existing.round_number,
+            status=existing.scoring_status,
+            input_package_cid=existing.input_package_cid,
+            input_package_hash=existing.input_package_hash,
+            input_frozen_at=existing.input_frozen_at,
+            final_bundle_cid=None,
+        )
+        state.record_commit(
+            "testnet",
+            metadata,
+            CommitOutcome(
+                validator_master_key="nHValidatorKey",
+                salt="d" * 64,
+                commit_tx_hash="TX1",
+                commitment_hash="c" * 64,
+                commit_opens_at="2026-05-25T00:00:00+00:00",
+                commit_closes_at="2026-05-25T00:30:00+00:00",
+                reveal_opens_at="2026-05-25T00:30:00+00:00",
+                reveal_closes_at="2026-05-25T01:00:00+00:00",
+            ),
+        )
+        state.record_reveal_miss(
+            "testnet",
+            metadata,
+            error_category=FailureCategory.REVEAL_WINDOW_MISSED.value,
+        )
+
+    # The foundation hashes arrive; the deferred comparison must complete without
+    # downgrading the lifecycle or erasing the reveal-stage miss.
+    second = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=_no_backend,
+        foundation_hash_fetcher=lambda *args: dict(EXPECTED_HASHES),
+        package_fetcher=_no_fetch,
+    )
+
+    assert second.status == SCORE_STATUS_SCORED
+    assert second.sidecar_state == STATE_COMMITTED
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round("testnet", 123)
+    assert record.sidecar_state == STATE_COMMITTED
+    assert record.comparison_levels_matched == "RAW_MATCH,PARSED_MATCH"
+    assert record.reveal_error_category == FailureCategory.REVEAL_WINDOW_MISSED.value
+    assert record.commit_tx_hash == "TX1"
 
 
 def test_already_scored_round_is_a_noop(tmp_path):

@@ -14,6 +14,7 @@ foundation-authored. No application-level signature is checked here.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -566,6 +567,66 @@ def find_memo_payload(
         decoded = _decode_memo(memo)
         if decoded is not None and decoded[0] == memo_type:
             return decoded[1]
+    return None
+
+
+def find_authored_memo_tx_hash(
+    rpc_client: PftlRpcClient,
+    *,
+    account: str,
+    memo_type: str,
+    validate: Callable[[dict[str, Any]], Any],
+    network: str,
+    round_number: int,
+    input_package_hash: str,
+    validator_master_key: str,
+    limit: int,
+) -> str | None:
+    """Return the hash of the most recent ``account`` transaction carrying a
+    ``memo_type`` memo whose validated payload binds to this round and validator.
+
+    Shared by commit and reveal idempotency: before submitting, scan the
+    foundation publisher account's recent validated history for a payload this
+    validator already authored for the round. ``validate`` is the protocol
+    validator for the memo kind (``validate_commit_payload`` /
+    ``validate_reveal_payload``); a payload that fails validation is skipped.
+    """
+
+    result = rpc_client.account_tx(
+        account=account,
+        ledger_index_min=-1,
+        ledger_index_max=-1,
+        forward=False,
+        limit=limit,
+        marker=None,
+    )
+    entries = result.get("transactions")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        tx = entry.get("tx_json") or entry.get("tx")
+        memos = tx.get("Memos") if isinstance(tx, dict) else None
+        if not isinstance(memos, list):
+            continue
+        payload = find_memo_payload(memos, memo_type)
+        if payload is None:
+            continue
+        try:
+            authored = validate(payload)
+        except commit_reveal.CommitRevealValidationError:
+            continue
+        if (
+            authored.network == network
+            and authored.round_number == round_number
+            and authored.input_package_hash == input_package_hash
+            and authored.validator_master_key == validator_master_key
+        ):
+            tx_hash = entry.get("hash") or (
+                tx.get("hash") if isinstance(tx, dict) else None
+            )
+            return tx_hash if isinstance(tx_hash, str) else None
     return None
 
 

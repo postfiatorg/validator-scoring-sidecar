@@ -49,6 +49,8 @@ from validator_scoring_sidecar.manifest import check_compatibility, selector_par
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.scoring_client import ScoringClient, ScoringClientError
 from validator_scoring_sidecar.state import (
+    STATE_COMMITTED,
+    STATE_REVEALED,
     STATE_SCORED,
     STATE_SCORING_FAILED,
     STATE_SKIPPED,
@@ -84,6 +86,10 @@ _SKIP_CATEGORIES = frozenset(
         FailureCategory.SKIPPED_OPERATOR_OPT_OUT,
     }
 )
+
+# A round at or beyond SCORED has already produced its fingerprints; rescoring is
+# unnecessary, but its (orthogonal) foundation comparison may still be completed.
+_SCORED_OR_FURTHER = frozenset({STATE_SCORED, STATE_COMMITTED, STATE_REVEALED})
 
 
 @dataclass(frozen=True)
@@ -136,7 +142,7 @@ def score_round(
 
         if (
             existing is not None
-            and existing.sidecar_state == STATE_SCORED
+            and existing.sidecar_state in _SCORED_OR_FURTHER
             and existing.matches_frozen_input(metadata)
         ):
             if existing.comparison_levels_matched is not None:
@@ -196,10 +202,19 @@ def _attempt_deferred_comparison(
 
     foundation = fetch_foundation(client, metadata, config)
     if foundation is None:
-        return _pending_result(config.network, metadata, existing.backend_mode)
+        return _pending_result(
+            config.network, metadata, existing.backend_mode, existing.sidecar_state
+        )
 
     verification = compare_hashes(metadata.input_package_hash, persisted, foundation)
-    outcome = _scored_outcome(existing.backend_mode, persisted, verification)
+    # Preserve the round's lifecycle state: a deferred foundation comparison is an
+    # orthogonal annotation and must not downgrade a COMMITTED/REVEALED round.
+    outcome = _scored_outcome(
+        existing.backend_mode,
+        persisted,
+        verification,
+        sidecar_state=existing.sidecar_state,
+    )
     state.record_score(config.network, metadata, outcome)
     return _scored_result(config.network, metadata, outcome, verification.compared)
 
@@ -393,9 +408,11 @@ def _scored_outcome(
     backend_mode: str | None,
     hashes: dict[str, str],
     verification,
+    *,
+    sidecar_state: str = STATE_SCORED,
 ) -> ScoreOutcome:
     return ScoreOutcome(
-        sidecar_state=STATE_SCORED,
+        sidecar_state=sidecar_state,
         backend_mode=backend_mode,
         model_response_hash=hashes.get(HASH_MODEL_RESPONSE),
         validator_scores_hash=hashes.get(HASH_VALIDATOR_SCORES),
@@ -466,13 +483,14 @@ def _pending_result(
     network: str,
     metadata: RoundMetadata,
     backend_mode: str | None,
+    sidecar_state: str = STATE_SCORED,
 ) -> ScoreResult:
     return ScoreResult(
         status=SCORE_STATUS_COMPARISON_PENDING,
         network=network,
         round_id=metadata.round_id,
         round_number=metadata.round_number,
-        sidecar_state=STATE_SCORED,
+        sidecar_state=sidecar_state,
         backend_mode=backend_mode,
         compared=False,
         matched_levels=[],
