@@ -1,3 +1,5 @@
+import json
+import subprocess
 from datetime import datetime, timezone
 
 import pytest
@@ -12,6 +14,7 @@ from validator_scoring_sidecar.commit import (
     COMMIT_STATUS_WINDOW_CLOSED,
     COMMIT_STATUS_WINDOW_NOT_OPEN,
     CommitError,
+    ValidatorKeysSigner,
     submit_commit,
 )
 from validator_scoring_sidecar.config import load_config
@@ -305,3 +308,54 @@ def test_submit_commit_requires_wallet_seed(tmp_path):
                 _metadata(), rpc_client=rpc, signer=FakeSigner(), state=state,
                 foundation_publisher_address=PUBLISHER,
             )
+
+
+def _write_keys_file(tmp_path, public_key="nHTestMasterKey"):
+    keys_path = tmp_path / "validator-keys.json"
+    keys_path.write_text(json.dumps({"public_key": public_key}), encoding="utf-8")
+    return keys_path
+
+
+def test_validator_keys_signer_signs_with_configured_keyfile(tmp_path, monkeypatch):
+    keys_path = _write_keys_file(tmp_path)
+    invocations = []
+
+    def fake_run(argv, **kwargs):
+        invocations.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="SIG456\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    signer = ValidatorKeysSigner(validator_keys_path=str(keys_path))
+
+    assert signer.sign(b"payload-bytes") == "SIG456"
+    # The tool must be bound to the configured key file: without --keyfile it
+    # would sign with its default keystore, decoupling identity from signature.
+    assert invocations == [
+        ["validator-keys", "--keyfile", str(keys_path), "sign", "payload-bytes"],
+    ]
+
+
+def test_validator_keys_signer_reads_master_key_from_same_keyfile(tmp_path):
+    keys_path = _write_keys_file(tmp_path, public_key="  nHTestMasterKey  ")
+    signer = ValidatorKeysSigner(validator_keys_path=str(keys_path))
+    assert signer.master_key == "nHTestMasterKey"
+
+
+def test_validator_keys_signer_rejects_keyfile_without_public_key(tmp_path):
+    keys_path = tmp_path / "validator-keys.json"
+    keys_path.write_text(json.dumps({"key_type": "ed25519"}), encoding="utf-8")
+    signer = ValidatorKeysSigner(validator_keys_path=str(keys_path))
+    with pytest.raises(CommitError):
+        signer.master_key
+
+
+def test_validator_keys_signer_wraps_tool_failure(tmp_path, monkeypatch):
+    keys_path = _write_keys_file(tmp_path)
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.CalledProcessError(1, argv, stderr="no keys")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    signer = ValidatorKeysSigner(validator_keys_path=str(keys_path))
+    with pytest.raises(CommitError):
+        signer.sign(b"payload-bytes")

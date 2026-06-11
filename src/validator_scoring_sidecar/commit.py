@@ -76,11 +76,17 @@ class Signer(Protocol):
 class ValidatorKeysSigner:
     """Signer backed by the postfiatd ``validator-keys`` tool.
 
-    Reads the validator master key from ``validator-keys.json`` and shells out to
-    ``validator-keys sign`` for each payload. The key file and binary must be
-    available to the sidecar; the seed and signatures are never logged. The exact
-    file field and CLI output format are pinned to the postfiatd tool — unit tests
-    inject a real-crypto fake signer instead of invoking it.
+    The configured key file is the single source of truth for the validator's
+    identity and its signatures. ``master_key`` reads the file's ``public_key``
+    field — protocol identity data carried in every commit/reveal payload, since
+    the on-chain sender is the relay wallet, not the validator — and ``sign``
+    invokes ``validator-keys --keyfile <path> sign`` so the signature provably
+    comes from that same file. Without the explicit ``--keyfile`` the tool would
+    fall back to its own default keystore path and the embedded identity and
+    signature could diverge. The key file and binary must be available to the
+    sidecar; the seed and signatures are never logged. The exact file field and
+    CLI output format are pinned to the postfiatd tool — unit tests inject a
+    real-crypto fake signer instead of invoking it.
     """
 
     def __init__(self, *, validator_keys_path: str, binary: str = "validator-keys"):
@@ -108,7 +114,13 @@ class ValidatorKeysSigner:
     def sign(self, message: bytes) -> str:
         try:
             completed = subprocess.run(
-                [self._binary, "sign", message.decode("utf-8")],
+                [
+                    self._binary,
+                    "--keyfile",
+                    self._path,
+                    "sign",
+                    message.decode("utf-8"),
+                ],
                 capture_output=True,
                 text=True,
                 check=True,
