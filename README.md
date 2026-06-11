@@ -13,7 +13,8 @@ tests/                                     pytest suite
 scripts/                                   Maintainer scripts (vendor freshness)
 docs/                                      Operator documentation
 .github/workflows/                         CI: vendor freshness against foundation main/devnet/testnet
-Dockerfile, docker-compose.yml, entrypoint.sh    Operator deployment packaging
+Dockerfile, docker-compose.yml, entrypoint.sh    Operator deployment packaging (verify-only default)
+docker-compose.participate.yml                   Opt-in overlay for the on-chain participation image
 .env.testnet.example, .env.devnet.example        Per-network operator env templates
 ```
 

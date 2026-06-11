@@ -1,6 +1,10 @@
 services:
   sidecar:
-    build: .
+    build:
+      context: .
+      # Verify-only image; docker-compose.participate.yml overrides the target
+      # for the opt-in participation deployment.
+      target: runtime
     image: validator-scoring-sidecar:local
     container_name: validator-scoring-sidecar
     init: true

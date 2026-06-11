@@ -11,6 +11,7 @@ build/
 .coverage
 .env
 .env.*
+validator-keys*.json
 .DS_Store
 docs/
 tests/

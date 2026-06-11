@@ -107,6 +107,20 @@ docker compose up -d
 
 The data volume retains state from the previous network. If you want a clean slate, also pass `-v` to `docker compose down`.
 
+## Participation mode
+
+The default deployment runs verify-only sync. To run the full on-chain commit-reveal loop, deploy with the participation overlay on top of the base compose file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.participate.yml up -d
+```
+
+The overlay builds a separate participation image that bundles the postfiatd `validator-keys` signing tool, sourced from the published postfiatd image and executed during the image build so an incompatible binary fails the build instead of a live round. It also mounts your validator key file read-only into the container.
+
+Before starting, uncomment the participation block in your `.env`: set `POSTFIAT_SIDECAR_MODE=participate`, the funded relay wallet seed, and `POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE` pointing at your `validator-keys.json` on the host. Participation is all-or-nothing: if any prerequisite is missing, the container logs a clear error and changes nothing on chain. The verify-only deployment is unaffected by the overlay's existence — `docker compose up -d` without the overlay keeps building and running the sync-only image.
+
+Participation also needs an inference runtime (see [`Deployment.md`](Deployment.md)) — scoring runs there, and a pass that cannot score has nothing to commit. For the full list of participation variables and the key-handling model, see [`Configuration.md`](Configuration.md).
+
 ## Configuration
 
 The setup above does not require editing any environment values. For the full list of variables, including advanced tunables you should normally leave at their defaults, see [`Configuration.md`](Configuration.md).
