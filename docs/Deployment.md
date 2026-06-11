@@ -4,9 +4,9 @@ The sidecar can stand up its own inference endpoint that reproduces the runtime 
 
 Either command runs on your own host, separately from the unattended `sync` loop. Neither is part of the `docker compose` workflow in [`Usage.md`](Usage.md).
 
-## What it does not do yet
+## What these commands do and do not do
 
-These commands stand up the endpoint and record it. They do not yet run scoring against that endpoint or compare outputs to the foundation; that lands in a later release. Today their value is standing up the runtime and producing the deployment record that the sidecar's compatibility check reads.
+These commands stand up the endpoint and write the deployment record; they do not score anything themselves. Scoring against the endpoint, comparison to the foundation's result, and on-chain participation are done by the `score` command and the unattended participate loop, both of which read the deployment record these commands produce — see [`Usage.md`](Usage.md).
 
 ## Option 1: Modal (managed)
 
