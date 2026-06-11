@@ -19,25 +19,28 @@ Even when participating, the sidecar does **not** hold your validator master key
 
 ## Setup
 
-You need a host with Docker and Docker Compose.
+You need a host with Docker and Docker Compose. There is nothing to clone or build: the sidecar ships as published Docker images (`agtipft/validator-scoring-sidecar`), built and gate-checked by CI from the repository's environment branches. You only download the compose files and an environment template.
 
-Clone the repository:
+Create a directory for the deployment:
 
 ```bash
-git clone https://github.com/postfiatorg/validator-scoring-sidecar.git
-cd validator-scoring-sidecar
+mkdir validator-scoring-sidecar && cd validator-scoring-sidecar
 ```
 
-Pick a network. Testnet:
+Then pick a network and fetch the three files from the matching branch. Testnet:
 
 ```bash
-cp .env.testnet.example .env
+curl -fsSLO https://raw.githubusercontent.com/postfiatorg/validator-scoring-sidecar/testnet/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/postfiatorg/validator-scoring-sidecar/testnet/docker-compose.participate.yml
+curl -fsSL https://raw.githubusercontent.com/postfiatorg/validator-scoring-sidecar/testnet/.env.testnet.example -o .env
 ```
 
 Or devnet:
 
 ```bash
-cp .env.devnet.example .env
+curl -fsSLO https://raw.githubusercontent.com/postfiatorg/validator-scoring-sidecar/devnet/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/postfiatorg/validator-scoring-sidecar/devnet/docker-compose.participate.yml
+curl -fsSL https://raw.githubusercontent.com/postfiatorg/validator-scoring-sidecar/devnet/.env.devnet.example -o .env
 ```
 
 Start the sidecar:
@@ -46,7 +49,16 @@ Start the sidecar:
 docker compose up -d
 ```
 
-That's it. The container runs the sync loop in the background and persists verified packages plus state under a Docker named volume.
+That's it. Docker pulls the published image for your network (the compose file selects the tag from `POSTFIAT_SIDECAR_NETWORK` in `.env`), runs the sync loop in the background, and persists verified packages plus state under a Docker named volume.
+
+## Updating the sidecar
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Pulling fetches the latest published image for your network; restarting picks it up. Data and state in the named volume are untouched. Add the participation overlay to both commands if you run participation mode.
 
 ## Verifying a healthy first sync
 
@@ -115,9 +127,9 @@ The default deployment runs verify-only sync. To run the full on-chain commit-re
 docker compose -f docker-compose.yml -f docker-compose.participate.yml up -d
 ```
 
-The overlay builds a separate participation image that bundles the postfiatd `validator-keys` signing tool, sourced from the published postfiatd image and executed during the image build so an incompatible binary fails the build instead of a live round. It also mounts your validator key file read-only into the container.
+The overlay switches to the published participation image, which bundles the postfiatd `validator-keys` signing tool — sourced from your environment's published postfiatd image and executed during the publish build, so an incompatible binary fails the release instead of a live round. It also mounts your validator key file read-only into the container.
 
-Before starting, uncomment the participation block in your `.env`: set `POSTFIAT_SIDECAR_MODE=participate`, the funded relay wallet seed, and `POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE` pointing at your `validator-keys.json` on the host. Participation is all-or-nothing: if any prerequisite is missing, the container logs a clear error and changes nothing on chain. The verify-only deployment is unaffected by the overlay's existence — `docker compose up -d` without the overlay keeps building and running the sync-only image.
+Before starting, uncomment the participation block in your `.env`: set `POSTFIAT_SIDECAR_MODE=participate`, the funded relay wallet seed, and `POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE` pointing at your `validator-keys.json` on the host. Participation is all-or-nothing: if any prerequisite is missing, the container logs a clear error and changes nothing on chain. The verify-only deployment is unaffected by the overlay's existence — `docker compose up -d` without the overlay keeps pulling and running the sync-only image.
 
 Participation also needs an inference runtime (see [`Deployment.md`](Deployment.md)) — scoring runs there, and a pass that cannot score has nothing to commit. For the full list of participation variables and the key-handling model, see [`Configuration.md`](Configuration.md).
 

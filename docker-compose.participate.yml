@@ -3,22 +3,18 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.participate.yml up -d
 #
-# It builds the participation image — which bundles the postfiatd
-# `validator-keys` signing tool and proves it executes at build time — and
+# It switches to the published participation image — which bundles the postfiatd
+# `validator-keys` signing tool, executed at publish time as a build gate — and
 # mounts your validator key file read-only. Set the participation values in
 # .env first (see docs/Configuration.md); the loop fails fast and changes
 # nothing on chain if any prerequisite is missing. The relay wallet seed stays
 # in the runtime environment and never enters an image layer.
 services:
   sidecar:
-    build:
-      target: participate
-      args:
-        VALIDATOR_KEYS_IMAGE: ${POSTFIAT_SIDECAR_VALIDATOR_KEYS_IMAGE:-agtipft/postfiatd:testnet-light-latest}
-    # The postfiatd image that supplies `validator-keys` is published for
-    # amd64 only, like the validator hosts themselves.
+    image: agtipft/validator-scoring-sidecar:${POSTFIAT_SIDECAR_NETWORK:-testnet}-participate-latest
+    # The participation image is published for amd64 only, like the postfiatd
+    # image its signing tool comes from and the validator hosts themselves.
     platform: linux/amd64
-    image: validator-scoring-sidecar:participate
     environment:
       # In-container path of the key mount below; the sidecar reads the
       # validator master public key from it and binds `validator-keys sign`

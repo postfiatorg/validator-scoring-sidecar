@@ -40,7 +40,6 @@ Verify-only sync needs none of these. To run the on-chain commit-reveal loop, de
 | `POSTFIAT_SIDECAR_MODE` | Set to `participate` to run the commit-reveal loop instead of `sync`. |
 | `POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED` | Seed of the funded operator relay `r...` wallet that pays for and sends the commit/reveal transactions. Secret: read from the runtime environment only, never accepted as a CLI flag, logged, or baked into an image layer. |
 | `POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE` | Host path of your `validator-keys.json`; the overlay mounts it read-only into the container. |
-| `POSTFIAT_SIDECAR_VALIDATOR_KEYS_IMAGE` | postfiatd image the participation build sources the `validator-keys` tool from. Defaults to `agtipft/postfiatd:testnet-light-latest`; set it to your network's tag, or to a digest for reproducible signing-tool provenance. |
 | `POSTFIAT_SIDECAR_PFTL_RPC_URL` | PFTL JSON-RPC endpoint for chain reads and memo submission. Defaults to `https://rpc.<network>.postfiat.org`. |
 | `POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS` | Optional override of the foundation publisher account; auto-discovered from the scoring service config when unset. |
 | `POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS` | How often the participate loop runs a pass (default `60`). Keep it well below the announced commit/reveal windows. |

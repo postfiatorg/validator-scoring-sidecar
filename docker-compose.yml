@@ -1,11 +1,9 @@
 services:
   sidecar:
-    build:
-      context: .
-      # Verify-only image; docker-compose.participate.yml overrides the target
-      # for the opt-in participation deployment.
-      target: runtime
-    image: validator-scoring-sidecar:local
+    # Published per-environment verify-only image; the tag follows the network
+    # set in .env. Participation deployments layer docker-compose.participate.yml
+    # on top. Developers building from source: see README.md.
+    image: agtipft/validator-scoring-sidecar:${POSTFIAT_SIDECAR_NETWORK:-testnet}-latest
     container_name: validator-scoring-sidecar
     init: true
     restart: unless-stopped

@@ -12,7 +12,7 @@ src/validator_scoring_sidecar/scoring/     Vendored foundation parser and select
 tests/                                     pytest suite
 scripts/                                   Maintainer scripts (vendor freshness)
 docs/                                      Operator documentation
-.github/workflows/                         CI: pytest, ruff, verify-only image build, vendor freshness
+.github/workflows/                         CI (pytest, ruff, image build, vendor freshness) and image publishing
 Dockerfile, docker-compose.yml, entrypoint.sh    Operator deployment packaging (verify-only default)
 docker-compose.participate.yml                   Opt-in overlay for the on-chain participation image
 .env.testnet.example, .env.devnet.example        Per-network operator env templates
@@ -54,6 +54,27 @@ validator-scoring-sidecar fetch-input-package --round-id <id>
 ```
 
 Direct CLI use is a development convenience. The operator deployment path is Docker Compose; the operator docs do not present the CLI as a parallel install path.
+
+## Releases and Docker images
+
+Operators never build from source: pushing to the `devnet` or `testnet` environment branch runs `.github/workflows/publish.yml`, which gates on pytest and a blocking vendor-freshness check, then builds and pushes that environment's images to Docker Hub:
+
+| Image | Contents |
+|---|---|
+| `agtipft/validator-scoring-sidecar:<env>-latest` | Verify-only sync image |
+| `agtipft/validator-scoring-sidecar:<env>-participate-latest` | Participation image bundling the postfiatd `validator-keys` tool from `agtipft/postfiatd:<env>-light-latest`, executed during the build as a compatibility gate |
+
+Each push also publishes immutable `<env>-<short-sha>` and `<env>-participate-<short-sha>` tags so a bad release can be rolled back by pinning. The operator compose files select the image from `POSTFIAT_SIDECAR_NETWORK` in `.env`.
+
+To build images from source while developing:
+
+```bash
+docker build --target runtime .
+docker build --platform linux/amd64 --target participate \
+  --build-arg VALIDATOR_KEYS_IMAGE=agtipft/postfiatd:devnet-light-latest .
+```
+
+Only the participation build pins a platform: the postfiatd image supplying the signing tool is published for amd64 only, while the verify-only image builds on any architecture.
 
 ## Vendor freshness
 
