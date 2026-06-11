@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8,<9",
+  "ruff>=0.15,<1",
 ]
 modal = [
   "modal>=0.73",
@@ -34,6 +35,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+# Vendored foundation modules are pinned by content hash and must never be
+# reformatted or "fixed" — that would break vendor-freshness verification.
+extend-exclude = ["src/validator_scoring_sidecar/scoring/_vendor_source"]
 
 [tool.pyright]
 exclude = [

@@ -12,7 +12,7 @@ src/validator_scoring_sidecar/scoring/     Vendored foundation parser and select
 tests/                                     pytest suite
 scripts/                                   Maintainer scripts (vendor freshness)
 docs/                                      Operator documentation
-.github/workflows/                         CI: vendor freshness against foundation main/devnet/testnet
+.github/workflows/                         CI: pytest, ruff, verify-only image build, vendor freshness
 Dockerfile, docker-compose.yml, entrypoint.sh    Operator deployment packaging (verify-only default)
 docker-compose.participate.yml                   Opt-in overlay for the on-chain participation image
 .env.testnet.example, .env.devnet.example        Per-network operator env templates
@@ -35,6 +35,14 @@ python -m pytest
 ```
 
 Tests are mocked at the HTTP layer — nothing reaches the live scoring service or IPFS gateway.
+
+## Linting
+
+```bash
+ruff check .
+```
+
+CI enforces this on every push and pull request, together with the test suite and a build of the verify-only Docker image. The vendored foundation modules under `scoring/_vendor_source` are excluded from linting — they are pinned by content hash and must match the foundation source byte for byte.
 
 ## Running the CLI directly
 
