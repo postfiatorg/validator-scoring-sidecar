@@ -30,9 +30,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# The modal extra lets the participate loop deploy the manifest-pinned Modal
+# endpoint itself; local-runtime operators simply leave the credentials unset.
 COPY --from=builder /build /build
 RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir /build \
+    && /opt/venv/bin/pip install --no-cache-dir "/build[modal]" \
     && rm -rf /build
 
 COPY --from=validator-keys-src ${VALIDATOR_KEYS_BIN} /usr/local/bin/validator-keys

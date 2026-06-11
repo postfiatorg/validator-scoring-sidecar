@@ -20,5 +20,10 @@ services:
       # validator master public key from it and binds `validator-keys sign`
       # to the same file.
       POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH: /keys/validator-keys.json
+    # Lets a local SGLang runtime on this host be reached from the container as
+    # host.docker.internal (see POSTFIAT_SIDECAR_LOCAL_ENDPOINT_URL). Harmless
+    # for Modal-backed deployments.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ${POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE:?set the host path of your validator-keys.json in .env}:/keys/validator-keys.json:ro

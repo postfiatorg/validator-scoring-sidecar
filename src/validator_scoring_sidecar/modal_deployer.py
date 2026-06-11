@@ -29,9 +29,12 @@ from validator_scoring_sidecar.deployment import (
 APP_MODULE_PATH = Path(__file__).with_name("_modal_app.py")
 ENDPOINT_CLASS_NAME = "SidecarScoringEndpoint"
 ENDPOINT_WEB_METHOD = "serve"
+# The Modal SDK's own credential variables; the deploy subprocess inherits them.
+ENV_MODAL_TOKEN_ID = "MODAL_TOKEN_ID"
+ENV_MODAL_TOKEN_SECRET = "MODAL_TOKEN_SECRET"
 MODAL_LOGIN_HINT = (
-    "no Modal login found; run `modal setup` (or set MODAL_TOKEN_ID and "
-    "MODAL_TOKEN_SECRET) before deploying"
+    "no Modal login found; run `modal setup` (or set "
+    f"{ENV_MODAL_TOKEN_ID} and {ENV_MODAL_TOKEN_SECRET}) before deploying"
 )
 MODAL_INSTALL_HINT = (
     "the Modal SDK is not installed; install it with "
@@ -65,7 +68,9 @@ class RealModalDeployer:
             raise ModalNotAvailableError(MODAL_INSTALL_HINT)
 
     def _require_modal_login(self) -> None:
-        if os.environ.get("MODAL_TOKEN_ID") and os.environ.get("MODAL_TOKEN_SECRET"):
+        if os.environ.get(ENV_MODAL_TOKEN_ID) and os.environ.get(
+            ENV_MODAL_TOKEN_SECRET
+        ):
             return
         if (Path.home() / ".modal.toml").is_file():
             return
