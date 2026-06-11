@@ -46,6 +46,18 @@ Verify-only sync needs none of these. To run the on-chain commit-reveal loop, de
 
 `POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH` — the in-container path of the mounted key file — is container-managed: the overlay pins it to `/keys/validator-keys.json`. Set it yourself only when running the CLI outside Docker.
 
+### Inference runtime
+
+Participation scoring needs an inference runtime; configure exactly one of the two:
+
+| Variable | Description |
+|---|---|
+| `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | Modal account credentials (secret). When set, the participate loop owns the runtime: it deploys the manifest-pinned Modal endpoint when none is recorded and redeploys when the foundation pins a new runtime, with no operator action. When unset, the loop never attempts a deployment. |
+| `POSTFIAT_SIDECAR_MODAL_KEY`, `POSTFIAT_SIDECAR_MODAL_SECRET` | Proxy-auth credentials for calling the deployed Modal endpoint (secret). |
+| `POSTFIAT_SIDECAR_LOCAL_ENDPOINT_URL` | For self-hosted local SGLang runtimes only: the endpoint as reachable **from inside the container**. The deployment record written by `start-sglang` points at `localhost`, which inside the container is not the host — use `http://host.docker.internal:8000/v1` for a runtime on the same host (the participation overlay maps that name to the host). |
+
+Auto-provisioning is strictly a Modal behavior. A local-mode deployment record always takes precedence and is never replaced; if a local runtime no longer matches a round's manifest, the round is recorded as runtime-incompatible and the operator re-runs `start-sglang` on their GPU host — the sidecar does not manage hardware it does not own.
+
 ### Key handling
 
 The sidecar never holds your validator master-key seed in process. It reads only the `public_key` field of the mounted `validator-keys.json` — the validator identity carried in each commit/reveal payload — and signs by invoking the bundled postfiatd `validator-keys` tool, explicitly bound to that same mounted file, so the embedded identity and the signature always come from one configured key source. The key file is mounted read-only, never copied into the image, and never logged. The on-chain transactions are signed and paid for by the separate relay wallet above, so the on-chain sender is deliberately not your validator identity.

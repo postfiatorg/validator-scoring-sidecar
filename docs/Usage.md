@@ -131,7 +131,7 @@ The overlay switches to the published participation image, which bundles the pos
 
 Before starting, uncomment the participation block in your `.env`: set `POSTFIAT_SIDECAR_MODE=participate`, the funded relay wallet seed, and `POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE` pointing at your `validator-keys.json` on the host. Participation is all-or-nothing: if any prerequisite is missing, the container logs a clear error and changes nothing on chain. The verify-only deployment is unaffected by the overlay's existence — `docker compose up -d` without the overlay keeps pulling and running the sync-only image.
 
-Participation also needs an inference runtime (see [`Deployment.md`](Deployment.md)) — scoring runs there, and a pass that cannot score has nothing to commit. For the full list of participation variables and the key-handling model, see [`Configuration.md`](Configuration.md).
+Participation also needs an inference runtime — scoring runs there, and a pass that cannot score has nothing to commit. With Modal this is zero-touch: set the four Modal values in `.env` and the sidecar deploys the foundation-pinned runtime itself, and redeploys when the foundation pins a new one. Running your own local SGLang H100 instead stays operator-managed — see [`Deployment.md`](Deployment.md). For the full list of participation variables and the key-handling model, see [`Configuration.md`](Configuration.md).
 
 ## Configuration
 

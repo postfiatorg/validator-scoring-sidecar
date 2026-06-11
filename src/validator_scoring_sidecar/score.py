@@ -16,6 +16,11 @@ frozen inputs:
 - Deferred comparison: a round already ``SCORED`` with a pending comparison is
   completed from its persisted hashes once the final bundle exists, without
   re-running inference.
+
+A full score may also provision its own runtime: when the caller supplies a
+``runtime_provisioner`` (the participate loop, Modal mode), a missing or
+manifest-stale Modal deployment record is replaced by a fresh deployment before
+inference — see ``_resolve_runtime`` for the gating rules.
 """
 
 from __future__ import annotations
@@ -30,7 +35,10 @@ from validator_scoring_sidecar.deployment import (
     DEPLOYMENT_MODE_LOCAL,
     DEPLOYMENT_MODE_MODAL,
     DeploymentError,
+    ManifestRuntimeError,
+    build_deployment_record,
     deployment_record_path,
+    extract_runtime_spec,
     load_round_manifest,
     select_latest_deployable_round,
 )
@@ -71,6 +79,17 @@ from validator_scoring_sidecar.verification import (
 )
 
 FOUNDATION_VERIFICATION_HASHES_PATH = "outputs/verification_hashes.json"
+
+# A runtime provisioner deploys the manifest-pinned Modal endpoint and returns
+# the resulting deployment record. Supplied by the participate loop when the
+# operator has configured Modal account credentials; never used to replace a
+# local-mode record.
+RuntimeProvisioner = Callable[[dict[str, Any]], dict[str, Any]]
+
+# Placeholder values for the provisioning pre-check record; neither field is
+# read by the compatibility checks the pre-check exists to evaluate.
+_PRECHECK_ENDPOINT_URL = "https://provisioning-precheck.invalid"
+_PRECHECK_DEPLOYED_AT = "1970-01-01T00:00:00+00:00"
 
 SCORE_STATUS_SCORED = "scored"
 SCORE_STATUS_DIVERGENT = "divergent"
@@ -126,6 +145,7 @@ def score_round(
     backend_factory=None,
     foundation_hash_fetcher=None,
     package_fetcher=fetch_input_package,
+    runtime_provisioner: RuntimeProvisioner | None = None,
 ) -> ScoreResult:
     """Score one round and persist the outcome."""
 
@@ -170,6 +190,7 @@ def score_round(
             package_fetcher=package_fetcher,
             factory=factory,
             fetch_foundation=fetch_foundation,
+            runtime_provisioner=runtime_provisioner,
         )
 
 
@@ -225,17 +246,14 @@ def _full_score(
     package_fetcher,
     factory: Callable[[dict[str, Any]], InferenceBackend],
     fetch_foundation,
+    runtime_provisioner: RuntimeProvisioner | None = None,
 ) -> ScoreResult:
     fetched = package_fetcher(metadata, config, client, source=source, force=False)
     state.record_input_verified(config.network, metadata, fetched)
 
     manifest = load_round_manifest(fetched.local_path)
-    deployment_record = _load_deployment_record(config)
-    compat = check_compatibility(
-        manifest,
-        deployment_record,
-        sidecar_network=config.network,
-        expected_round_number=metadata.round_number,
+    deployment_record, compat = _resolve_runtime(
+        config, manifest, metadata, runtime_provisioner
     )
     if not compat.passed:
         outcome = _outcome_from_compat_failure(compat.failure)
@@ -330,7 +348,7 @@ def _default_backend_factory(deployment_record: dict[str, Any]) -> InferenceBack
     if mode == DEPLOYMENT_MODE_MODAL:
         return ModalBackend.from_environment(endpoint_url)
     if mode == DEPLOYMENT_MODE_LOCAL:
-        return LocalSglangBackend(endpoint_url)
+        return LocalSglangBackend.from_environment(endpoint_url)
     raise DeploymentError(
         f"deployment record mode {mode!r} is not a supported inference backend"
     )
@@ -361,6 +379,94 @@ def _fetch_foundation_hashes(
         except ScoringClientError:
             pass
     return None
+
+
+def _resolve_runtime(
+    config: SidecarConfig,
+    manifest: dict[str, Any],
+    metadata: RoundMetadata,
+    provisioner: RuntimeProvisioner | None,
+) -> tuple[dict[str, Any], Any]:
+    """Return the deployment record to score with and its compatibility result.
+
+    With no provisioner this is the manual contract: the record must exist and
+    is checked as-is. With a provisioner (the participate loop, Modal mode),
+    a missing record or a stale Modal record is replaced by a fresh deployment —
+    but only when the pre-check proves a fresh deployment would actually pass,
+    so unfixable failures (unsupported schema, vendored-code drift, dry-run
+    rounds) never trigger a deploy or a deploy loop. A local-mode record is
+    never replaced: the sidecar does not manage hardware it does not own.
+    """
+
+    try:
+        record = _load_deployment_record(config)
+    except DeploymentError:
+        record = None
+
+    compat = None
+    if record is not None:
+        compat = check_compatibility(
+            manifest,
+            record,
+            sidecar_network=config.network,
+            expected_round_number=metadata.round_number,
+        )
+        if compat.passed:
+            return record, compat
+
+    if provisioner is not None and (
+        record is None or record.get("mode") == DEPLOYMENT_MODE_MODAL
+    ):
+        precheck = _fresh_modal_compatibility(config, manifest, metadata)
+        if precheck is not None and precheck.passed:
+            new_record = provisioner(manifest)
+            return new_record, check_compatibility(
+                manifest,
+                new_record,
+                sidecar_network=config.network,
+                expected_round_number=metadata.round_number,
+            )
+        if record is None and precheck is not None:
+            # The round itself is unscoreable (dry-run, wrong network, …);
+            # record that verdict instead of demanding a deployment record.
+            return {}, precheck
+
+    if record is None or compat is None:
+        raise DeploymentError(
+            f"no deployment record found at {deployment_record_path(config)}; "
+            "run `deploy-modal` or `start-sglang` first"
+        )
+    return record, compat
+
+
+def _fresh_modal_compatibility(
+    config: SidecarConfig,
+    manifest: dict[str, Any],
+    metadata: RoundMetadata,
+):
+    """Compatibility a fresh Modal deployment from this manifest would get.
+
+    Builds the record such a deployment would write and runs the real checker
+    against it, so only record-independent checks can fail. Returns ``None``
+    when the manifest does not describe a deployable runtime at all.
+    """
+
+    try:
+        spec = extract_runtime_spec(manifest)
+    except ManifestRuntimeError:
+        return None
+    hypothetical = build_deployment_record(
+        spec,
+        mode=DEPLOYMENT_MODE_MODAL,
+        endpoint_url=_PRECHECK_ENDPOINT_URL,
+        deployed_at=_PRECHECK_DEPLOYED_AT,
+    )
+    return check_compatibility(
+        manifest,
+        hypothetical.as_dict(),
+        sidecar_network=config.network,
+        expected_round_number=metadata.round_number,
+    )
 
 
 def _load_deployment_record(config: SidecarConfig) -> dict[str, Any]:

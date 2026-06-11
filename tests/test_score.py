@@ -1,6 +1,9 @@
 import json
 
+import pytest
+
 from validator_scoring_sidecar.config import load_config
+from validator_scoring_sidecar.deployment import DeploymentError
 from validator_scoring_sidecar.failure import FailureCategory
 from validator_scoring_sidecar.inference import (
     BACKEND_MODE_MODAL,
@@ -535,3 +538,139 @@ def test_deferred_falls_back_to_rescore_when_persisted_hashes_missing(tmp_path):
 
     assert result.status == SCORE_STATUS_SCORED
     assert backend.run_count == 2
+
+
+def _config_without_record(tmp_path):
+    return load_config(
+        base_url="https://scoring.example.org",
+        data_dir=tmp_path,
+        network="testnet",
+        environ={},
+    )
+
+
+def _never_provision(manifest):
+    raise AssertionError("provisioning must not run on this path")
+
+
+def test_missing_record_without_provisioner_raises(tmp_path):
+    with pytest.raises(DeploymentError):
+        score_round(
+            _config_without_record(tmp_path),
+            FakeClient(),
+            round_id=123,
+            backend_factory=_no_backend,
+            foundation_hash_fetcher=lambda *args: None,
+            package_fetcher=_make_package_fetcher(_manifest()),
+        )
+
+
+def test_missing_record_is_provisioned_for_modal(tmp_path):
+    backend = FakeBackend()
+    provisioned = []
+
+    def provision(manifest):
+        provisioned.append(manifest)
+        return _deployment_record()
+
+    result = score_round(
+        _config_without_record(tmp_path),
+        FakeClient(),
+        round_id=123,
+        backend_factory=lambda record: backend,
+        foundation_hash_fetcher=lambda client, metadata, cfg: dict(EXPECTED_HASHES),
+        package_fetcher=_make_package_fetcher(_manifest()),
+        runtime_provisioner=provision,
+    )
+
+    assert len(provisioned) == 1
+    assert provisioned[0]["round"]["round_number"] == 456
+    assert result.status == SCORE_STATUS_SCORED
+    assert backend.run_count == 1
+
+
+def test_stale_modal_record_is_reprovisioned(tmp_path):
+    config = _setup(
+        tmp_path, deployment_record=_deployment_record(model_revision="b" * 40)
+    )
+    backend = FakeBackend()
+    provisioned = []
+
+    def provision(manifest):
+        provisioned.append(manifest)
+        return _deployment_record()
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=lambda record: backend,
+        foundation_hash_fetcher=lambda client, metadata, cfg: dict(EXPECTED_HASHES),
+        package_fetcher=_make_package_fetcher(_manifest()),
+        runtime_provisioner=provision,
+    )
+
+    assert len(provisioned) == 1
+    assert result.status == SCORE_STATUS_SCORED
+    assert backend.run_count == 1
+
+
+def test_local_record_is_never_reprovisioned(tmp_path):
+    config = _setup(
+        tmp_path,
+        deployment_record=_deployment_record(mode="local", model_revision="b" * 40),
+    )
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=_no_backend,
+        foundation_hash_fetcher=lambda *args: None,
+        package_fetcher=_make_package_fetcher(_manifest()),
+        runtime_provisioner=_never_provision,
+    )
+
+    assert result.status == SCORE_STATUS_SCORING_FAILED
+    assert result.error_category == FailureCategory.MANIFEST_INCOMPATIBLE.value
+
+
+def test_unfixable_failure_is_not_provisioned(tmp_path):
+    # Vendored-code drift cannot be fixed by redeploying the runtime, so a
+    # stale Modal record must not trigger a deploy loop.
+    manifest = _manifest()
+    manifest["code"]["parser"]["content_sha256"] = "f" * 64
+    config = _setup(
+        tmp_path, deployment_record=_deployment_record(model_revision="b" * 40)
+    )
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=_no_backend,
+        foundation_hash_fetcher=lambda *args: None,
+        package_fetcher=_make_package_fetcher(manifest),
+        runtime_provisioner=_never_provision,
+    )
+
+    assert result.status == SCORE_STATUS_SCORING_FAILED
+    assert result.error_category == FailureCategory.MANIFEST_INCOMPATIBLE.value
+
+
+def test_dry_run_round_is_skipped_without_provisioning(tmp_path):
+    manifest = _manifest()
+    manifest["round"] = {**manifest["round"], "kind": "dry_run"}
+
+    result = score_round(
+        _config_without_record(tmp_path),
+        FakeClient(),
+        round_id=123,
+        backend_factory=_no_backend,
+        foundation_hash_fetcher=lambda *args: None,
+        package_fetcher=_make_package_fetcher(manifest),
+        runtime_provisioner=_never_provision,
+    )
+
+    assert result.status == SCORE_STATUS_SKIPPED
+    assert result.error_category == FailureCategory.SKIPPED_OPERATOR_OPT_OUT.value

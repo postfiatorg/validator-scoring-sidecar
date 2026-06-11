@@ -7,9 +7,17 @@ from xrpl.core.addresscodec import encode_node_public_key
 
 from validator_scoring_sidecar.chain import VerifiedAnnouncement
 from validator_scoring_sidecar.config import load_config
-from validator_scoring_sidecar.deployment import NoEligibleRoundError
+from validator_scoring_sidecar.deployment import (
+    ModalDeploymentResult,
+    NoEligibleRoundError,
+    deployment_record_path,
+)
 from validator_scoring_sidecar.input_package import FetchedInputPackage
-from validator_scoring_sidecar.participate import ParticipationConfigError, participate
+from validator_scoring_sidecar.participate import (
+    ParticipationConfigError,
+    modal_runtime_provisioner,
+    participate,
+)
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.score import ScoreResult
 from validator_scoring_sidecar.scoring import commit_reveal
@@ -130,7 +138,9 @@ def fake_decoder(transaction, config, client, *, package_fetcher=None, round_lim
     return None
 
 
-def fake_score_runner(config, client, *, source=None, round_limit=None):
+def fake_score_runner(
+    config, client, *, source=None, round_limit=None, runtime_provisioner=None
+):
     return ScoreResult(
         status="already_scored",
         network=NETWORK,
@@ -364,3 +374,101 @@ def test_participate_requires_validator_keys(tmp_path):
             score_runner=_no_score,
             announcement_decoder=fake_decoder,
         )
+
+
+MODAL_CREDS = {"MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"}
+
+
+def _runtime_manifest():
+    return {
+        "runtime": {
+            "kind": "modal_sglang",
+            "image": "lmsysorg/sglang:nightly-dev@sha256:" + "d" * 64,
+            "gpu": "H100",
+            "tensor_parallelism": 1,
+            "launch_args": ["--enable-deterministic-inference"],
+        },
+        "model": {
+            "provider": "huggingface",
+            "repo_id": "Qwen/Qwen3.6-27B-FP8",
+            "served_name": "Qwen/Qwen3.6-27B-FP8",
+            "revision": "a" * 40,
+        },
+    }
+
+
+def test_modal_runtime_provisioner_requires_both_credentials(tmp_path):
+    config = _config(tmp_path)
+    assert modal_runtime_provisioner(config, environ={}) is None
+    assert (
+        modal_runtime_provisioner(config, environ={"MODAL_TOKEN_ID": "id"}) is None
+    )
+    assert (
+        modal_runtime_provisioner(config, environ={"MODAL_TOKEN_SECRET": "secret"})
+        is None
+    )
+
+
+def test_modal_runtime_provisioner_deploys_and_records(tmp_path):
+    config = _config(tmp_path)
+    deployed = {}
+
+    class FakeDeployer:
+        def deploy(self, spec, *, app_name):
+            deployed["app_name"] = app_name
+            deployed["image"] = spec.image
+            return ModalDeploymentResult(endpoint_url="https://operator--app.modal.run")
+
+    provision = modal_runtime_provisioner(
+        config, environ=MODAL_CREDS, deployer_factory=FakeDeployer
+    )
+    record = provision(_runtime_manifest())
+
+    assert deployed["app_name"] == f"validator-scoring-sidecar-{NETWORK}"
+    assert record["mode"] == "modal"
+    assert record["endpoint_url"] == "https://operator--app.modal.run"
+    assert deployment_record_path(config).is_file()
+
+
+def test_participate_forwards_runtime_provisioner(tmp_path):
+    captured = {}
+
+    def runner(config, client, *, source=None, round_limit=None, runtime_provisioner=None):
+        captured["provisioner"] = runtime_provisioner
+        return fake_score_runner(config, client)
+
+    def sentinel(manifest):
+        raise AssertionError("never invoked in this test")
+
+    participate(
+        _config(tmp_path),
+        FakeClient(),
+        rpc_client=FakeRpc(close_time=COMMIT_TIME),
+        signer=FakeSigner(),
+        score_runner=runner,
+        announcement_decoder=fake_decoder,
+        runtime_provisioner=sentinel,
+    )
+
+    assert captured["provisioner"] is sentinel
+
+
+def test_participate_without_modal_credentials_passes_no_provisioner(tmp_path, monkeypatch):
+    monkeypatch.delenv("MODAL_TOKEN_ID", raising=False)
+    monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
+    captured = {}
+
+    def runner(config, client, *, source=None, round_limit=None, runtime_provisioner=None):
+        captured["provisioner"] = runtime_provisioner
+        return fake_score_runner(config, client)
+
+    participate(
+        _config(tmp_path),
+        FakeClient(),
+        rpc_client=FakeRpc(close_time=COMMIT_TIME),
+        signer=FakeSigner(),
+        score_runner=runner,
+        announcement_decoder=fake_decoder,
+    )
+
+    assert captured["provisioner"] is None

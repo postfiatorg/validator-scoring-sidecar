@@ -308,6 +308,42 @@ def test_local_default_endpoint_targets_localhost():
     assert captured["url"] == "http://localhost:8000/v1/chat/completions"
 
 
+def test_local_environment_endpoint_override_wins():
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json=_completion())
+
+    backend = LocalSglangBackend.from_environment(
+        "http://localhost:8000/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        environ={
+            "POSTFIAT_SIDECAR_LOCAL_ENDPOINT_URL": "http://host.docker.internal:8000/v1"
+        },
+    )
+    backend.run(_model_request())
+
+    assert captured["url"] == "http://host.docker.internal:8000/v1/chat/completions"
+
+
+def test_local_environment_without_override_uses_record_endpoint():
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json=_completion())
+
+    backend = LocalSglangBackend.from_environment(
+        "http://gpu-host:8000/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        environ={},
+    )
+    backend.run(_model_request())
+
+    assert captured["url"] == "http://gpu-host:8000/v1/chat/completions"
+
+
 def test_local_timeout_maps_to_inference_timeout():
     def handler(request):
         raise httpx.ReadTimeout("slow", request=request)
