@@ -249,3 +249,59 @@ def test_resolve_publisher_address_raises_when_unavailable():
     config = load_config(network=NETWORK, environ={})
     with pytest.raises(ChainWatcherError):
         resolve_foundation_publisher_address(config, None)
+
+
+class _FakeXrplResponse:
+    def __init__(self, result):
+        self.result = result
+
+    def is_successful(self):
+        return True
+
+
+class _FakeXrplClient:
+    """Stands in for xrpl-py's JsonRpcClient under XrplPftlRpcClient."""
+
+    def __init__(self, network_id=2024):
+        self.network_id = network_id
+        self.server_info_requests = 0
+
+    def request(self, request):
+        self.server_info_requests += 1
+        return _FakeXrplResponse({"info": {"network_id": self.network_id}})
+
+
+def test_submit_memo_stamps_discovered_network_id(monkeypatch):
+    import xrpl.transaction
+    from xrpl.core import keypairs
+
+    from validator_scoring_sidecar.chain import XrplPftlRpcClient
+
+    submitted = []
+
+    def fake_submit_and_wait(transaction, client, wallet):
+        submitted.append(transaction)
+        return _FakeXrplResponse(
+            {"meta": {"TransactionResult": "tesSUCCESS"}, "hash": "TX" * 32}
+        )
+
+    monkeypatch.setattr(xrpl.transaction, "submit_and_wait", fake_submit_and_wait)
+    rpc = XrplPftlRpcClient("https://rpc.example.org")
+    rpc._client = _FakeXrplClient(network_id=2024)
+    seed = keypairs.generate_seed()
+
+    for _ in range(2):
+        tx_hash = rpc.submit_memo(
+            wallet_seed=seed,
+            destination="rDestination",
+            memo_type="pf_test",
+            memo_data="{}",
+        )
+        assert tx_hash == "TX" * 32
+
+    # PFTL networks (id > 1024) reject transactions without NetworkID with
+    # telREQUIRES_NETWORK_ID, and xrpl-py's autofill cannot supply it against
+    # postfiatd's fork build version — the client must stamp it itself.
+    assert all(tx.network_id == 2024 for tx in submitted)
+    # Discovered once via server_info, then cached across submissions.
+    assert rpc._client.server_info_requests == 1
