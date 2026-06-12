@@ -308,6 +308,37 @@ def test_local_default_endpoint_targets_localhost():
     assert captured["url"] == "http://localhost:8000/v1/chat/completions"
 
 
+def test_default_client_follows_redirects():
+    # Modal answers >150s requests (cold starts) with a 303 redirect chain to a
+    # result-polling URL; the default client must follow it like the
+    # foundation's OpenAI-SDK client does.
+    backend = LocalSglangBackend()
+    assert backend._http.follow_redirects is True
+    backend.close()
+
+
+def test_backend_follows_redirect_to_result_url():
+    calls = []
+
+    def handler(request):
+        calls.append(request.method)
+        if len(calls) == 1:
+            return httpx.Response(
+                303, headers={"Location": "http://localhost:8000/result/abc"}
+            )
+        return httpx.Response(200, json=_completion("REDIRECTED OUTPUT"))
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    )
+    result = LocalSglangBackend(
+        "http://localhost:8000/v1", http_client=client
+    ).run(_model_request())
+
+    assert result.content == "REDIRECTED OUTPUT"
+    assert calls == ["POST", "GET"]
+
+
 def test_local_environment_endpoint_override_wins():
     captured = {}
 

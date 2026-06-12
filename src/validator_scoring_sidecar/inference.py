@@ -146,7 +146,13 @@ class _ChatCompletionsBackend:
     ):
         self._url = _chat_completions_url(endpoint_url)
         self._headers = dict(headers or {})
-        self._http = http_client or httpx.Client(timeout=timeout_seconds)
+        # Modal answers requests that run past ~150s (cold starts, long
+        # inference) with a 303 redirect chain to a result-polling URL; the
+        # foundation's OpenAI-SDK client follows it by default and this client
+        # must match, or every cold-start round fails with INFERENCE_ERROR 303.
+        self._http = http_client or httpx.Client(
+            timeout=timeout_seconds, follow_redirects=True
+        )
         self._owns_client = http_client is None
 
     def close(self) -> None:
