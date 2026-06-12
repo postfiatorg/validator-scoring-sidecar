@@ -135,6 +135,7 @@ class XrplPftlRpcClient:
     def __init__(self, rpc_url: str):
         self._rpc_url = rpc_url
         self._client: Any | None = None
+        self._cached_network_id: int | None = None
 
     def _ensure_client(self) -> Any:
         if self._client is None:
@@ -142,6 +143,32 @@ class XrplPftlRpcClient:
 
             self._client = JsonRpcClient(self._rpc_url)
         return self._client
+
+    def _resolve_network_id(self) -> int | None:
+        """Fetch and cache the chain's network ID for transaction stamping.
+
+        PFTL networks use IDs above 1024, where every transaction must carry an
+        explicit ``NetworkID`` or be rejected with ``telREQUIRES_NETWORK_ID``.
+        xrpl-py's autofill cannot supply it against postfiatd, because the fork
+        reports its own build version (pre-1.11 by rippled numbering) and the
+        autofill version gate skips the field. Discovered from ``server_info``
+        so the operator never configures it.
+        """
+
+        if self._cached_network_id is None:
+            from xrpl.models.requests import ServerInfo
+
+            try:
+                response = self._ensure_client().request(ServerInfo())
+            except Exception as exc:  # noqa: BLE001 - surface any transport failure uniformly
+                raise PftlRpcError(f"PFTL server_info request failed: {exc}") from exc
+            if not response.is_successful():
+                raise PftlRpcError(
+                    f"PFTL server_info returned an error: {response.result}"
+                )
+            network_id = response.result.get("info", {}).get("network_id")
+            self._cached_network_id = int(network_id) if network_id is not None else 0
+        return self._cached_network_id or None
 
     def account_tx(
         self,
@@ -211,6 +238,7 @@ class XrplPftlRpcClient:
             account=wallet.classic_address,
             destination=destination,
             amount="1",
+            network_id=self._resolve_network_id(),
             memos=[
                 Memo(
                     memo_type=str_to_hex(memo_type),
