@@ -41,6 +41,10 @@ DEFAULT_ACCOUNT_TX_PAGE_LIMIT = 200
 # xrpl uses -1 to mean "the latest validated ledger" for the upper bound and
 # "the earliest available ledger" for the lower bound on a first scan.
 VALIDATED_LEDGER_INDEX = -1
+# Bounds the clamp-and-retry loop when the cursor is below the node's retained
+# history. Each retry re-reads the floor, so this only needs to absorb the
+# pruning-boundary race (the floor advancing mid-recovery), not a deep walk.
+MAX_PRUNED_LEDGER_RETRIES = 3
 
 
 class ChainWatcherError(RuntimeError):
@@ -53,6 +57,13 @@ class PftlRpcError(ChainWatcherError):
 
 class PftlInsufficientFundsError(PftlRpcError):
     """Raised when a transaction is rejected for insufficient balance or fee."""
+
+
+class PftlPrunedLedgerError(PftlRpcError):
+    """Raised when an ``account_tx`` lower bound is below the node's retained
+    history (``lgrIdxMalformed``) — i.e. the requested ledgers have been pruned
+    off a non-archive node. Distinct from a generic RPC error so the watcher can
+    recover by clamping the floor forward rather than failing the pass."""
 
 
 @dataclass(frozen=True)
@@ -112,6 +123,8 @@ class PftlRpcClient(Protocol):
         limit: int,
         marker: Any | None,
     ) -> dict[str, Any]: ...
+
+    def earliest_validated_ledger(self) -> int: ...
 
     def latest_validated_ledger_close_time(self) -> datetime: ...
 
@@ -197,10 +210,29 @@ class XrplPftlRpcClient:
                 f"PFTL account_tx request failed for {account}: {exc}"
             ) from exc
         if not response.is_successful():
+            if _is_pruned_ledger(response.result):
+                raise PftlPrunedLedgerError(
+                    f"PFTL account_tx lower bound {ledger_index_min} is below the "
+                    f"node's retained history for {account}: {response.result}"
+                )
             raise PftlRpcError(
                 f"PFTL account_tx returned an error for {account}: {response.result}"
             )
         return response.result
+
+    def earliest_validated_ledger(self) -> int:
+        from xrpl.models.requests import ServerInfo
+
+        try:
+            response = self._ensure_client().request(ServerInfo())
+        except Exception as exc:  # noqa: BLE001 - surface any transport failure uniformly
+            raise PftlRpcError(f"PFTL server_info request failed: {exc}") from exc
+        if not response.is_successful():
+            raise PftlRpcError(
+                f"PFTL server_info returned an error: {response.result}"
+            )
+        complete = response.result.get("info", {}).get("complete_ledgers")
+        return _earliest_complete_ledger(complete)
 
     def latest_validated_ledger_close_time(self) -> datetime:
         from xrpl.models.requests import Ledger
@@ -316,6 +348,33 @@ class PftlAccountWatcher:
         )
 
     def _fetch_all(self, ledger_index_min: int) -> list[dict[str, Any]]:
+        """Page through ``account_tx`` from ``ledger_index_min``.
+
+        If the stored cursor has fallen below the node's retained history (a
+        pruning, non-archive node after an idle gap), the node rejects the
+        lower bound with ``lgrIdxMalformed``; recover by clamping the floor
+        forward to the node's earliest available ledger and retrying. Skipped
+        ledgers only ever hold announcements whose commit windows have already
+        closed — a node retains far more history than any commit window is long
+        — so the clamp never costs a committable round. Re-reading the floor on
+        each retry absorbs the boundary race where the node prunes further
+        mid-recovery.
+        """
+
+        retries = 0
+        while True:
+            try:
+                return self._fetch_pages(ledger_index_min)
+            except PftlPrunedLedgerError:
+                retries += 1
+                if retries > MAX_PRUNED_LEDGER_RETRIES:
+                    raise
+                floor = self._rpc.earliest_validated_ledger()
+                if ledger_index_min != VALIDATED_LEDGER_INDEX:
+                    floor = max(floor, ledger_index_min + 1)
+                ledger_index_min = floor
+
+    def _fetch_pages(self, ledger_index_min: int) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         marker: Any | None = None
         while True:
@@ -578,6 +637,38 @@ def _decode_hex_text(value: str) -> str | None:
 def _is_insufficient_funds(text: str) -> bool:
     lowered = text.lower()
     return "insuf" in lowered or "unfunded" in lowered
+
+
+def _is_pruned_ledger(result: Any) -> bool:
+    """True when an account_tx error means the lower bound predates retained
+    history (``lgrIdxMalformed`` / error code 58).
+
+    Code 58 is rippled's general malformed-ledger-index error — it also covers a
+    non-integer index or ``min > max``. It unambiguously means "pruned" only
+    because the watcher always sends a valid integer lower bound with
+    ``max == -1``; do not reuse this helper for calls without that guarantee."""
+
+    if not isinstance(result, dict):
+        return False
+    return result.get("error") == "lgrIdxMalformed" or result.get("error_code") == 58
+
+
+def _earliest_complete_ledger(value: Any) -> int:
+    """Earliest validated ledger the node still retains, parsed from the
+    ``complete_ledgers`` range string (e.g. ``"1850169-1906374"``; ranges are
+    comma-separated and the first one's start is the earliest available)."""
+
+    if not isinstance(value, str) or not value.strip() or value.strip() == "empty":
+        raise PftlRpcError(
+            f"PFTL server_info has no usable complete_ledgers range: {value!r}"
+        )
+    low = value.split(",")[0].split("-")[0].strip()
+    try:
+        return int(low)
+    except ValueError as exc:
+        raise PftlRpcError(
+            f"PFTL complete_ledgers is not a ledger range: {value!r}"
+        ) from exc
 
 
 def find_memo_payload(

@@ -2,10 +2,15 @@ import httpx
 import pytest
 
 from validator_scoring_sidecar.chain import (
+    MAX_PRUNED_LEDGER_RETRIES,
     ChainWatcherError,
     FoundationConfig,
     PftlAccountWatcher,
+    PftlPrunedLedgerError,
+    PftlRpcError,
     WatchedTransaction,
+    _earliest_complete_ledger,
+    _is_pruned_ledger,
     resolve_foundation_publisher_address,
 )
 from validator_scoring_sidecar.config import load_config
@@ -305,3 +310,99 @@ def test_submit_memo_stamps_discovered_network_id(monkeypatch):
     assert all(tx.network_id == 2024 for tx in submitted)
     # Discovered once via server_info, then cached across submissions.
     assert rpc._client.server_info_requests == 1
+
+
+class PruningFakeRpc(FakeRpc):
+    """account_tx fake that rejects a lower bound below a retained floor with
+    PftlPrunedLedgerError, like a pruning non-archive node. ``true_floor`` is
+    what the node actually enforces; ``reported_floor`` / ``reported_floors`` is
+    what server_info reports (a sequence lets a test model the floor advancing
+    mid-recovery)."""
+
+    def __init__(self, entries, *, true_floor, reported_floor=None, reported_floors=None, page_size=10):
+        super().__init__(entries, page_size=page_size)
+        self.true_floor = true_floor
+        self.reported_floor = reported_floor if reported_floor is not None else true_floor
+        self.reported_floors = list(reported_floors) if reported_floors else None
+        self.floor_reads = 0
+
+    def account_tx(self, *, account, ledger_index_min, ledger_index_max, forward, limit, marker):
+        if ledger_index_min != -1 and ledger_index_min < self.true_floor:
+            self.calls.append({"min": ledger_index_min, "max": ledger_index_max, "marker": marker})
+            raise PftlPrunedLedgerError(
+                f"account_tx min {ledger_index_min} below retained floor {self.true_floor}"
+            )
+        return super().account_tx(
+            account=account,
+            ledger_index_min=ledger_index_min,
+            ledger_index_max=ledger_index_max,
+            forward=forward,
+            limit=limit,
+            marker=marker,
+        )
+
+    def earliest_validated_ledger(self):
+        self.floor_reads += 1
+        if self.reported_floors:
+            return self.reported_floors.pop(0)
+        return self.reported_floor
+
+
+def test_poll_clamps_cursor_below_retained_history(tmp_path):
+    entries = [_entry(1850170, "X"), _entry(1850180, "Y")]
+    rpc = PruningFakeRpc(entries, true_floor=1850169, reported_floor=1850169)
+    with SidecarState(tmp_path) as state:
+        state.set_chain_cursor(NETWORK, PUBLISHER, 1818876, "OLD")
+        result = _watcher(state, rpc).poll()
+
+    assert [t.tx_hash for t in result] == ["X", "Y"]
+    assert rpc.floor_reads == 1
+    mins = [c["min"] for c in rpc.calls]
+    # First attempt used the stale cursor; the retry used the clamped floor.
+    assert mins[0] == 1818876
+    assert mins[-1] == 1850169
+
+
+def test_poll_recovers_from_pruning_boundary_race(tmp_path):
+    # server_info first reports a floor the node has already pruned past, so the
+    # clamped retry still fails; re-reading the floor converges.
+    entries = [_entry(1850200, "Z")]
+    rpc = PruningFakeRpc(entries, true_floor=1850200, reported_floors=[1850169, 1850200])
+    with SidecarState(tmp_path) as state:
+        state.set_chain_cursor(NETWORK, PUBLISHER, 1818876, "OLD")
+        result = _watcher(state, rpc).poll()
+
+    assert [t.tx_hash for t in result] == ["Z"]
+    assert rpc.floor_reads == 2
+    # The successful fetch used the re-read (advanced) floor, not the stale one.
+    assert rpc.calls[-1]["min"] == 1850200
+
+
+def test_poll_gives_up_after_max_pruned_retries(tmp_path):
+    # true floor never reachable from the reported floor: recovery is bounded
+    # rather than looping forever, and the error propagates.
+    rpc = PruningFakeRpc([], true_floor=2_000_000, reported_floor=1_500_000)
+    with SidecarState(tmp_path) as state:
+        state.set_chain_cursor(NETWORK, PUBLISHER, 1_000_000, "OLD")
+        with pytest.raises(PftlPrunedLedgerError):
+            _watcher(state, rpc).poll()
+
+    assert rpc.floor_reads == MAX_PRUNED_LEDGER_RETRIES
+
+
+def test_earliest_complete_ledger_parses_range():
+    assert _earliest_complete_ledger("1850169-1906374") == 1850169
+    assert _earliest_complete_ledger("1850169-1900000,1900005-1906374") == 1850169
+
+
+def test_earliest_complete_ledger_rejects_unusable_range():
+    for bad in ("", "empty", None, 123):
+        with pytest.raises(PftlRpcError):
+            _earliest_complete_ledger(bad)
+
+
+def test_is_pruned_ledger_detects_lgr_idx_malformed():
+    assert _is_pruned_ledger({"error": "lgrIdxMalformed"}) is True
+    assert _is_pruned_ledger({"error_code": 58}) is True
+    assert _is_pruned_ledger({"error": "actNotFound"}) is False
+    assert _is_pruned_ledger("not a dict") is False
