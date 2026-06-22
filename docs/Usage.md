@@ -133,6 +133,93 @@ Before starting, uncomment the participation block in your `.env`: set `POSTFIAT
 
 Participation also needs an inference runtime — scoring runs there, and a pass that cannot score has nothing to commit. With Modal this is zero-touch: set the four Modal values in `.env` and the sidecar deploys the foundation-pinned runtime itself, and redeploys when the foundation pins a new one. Running your own local SGLang H100 instead stays operator-managed — see [`Deployment.md`](Deployment.md). For the full list of participation variables and the key-handling model, see [`Configuration.md`](Configuration.md).
 
+## Participation lifecycle and recovery
+
+Once participation mode is configured and the container is up, there is nothing to do per round. The loop runs one `participate` pass at the chain-poll cadence (`POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS`, default 60s). Each pass scores the latest eligible round, watches the foundation publisher account for that round's on-chain announcement, and — inside the announced windows — submits your commit and, on a later pass, your reveal. You "join" a round simply by running while its windows are open. Each pass logs `participate completed`, or `participate failed; sleeping ...` on an infrastructure error that is retried next pass.
+
+### Round states
+
+The sidecar records one row per round in its local SQLite store (`/data/sidecar.db` in the named volume, schema v5). A round advances through:
+
+```
+DISCOVERED → INPUT_PACKAGE_VERIFIED → SCORED → COMMITTED → REVEALED
+```
+
+- `DISCOVERED` — round seen; input package not yet verified.
+- `INPUT_PACKAGE_VERIFIED` — frozen input package downloaded and hash-verified.
+- `SCORED` — reproduced the round on your runtime and recorded your three output fingerprints (model response, validator scores, selected UNL). The foundation comparison may still be pending.
+- `COMMITTED` — your salted commitment is on chain (`commit_tx_hash` recorded), with the salt and reveal windows persisted so a later pass can reopen it.
+- `REVEALED` — your reveal is on chain (`reveal_tx_hash` recorded). This is the terminal happy path.
+
+Two states sit off that ladder: `SCORING_FAILED` (scoring could not complete — inference error, runtime unavailable, and similar) and `SKIPPED` (the round will not be scored or committed — a dry-run/override round, an unsupported manifest, or a low-balance commit skip).
+
+A foundation-comparison divergence is recorded as an annotation (`error_category` = `OUTPUT_DIVERGENCE`), not a state: a divergent round is still committed and revealed, because participation records what you actually computed.
+
+### Inspecting state
+
+There is no status subcommand; read the SQLite store directly. The container image has no `sqlite3` CLI but ships Python's standard-library `sqlite3`:
+
+```bash
+docker compose exec sidecar python -c "
+import sqlite3
+db = sqlite3.connect('/data/sidecar.db'); db.row_factory = sqlite3.Row
+for r in db.execute('SELECT round_number, sidecar_state, commit_tx_hash, reveal_tx_hash, error_category, reveal_error_category FROM sidecar_rounds ORDER BY round_number DESC LIMIT 10'):
+    print(dict(r))
+"
+```
+
+What to expect at each checkpoint: **before commit** the round reaches `SCORED` (with an `OUTPUT_DIVERGENCE` annotation if your reproduction differs — it is still committed); **after commit** the state is `COMMITTED` with `commit_tx_hash` set; **after reveal** the state is `REVEALED` with `reveal_tx_hash` set; **after convergence** the foundation publishes a per-round report (see below).
+
+### Restart and crash safety
+
+Each pass is idempotent and restart-safe — you can stop, update, or crash the container without corrupting participation:
+
+- Reveals run first and are driven from local state, independent of whether a new round is scorable, so a round committed earlier still reveals in its window even when nothing new is eligible.
+- Before submitting a commit or reveal, the sidecar scans the publisher account's recent validated history for a payload you already authored for that round; if it finds one it records that transaction hash instead of double-submitting. A run that crashed after broadcasting but before persisting recovers correctly.
+- The chain watcher advances its cursor past an announcement only once it is terminally handled, never past one whose commit is still pending or hit a transient error, so nothing is silently skipped.
+- A reveal refuses to broadcast unless your stored outputs and salt still reproduce the committed commitment (a local-state corruption guard).
+
+### Recoverable vs terminal conditions
+
+Recoverable — the next pass retries automatically:
+
+- **Insufficient relay-wallet balance at reveal time**: the reveal is skipped for this pass and retried on a later pass while the reveal window is still open (the round stays `COMMITTED`). Fund the wallet and the next pass reveals.
+- **Transient RPC, download, or scoring errors**: the pass fails (`participate failed` in the logs), the cursor does not advance, and the round is reprocessed next pass.
+- **A commit window that has not opened yet**: the pass holds and retries.
+
+Terminal — there is no re-submission on a later pass:
+
+- **Insufficient relay-wallet balance at commit time**: the commit is recorded `SKIPPED` and the announcement cursor advances past it, so the round is not committed and is not retried later. Keep the wallet funded ahead of the commit window (see *Avoiding misses*). A low-balance *reveal*, in contrast, is retried as above.
+- **A reveal window that closed before you revealed** is recorded as a missed reveal: the round stays `COMMITTED` with `reveal_error_category` = `REVEAL_WINDOW_MISSED`. This is distinct from a transient low-balance reveal skip, which sets no `reveal_error_category` and is retried.
+- **A commit window that closed before you committed**: the round stays `SCORED`, is never committed, and the announcement cursor advances past it.
+
+A missed window is a chain-participation miss only — it does not fail the round's score and never affects the canonical Validator List.
+
+### Avoiding misses
+
+- **Keep the relay wallet funded** — maintain the account reserve plus a long runway of per-round transaction fees so a commit or reveal is never skipped for balance. (An explicit startup balance pre-flight check is not yet built; underfunding is handled reactively.)
+- **Keep the poll interval well below the window lengths** — the default 60s sits comfortably inside devnet windows, so each window is polled many times.
+- **Keep the container running** — the reveal happens passes after the commit, so a host that is down across the reveal window misses it even though the commit landed.
+
+### Reading the convergence outcome
+
+After your reveal, the foundation ingests on-chain commits and reveals, verifies them against its own outputs, and publishes a per-round convergence report. The report seals once the latest validated ledger has closed past `reveal_closes_at` plus a grace period; before that it is live and still changing. Read it from the foundation scoring service, keyed on the on-chain round number (devnet base shown):
+
+```bash
+curl https://scoring-devnet.postfiat.org/api/scoring/rounds/<round_number>/convergence
+# or, for the latest announced round:
+curl https://scoring-devnet.postfiat.org/api/scoring/convergence/current
+```
+
+The response carries a `phase` (`live`, `sealed`, or `not_tracked`) and a `finalized` flag. A `sealed` response includes the immutable `report` with its `convergence_bundle_cid`, the on-chain `anchor_tx_hash`, and `sealed_at`. Find your validator in the report's `participants` array by your validator master key (`nH...`); your `outcome` is one of:
+
+- `valid` — your revealed hashes matched the foundation (or its hashes were not available to compare).
+- `divergent` — your reveal was accepted but one or more output levels (`RAW`, `PARSED`, `SELECTED_UNL`) differ; `comparison_levels_matched` and `divergence_stage` show where.
+- `missing_reveal` — your commit was accepted but no valid reveal was (for example a missed reveal window).
+- `late` / `commitment_mismatch` / `signature_invalid` — your commit fell outside the window, a reveal did not match your accepted commitment, or no commit carried a valid signature.
+
+These are the foundation's per-validator outcome labels and are distinct from the sidecar's local round states above. Each sealed report is also anchored on chain by a `pf_dynamic_unl_convergence_report_v1` memo from the foundation publisher account, carrying the `round_number` and `convergence_bundle_cid`, so you can resolve a round to its report by scanning that account.
+
 ## Configuration
 
 The setup above does not require editing any environment values. For the full list of variables, including advanced tunables you should normally leave at their defaults, see [`Configuration.md`](Configuration.md).
