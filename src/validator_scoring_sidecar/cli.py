@@ -434,7 +434,7 @@ def deploy_modal_command(args: argparse.Namespace) -> int:
             manifest,
             config,
             deployer=RealModalDeployer(),
-            app_name=args.app_name,
+            app_name=args.app_name or config.modal_app_name,
         ),
     )
 

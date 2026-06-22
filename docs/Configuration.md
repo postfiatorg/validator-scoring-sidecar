@@ -55,8 +55,18 @@ Participation scoring needs an inference runtime; configure exactly one of the t
 | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | Modal account credentials (secret). When set, the participate loop owns the runtime: it deploys the manifest-pinned Modal endpoint when none is recorded and redeploys when the foundation pins a new runtime, with no operator action. When unset, the loop never attempts a deployment. |
 | `POSTFIAT_SIDECAR_MODAL_KEY`, `POSTFIAT_SIDECAR_MODAL_SECRET` | Proxy-auth credentials for calling the deployed Modal endpoint (secret). |
 | `POSTFIAT_SIDECAR_LOCAL_ENDPOINT_URL` | For self-hosted local SGLang runtimes only: the endpoint as reachable **from inside the container**. The deployment record written by `start-sglang` points at `localhost`, which inside the container is not the host — use `http://host.docker.internal:8000/v1` for a runtime on the same host (the participation overlay maps that name to the host). |
+| `POSTFIAT_SIDECAR_MODAL_APP_NAME` | Optional Modal app name override (and, derived from it, the model-weights volume name). Defaults to `validator-scoring-sidecar-<network>`. Leave unset for a single validator; set a unique value per validator when several share one Modal account — see below. |
 
 Auto-provisioning is strictly a Modal behavior. A local-mode deployment record always takes precedence and is never replaced; if a local runtime no longer matches a round's manifest, the round is recorded as runtime-incompatible and the operator re-runs `start-sglang` on their GPU host — the sidecar does not manage hardware it does not own.
+
+### Running multiple validators on one Modal account
+
+Each sidecar instance is independent, but two values must be unique per validator when several run against shared infrastructure:
+
+- `POSTFIAT_SIDECAR_MODAL_APP_NAME` — set a distinct name per validator (for example `validator-scoring-sidecar-devnet-nurgle`). The app name defaults to `validator-scoring-sidecar-<network>`, so without this every instance would deploy and redeploy the *same* Modal app and compete over it when the foundation pins a new runtime. A distinct app name also gives each validator its own model-weights volume. The manual `deploy-modal --app-name` flag still overrides this when set.
+- `POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED` — each validator must use its own funded relay wallet. Sharing one relay wallet across instances makes concurrent commit/reveal submissions from the same account collide on transaction sequence.
+
+A single — or the first — validator can leave `POSTFIAT_SIDECAR_MODAL_APP_NAME` unset and keep the default.
 
 ### Key handling
 
