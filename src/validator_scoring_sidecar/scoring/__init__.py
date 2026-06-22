@@ -121,7 +121,7 @@ SUPPORTED_SELECTOR_CONTENT_HASHES: frozenset[str] = frozenset(
 )
 SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES: frozenset[str] = frozenset(
     {
-        "70e6fefc3460a95e6c0cb55dfd0c901dc26ba1b8a1aaeb50cc2829371fb89b07",
+        "5ce025098523557a2d02f828e00bfa1e82ddc6323cff5af3f9f8a4bc04c65049",
     }
 )
 
