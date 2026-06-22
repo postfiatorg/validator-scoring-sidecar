@@ -27,6 +27,8 @@ With no `--round-id` or `--manifest`, the command discovers the newest round tha
 
 A successful run deploys a Modal app named `validator-scoring-sidecar-<network>` (so a later deploy replaces it rather than creating a second one). The endpoint scales to zero when idle, so a deployed-but-unused app does not hold a GPU; the first request after idle incurs a cold start while the container and weights load.
 
+If you run the sidecar for more than one validator against the same Modal account, set `POSTFIAT_SIDECAR_MODAL_APP_NAME` to a distinct value per validator so they do not manage the same app — see [Running multiple validators on one Modal account](Configuration.md#running-multiple-validators-on-one-modal-account). The participate loop reads that value when it auto-deploys, and an unset value keeps the per-network default.
+
 ## Option 2: Local SGLang (self-hosted)
 
 Run the model on your own hardware instead of renting cloud GPUs. This path stays operator-managed: the sidecar never deploys, restarts, or replaces a local runtime — when a later round pins a different runtime, the sidecar reports the round as runtime-incompatible and you re-run the command below against the newer round.

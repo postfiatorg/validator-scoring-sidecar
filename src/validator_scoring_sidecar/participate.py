@@ -168,7 +168,10 @@ def modal_runtime_provisioner(
 
     def provision(manifest: dict[str, Any]) -> dict[str, Any]:
         record = deploy_modal_endpoint(
-            manifest, config, deployer=deployer_factory()
+            manifest,
+            config,
+            deployer=deployer_factory(),
+            app_name=config.modal_app_name,
         )
         return record.as_dict()
 

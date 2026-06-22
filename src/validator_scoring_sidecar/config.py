@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,11 @@ ENV_FOUNDATION_PUBLISHER_ADDRESS = "POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRES
 ENV_CHAIN_POLL_INTERVAL_SECONDS = "POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS"
 ENV_VALIDATOR_WALLET_SEED = "POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED"
 ENV_VALIDATOR_KEYS_PATH = "POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH"
+ENV_MODAL_APP_NAME = "POSTFIAT_SIDECAR_MODAL_APP_NAME"
+
+# Mirror Modal's own app-name charset so a malformed value fails here, at config
+# load, rather than deep in a Modal deploy the participate loop cannot recover.
+_MODAL_APP_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class ConfigError(ValueError):
@@ -51,6 +57,7 @@ class SidecarConfig:
     chain_poll_interval_seconds: float
     validator_wallet_seed: str | None
     validator_keys_path: str | None
+    modal_app_name: str | None
 
 
 def load_config(
@@ -125,6 +132,10 @@ def load_config(
         cli_value=None,
         env_value=env.get(ENV_VALIDATOR_KEYS_PATH),
     )
+    resolved_modal_app_name = _resolve_optional(
+        cli_value=None,
+        env_value=env.get(ENV_MODAL_APP_NAME),
+    )
 
     return SidecarConfig(
         scoring_base_url=_normalize_base_url(resolved_base_url),
@@ -147,6 +158,11 @@ def load_config(
         chain_poll_interval_seconds=_parse_chain_poll_interval(resolved_poll_interval),
         validator_wallet_seed=resolved_wallet_seed,
         validator_keys_path=resolved_validator_keys_path,
+        modal_app_name=(
+            _validate_modal_app_name(resolved_modal_app_name)
+            if resolved_modal_app_name is not None
+            else None
+        ),
     )
 
 
@@ -250,6 +266,15 @@ def _require_non_empty(name: str, value: str) -> str:
     stripped = value.strip()
     if not stripped:
         raise ConfigError(f"{name} must not be empty")
+    return stripped
+
+
+def _validate_modal_app_name(value: str) -> str:
+    stripped = _require_non_empty("modal_app_name", value)
+    if not _MODAL_APP_NAME_RE.fullmatch(stripped):
+        raise ConfigError(
+            "modal_app_name may contain only letters, numbers, '.', '_', and '-'"
+        )
     return stripped
 
 

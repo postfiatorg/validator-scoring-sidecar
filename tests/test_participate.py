@@ -430,6 +430,27 @@ def test_modal_runtime_provisioner_deploys_and_records(tmp_path):
     assert deployment_record_path(config).is_file()
 
 
+def test_modal_runtime_provisioner_uses_configured_app_name(tmp_path):
+    config = load_config(
+        network=NETWORK,
+        data_dir=tmp_path,
+        environ={"POSTFIAT_SIDECAR_MODAL_APP_NAME": "sidecar-devnet-nurgle"},
+    )
+    deployed = {}
+
+    class FakeDeployer:
+        def deploy(self, spec, *, app_name):
+            deployed["app_name"] = app_name
+            return ModalDeploymentResult(endpoint_url="https://operator--app.modal.run")
+
+    provision = modal_runtime_provisioner(
+        config, environ=MODAL_CREDS, deployer_factory=FakeDeployer
+    )
+    provision(_runtime_manifest())
+
+    assert deployed["app_name"] == "sidecar-devnet-nurgle"
+
+
 def test_participate_forwards_runtime_provisioner(tmp_path):
     captured = {}
 
