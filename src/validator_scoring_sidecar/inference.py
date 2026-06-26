@@ -35,6 +35,7 @@ from validator_scoring_sidecar.failure import Failure, FailureCategory
 
 ENV_MODAL_KEY = "POSTFIAT_SIDECAR_MODAL_KEY"
 ENV_MODAL_SECRET = "POSTFIAT_SIDECAR_MODAL_SECRET"
+ENV_LOCAL_ENDPOINT_URL = "POSTFIAT_SIDECAR_LOCAL_ENDPOINT_URL"
 MODEL_REQUEST_RELATIVE_PATH = "inputs/model_request.json"
 BACKEND_MODE_MODAL = "modal"
 BACKEND_MODE_LOCAL = "local"
@@ -145,7 +146,13 @@ class _ChatCompletionsBackend:
     ):
         self._url = _chat_completions_url(endpoint_url)
         self._headers = dict(headers or {})
-        self._http = http_client or httpx.Client(timeout=timeout_seconds)
+        # Modal answers requests that run past ~150s (cold starts, long
+        # inference) with a 303 redirect chain to a result-polling URL; the
+        # foundation's OpenAI-SDK client follows it by default and this client
+        # must match, or every cold-start round fails with INFERENCE_ERROR 303.
+        self._http = http_client or httpx.Client(
+            timeout=timeout_seconds, follow_redirects=True
+        )
         self._owns_client = http_client is None
 
     def close(self) -> None:
@@ -260,6 +267,32 @@ class LocalSglangBackend(_ChatCompletionsBackend):
         super().__init__(
             endpoint_url,
             headers=None,
+            timeout_seconds=timeout_seconds,
+            http_client=http_client,
+        )
+
+    @classmethod
+    def from_environment(
+        cls,
+        endpoint_url: str,
+        *,
+        timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+        http_client: httpx.Client | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> "LocalSglangBackend":
+        """Build a backend, letting the environment override the endpoint.
+
+        The deployment record points at the endpoint as seen from the host that
+        started it (typically ``localhost``), which is not reachable from inside
+        the sidecar container. ``POSTFIAT_SIDECAR_LOCAL_ENDPOINT_URL`` lets the
+        containerized loop reach the same server (e.g. via
+        ``http://host.docker.internal:8000/v1``) without touching the record.
+        """
+
+        env = os.environ if environ is None else environ
+        override = (env.get(ENV_LOCAL_ENDPOINT_URL) or "").strip()
+        return cls(
+            override or endpoint_url,
             timeout_seconds=timeout_seconds,
             http_client=http_client,
         )

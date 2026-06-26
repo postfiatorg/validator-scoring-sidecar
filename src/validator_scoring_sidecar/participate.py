@@ -7,6 +7,12 @@ submit the validator's commit inside the commit window and its reveal inside the
 reveal window. Round discovery and scoring stay API-driven; the announcement
 supplies only the windows and the ledger-anchored trust signal.
 
+For Modal-backed operators the pass also owns the inference runtime: with Modal
+account credentials configured, a missing or manifest-stale Modal deployment is
+redeployed from the round's pinned manifest before scoring, so foundation
+runtime upgrades do not stall unattended operation. A local-mode runtime is
+never touched — the sidecar does not manage hardware it does not own.
+
 Participation is all-or-nothing: it refuses to start unless a funded operator
 relay wallet, validator-keys signing access, a reachable PFTL RPC, and a
 discoverable foundation publisher address are all present — so it never spends on
@@ -28,7 +34,8 @@ is the operator's scheduler invoking this pass at the chain-poll cadence.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,7 +60,15 @@ from validator_scoring_sidecar.config import (
     ENV_VALIDATOR_WALLET_SEED,
     SidecarConfig,
 )
-from validator_scoring_sidecar.deployment import NoEligibleRoundError
+from validator_scoring_sidecar.deployment import (
+    NoEligibleRoundError,
+    deploy_modal_endpoint,
+)
+from validator_scoring_sidecar.modal_deployer import (
+    ENV_MODAL_TOKEN_ID,
+    ENV_MODAL_TOKEN_SECRET,
+    RealModalDeployer,
+)
 from validator_scoring_sidecar.input_package import (
     SOURCE_AUTO,
     PackageSource,
@@ -61,7 +76,7 @@ from validator_scoring_sidecar.input_package import (
 )
 from validator_scoring_sidecar.reveal import RevealError, submit_reveal
 from validator_scoring_sidecar.round_metadata import RoundMetadata
-from validator_scoring_sidecar.score import score_round
+from validator_scoring_sidecar.score import RuntimeProvisioner, score_round
 from validator_scoring_sidecar.scoring_client import ScoringClient, ScoringClientError
 from validator_scoring_sidecar.state import (
     SCORED_OR_FURTHER_STATES,
@@ -132,6 +147,37 @@ def require_participation_config(config: SidecarConfig) -> tuple[str, str]:
     return wallet_seed, keys_path
 
 
+def modal_runtime_provisioner(
+    config: SidecarConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+    deployer_factory: Callable[[], Any] = RealModalDeployer,
+) -> RuntimeProvisioner | None:
+    """Build the Modal auto-provisioner, or ``None`` without Modal credentials.
+
+    This is the participation half of the auto-provisioning gate: absent the
+    Modal account tokens the loop never attempts a deployment, so local-runtime
+    operators and unconfigured setups keep today's behavior exactly. The score
+    path enforces the other half — a local-mode deployment record is never
+    replaced regardless of credentials.
+    """
+
+    env = os.environ if environ is None else environ
+    if not (env.get(ENV_MODAL_TOKEN_ID) and env.get(ENV_MODAL_TOKEN_SECRET)):
+        return None
+
+    def provision(manifest: dict[str, Any]) -> dict[str, Any]:
+        record = deploy_modal_endpoint(
+            manifest,
+            config,
+            deployer=deployer_factory(),
+            app_name=config.modal_app_name,
+        )
+        return record.as_dict()
+
+    return provision
+
+
 def participate(
     config: SidecarConfig,
     client: ScoringClient,
@@ -145,6 +191,7 @@ def participate(
         ..., VerifiedAnnouncement | None
     ] = decode_and_verify_announcement,
     package_fetcher=fetch_input_package,
+    runtime_provisioner: RuntimeProvisioner | None = None,
 ) -> ParticipateResult:
     """Run one unattended participation pass for the latest eligible round."""
 
@@ -152,8 +199,19 @@ def participate(
     publisher = _resolve_publisher(config, client)
     _probe_rpc(config, rpc_client)
 
+    provisioner = (
+        runtime_provisioner
+        if runtime_provisioner is not None
+        else modal_runtime_provisioner(config)
+    )
     try:
-        score = score_runner(config, client, source=source, round_limit=round_limit)
+        score = score_runner(
+            config,
+            client,
+            source=source,
+            round_limit=round_limit,
+            runtime_provisioner=provisioner,
+        )
         score_status = score.status
         active_round_id: int | None = score.round_id
         active_round_number = score.round_number

@@ -204,3 +204,23 @@ def test_validator_keys_path_read_from_env():
         environ={"POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH": "/keys/validator-keys.json"}
     )
     assert config.validator_keys_path == "/keys/validator-keys.json"
+
+
+def test_modal_app_name_defaults_none_and_reads_env():
+    assert load_config(environ={}).modal_app_name is None
+    config = load_config(
+        environ={
+            "POSTFIAT_SIDECAR_MODAL_APP_NAME": "validator-scoring-sidecar-devnet-nurgle"
+        }
+    )
+    assert config.modal_app_name == "validator-scoring-sidecar-devnet-nurgle"
+
+
+def test_modal_app_name_rejects_invalid_value():
+    with pytest.raises(ConfigError, match="modal_app_name"):
+        load_config(environ={"POSTFIAT_SIDECAR_MODAL_APP_NAME": "bad name!"})
+
+
+def test_modal_app_name_blank_treated_as_unset():
+    config = load_config(environ={"POSTFIAT_SIDECAR_MODAL_APP_NAME": "   "})
+    assert config.modal_app_name is None

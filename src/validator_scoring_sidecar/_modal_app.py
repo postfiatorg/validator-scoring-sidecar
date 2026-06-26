@@ -27,18 +27,35 @@ STARTUP_TIMEOUT = 35 * MINUTES
 
 # These SIDECAR_MODAL_* variables are set by RealModalDeployer (modal_deployer.py)
 # on the `modal deploy` subprocess that runs this file. Operators never set them.
-APP_NAME = os.environ["SIDECAR_MODAL_APP_NAME"]
-IMAGE_REF = os.environ["SIDECAR_MODAL_IMAGE"]
-GPU_TYPE = os.environ["SIDECAR_MODAL_GPU"]
-LAUNCH_COMMAND = json.loads(os.environ["SIDECAR_MODAL_LAUNCH_COMMAND"])
-LAUNCH_ARGS = json.loads(os.environ["SIDECAR_MODAL_LAUNCH_ARGS"])
-MANIFEST_ENVIRONMENT = json.loads(os.environ["SIDECAR_MODAL_ENVIRONMENT"])
-MODEL_REPO_ID = os.environ["SIDECAR_MODAL_MODEL_REPO_ID"]
-MODEL_REVISION = os.environ["SIDECAR_MODAL_MODEL_REVISION"]
+# Modal re-imports this module inside the served container, where the deployer's
+# environment does not exist — so the same values are baked into the image env
+# below, and the in-container import reads back exactly what was deployed.
+_DEPLOY_CONFIG = {
+    name: os.environ[name]
+    for name in (
+        "SIDECAR_MODAL_APP_NAME",
+        "SIDECAR_MODAL_IMAGE",
+        "SIDECAR_MODAL_GPU",
+        "SIDECAR_MODAL_LAUNCH_COMMAND",
+        "SIDECAR_MODAL_LAUNCH_ARGS",
+        "SIDECAR_MODAL_ENVIRONMENT",
+        "SIDECAR_MODAL_MODEL_REPO_ID",
+        "SIDECAR_MODAL_MODEL_REVISION",
+    )
+}
+APP_NAME = _DEPLOY_CONFIG["SIDECAR_MODAL_APP_NAME"]
+IMAGE_REF = _DEPLOY_CONFIG["SIDECAR_MODAL_IMAGE"]
+GPU_TYPE = _DEPLOY_CONFIG["SIDECAR_MODAL_GPU"]
+LAUNCH_COMMAND = json.loads(_DEPLOY_CONFIG["SIDECAR_MODAL_LAUNCH_COMMAND"])
+LAUNCH_ARGS = json.loads(_DEPLOY_CONFIG["SIDECAR_MODAL_LAUNCH_ARGS"])
+MANIFEST_ENVIRONMENT = json.loads(_DEPLOY_CONFIG["SIDECAR_MODAL_ENVIRONMENT"])
+MODEL_REPO_ID = _DEPLOY_CONFIG["SIDECAR_MODAL_MODEL_REPO_ID"]
+MODEL_REVISION = _DEPLOY_CONFIG["SIDECAR_MODAL_MODEL_REVISION"]
 MODEL_VOLUME_NAME = os.environ.get(
     "SIDECAR_MODAL_MODEL_VOLUME",
     f"{APP_NAME}-model-weights",
 )
+_DEPLOY_CONFIG["SIDECAR_MODAL_MODEL_VOLUME"] = MODEL_VOLUME_NAME
 
 # The manifest environment is reproduced verbatim; HF cache locations are added
 # so weight downloads persist in the Modal volume across cold starts.
@@ -54,7 +71,7 @@ sglang_image = (
     modal.Image.from_registry(IMAGE_REF)
     .entrypoint([])
     .pip_install("huggingface_hub", "hf_xet")
-    .env(RUNTIME_ENV)
+    .env({**RUNTIME_ENV, **_DEPLOY_CONFIG})
 )
 
 model_volume = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
