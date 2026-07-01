@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from validator_scoring_sidecar.chain import (
@@ -82,12 +83,17 @@ from validator_scoring_sidecar.input_package import (
 from validator_scoring_sidecar.reveal import RevealError, submit_reveal
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.score import (
+    FOUNDATION_VERIFICATION_HASHES_PATH,
     RuntimeProvisioner,
     provision_runtime_if_needed,
     score_round,
 )
 from validator_scoring_sidecar.scoring import commit_reveal
-from validator_scoring_sidecar.scoring_client import ScoringClient, ScoringClientError
+from validator_scoring_sidecar.scoring_client import (
+    ScoringClient,
+    ScoringClientError,
+    ScoringHTTPError,
+)
 from validator_scoring_sidecar.state import (
     SCORED_OR_FURTHER_STATES,
     RoundStateRecord,
@@ -131,6 +137,7 @@ class ParticipateResult:
     commits: list[dict[str, Any]]
     reveals: list[dict[str, Any]]
     announcements: list[dict[str, Any]]
+    protocol_violations: list[dict[str, Any]]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -141,6 +148,7 @@ class ParticipateResult:
             "commits": list(self.commits),
             "reveals": list(self.reveals),
             "announcements": list(self.announcements),
+            "protocol_violations": list(self.protocol_violations),
         }
 
 
@@ -326,6 +334,12 @@ def participate(
             package_fetcher=package_fetcher,
             round_limit=round_limit,
         )
+        protocol_violations = _probe_output_withholding(
+            config,
+            client,
+            state,
+            rpc_client=rpc_client,
+        )
         commits = _advance_commits(
             config,
             state,
@@ -342,6 +356,7 @@ def participate(
         commits=commits,
         reveals=reveals,
         announcements=announcements,
+        protocol_violations=protocol_violations,
     )
 
 
@@ -471,6 +486,78 @@ def _advance_commits(
                 "tx_hash": commit.commit_tx_hash,
             }
         )
+    return results
+
+
+def _parse_iso_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _probe_output_withholding(
+    config: SidecarConfig,
+    client: ScoringClient,
+    state: SidecarState,
+    *,
+    rpc_client: PftlRpcClient,
+) -> list[dict[str, Any]]:
+    """Report early public availability of foundation output hashes."""
+
+    try:
+        now = rpc_client.latest_validated_ledger_close_time()
+    except PftlRpcError as exc:
+        return [{"status": ADVANCE_STATUS_ERROR, "error": str(exc)}]
+
+    results: list[dict[str, Any]] = []
+    for record in state.get_rounds_pending_commit(config.network):
+        if not (record.commit_opens_at and record.commit_closes_at):
+            continue
+        try:
+            opens = _parse_iso_time(record.commit_opens_at)
+            closes = _parse_iso_time(record.commit_closes_at)
+        except ValueError as exc:
+            results.append(
+                {
+                    "round_number": record.round_number,
+                    "status": ADVANCE_STATUS_ERROR,
+                    "error": str(exc),
+                }
+            )
+            continue
+        if not (opens <= now < closes):
+            continue
+        try:
+            payload = client.fetch_final_bundle_file(
+                record.round_number,
+                FOUNDATION_VERIFICATION_HASHES_PATH,
+            )
+        except ScoringHTTPError as exc:
+            if exc.status_code == 404:
+                continue
+            results.append(
+                {
+                    "round_number": record.round_number,
+                    "status": ADVANCE_STATUS_ERROR,
+                    "error": str(exc),
+                }
+            )
+            continue
+        except ScoringClientError as exc:
+            results.append(
+                {
+                    "round_number": record.round_number,
+                    "status": ADVANCE_STATUS_ERROR,
+                    "error": str(exc),
+                }
+            )
+            continue
+        if isinstance(payload, dict):
+            results.append(
+                {
+                    "round_number": record.round_number,
+                    "status": "protocol_violation",
+                    "path": FOUNDATION_VERIFICATION_HASHES_PATH,
+                }
+            )
     return results
 
 
