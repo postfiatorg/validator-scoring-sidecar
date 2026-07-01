@@ -26,6 +26,7 @@ from validator_scoring_sidecar.participate import (
 )
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.score import ScoreResult
+from validator_scoring_sidecar.scoring_client import ScoringHTTPError
 from validator_scoring_sidecar.scoring import (
     SUPPORTED_PARSER_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
@@ -113,6 +114,14 @@ class FakeClient:
             "announcement_reveal_window_seconds": 1800,
             "announcement_reveal_gap_seconds": 0,
         }
+
+    def fetch_final_bundle_file(self, round_number, file_path):
+        raise ScoringHTTPError(404, f"https://foundation.test/rounds/{round_number}/{file_path}")
+
+
+class LeakyFakeClient(FakeClient):
+    def fetch_final_bundle_file(self, round_number, file_path):
+        return {"model_response_hash": "1" * 64}
 
 
 def _announcement():
@@ -231,6 +240,28 @@ def test_participate_commits_in_commit_window(tmp_path):
     assert rpc.submitted[0]["memo_type"] == commit_reveal.VALIDATOR_COMMIT_TYPE
     # The reveal window has not opened, so no reveal is broadcast.
     assert all(entry["status"] != "revealed" for entry in result.reveals)
+    assert result.protocol_violations == []
+
+
+def test_participate_reports_mid_window_output_hash_leak(tmp_path):
+    _seed_scored(tmp_path)
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    result = participate(
+        _config(tmp_path),
+        LeakyFakeClient(),
+        rpc_client=rpc,
+        signer=FakeSigner(),
+        score_runner=fake_score_runner,
+        announcement_decoder=fake_decoder,
+    )
+
+    assert result.protocol_violations == [
+        {
+            "round_number": ROUND_NUMBER,
+            "status": "protocol_violation",
+            "path": "outputs/verification_hashes.json",
+        }
+    ]
 
 
 def test_participate_reveals_in_reveal_window(tmp_path):
