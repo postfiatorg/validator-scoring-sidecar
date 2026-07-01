@@ -263,9 +263,10 @@ class XrplPftlRpcClient:
         from xrpl.models.transactions import Memo, Payment
         from xrpl.transaction import submit_and_wait
         from xrpl.utils import str_to_hex
-        from xrpl.wallet import Wallet
 
-        wallet = Wallet.from_seed(wallet_seed)
+        from validator_scoring_sidecar.wallet import relay_wallet_from_secret
+
+        wallet = relay_wallet_from_secret(wallet_seed)
         payment = Payment(
             account=wallet.classic_address,
             destination=destination,
