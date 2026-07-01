@@ -9,7 +9,12 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
 
-from validator_scoring_sidecar.chain import ChainWatcherError, XrplPftlRpcClient
+from validator_scoring_sidecar.chain import (
+    ChainWatcherError,
+    FoundationConfig,
+    XrplPftlRpcClient,
+    resolve_foundation_publisher_address,
+)
 from validator_scoring_sidecar.commit import ValidatorKeysSigner
 from validator_scoring_sidecar.config import ConfigError, load_config
 from validator_scoring_sidecar.deployment import (
@@ -43,7 +48,20 @@ from validator_scoring_sidecar.scoring_client import (
     ScoringClientError,
 )
 from validator_scoring_sidecar.state import SidecarStateError
-from validator_scoring_sidecar.score import ScoreResult, score_round
+from validator_scoring_sidecar.score import (
+    SCORE_STATUS_ALREADY_SCORED,
+    SCORE_STATUS_COMPARISON_PENDING,
+    SCORE_STATUS_DIVERGENT,
+    SCORE_STATUS_SCORED,
+    SCORE_STATUS_SKIPPED,
+    ScoreResult,
+    score_round,
+)
+from validator_scoring_sidecar.preflight import (
+    CHECK_REPRODUCTION,
+    CheckResult,
+    run_preflight,
+)
 from validator_scoring_sidecar.participate import (
     ParticipateResult,
     ParticipationConfigError,
@@ -307,6 +325,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_json_argument(participate_parser)
     participate_parser.set_defaults(handler=participate_command)
+
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help=(
+            "Confirm a participation deployment is ready to commit and reveal and "
+            "print a single READY / NOT READY verdict."
+        ),
+    )
+    preflight_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Skip the round reproduction (the GPU step) and run config checks only.",
+    )
+    preflight_parser.add_argument(
+        "--source",
+        choices=PACKAGE_SOURCE_CHOICES,
+        default="auto",
+        help="Package retrieval source for the reproduction fetch. Defaults to auto.",
+    )
+    preflight_parser.add_argument(
+        "--round-limit",
+        type=_round_limit,
+        default=DEFAULT_SYNC_ROUND_LIMIT,
+        help=(
+            "Recent rounds to scan for the latest round to reproduce. Defaults to "
+            f"{DEFAULT_SYNC_ROUND_LIMIT}."
+        ),
+    )
+    _add_common_config_arguments(preflight_parser)
+    preflight_parser.add_argument(
+        "--pftl-rpc-url",
+        help="PFTL JSON-RPC URL. Overrides POSTFIAT_SIDECAR_PFTL_RPC_URL.",
+    )
+    preflight_parser.add_argument(
+        "--foundation-publisher-address",
+        help=(
+            "Foundation publisher r-address. Overrides "
+            "POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS and config discovery."
+        ),
+    )
+    _add_json_argument(preflight_parser)
+    preflight_parser.set_defaults(handler=preflight_command)
     return parser
 
 
@@ -728,6 +788,108 @@ def participate_command(args: argparse.Namespace) -> int:
         print(_format_participate_result(result))
 
     return EXIT_OK
+
+
+def preflight_command(args: argparse.Namespace) -> int:
+    config = load_config(
+        base_url=args.base_url,
+        data_dir=args.data_dir,
+        ipfs_gateway_url=args.ipfs_gateway_url,
+        network=args.network,
+        timeout_seconds=args.timeout,
+        pftl_rpc_url=args.pftl_rpc_url,
+        foundation_publisher_address=args.foundation_publisher_address,
+    )
+    client = ScoringClient(config)
+    rpc_client = XrplPftlRpcClient(config.pftl_rpc_url)
+
+    def resolve_publisher() -> str:
+        foundation_config = None
+        if not config.foundation_publisher_address:
+            foundation_config = FoundationConfig.from_api_payload(client.fetch_config())
+        return resolve_foundation_publisher_address(config, foundation_config)
+
+    run_reproduction: Callable[[], CheckResult] | None = None
+    if not args.quick:
+
+        def run_reproduction() -> CheckResult:
+            try:
+                result = score_round(
+                    config,
+                    client,
+                    round_id=None,
+                    source=args.source,
+                    round_limit=args.round_limit,
+                )
+            except Exception as exc:  # noqa: BLE001 - any failure is a failed check
+                return CheckResult(
+                    CHECK_REPRODUCTION, False, f"reproduction failed: {exc}"
+                )
+            return _reproduction_result_to_check(result)
+
+    try:
+        report = run_preflight(
+            config,
+            rpc_client=rpc_client,
+            resolve_publisher=resolve_publisher,
+            run_reproduction=run_reproduction,
+        )
+    finally:
+        client.close()
+
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(report.render())
+    return EXIT_OK if report.ready else EXIT_OPERATOR_ERROR
+
+
+def _reproduction_result_to_check(result: ScoreResult) -> CheckResult:
+    """Map a reproduction ``ScoreResult`` to a readiness check.
+
+    Reproduction proves the operator's own runtime can score a round. A genuine
+    divergence or a scoring failure is the only real problem; a not-yet-published
+    foundation comparison (the round is still in its commit/reveal window) and a
+    non-scorable latest round (an override/skipped round) are expected states
+    that must not read as NOT READY. Note that an ``already_scored`` round is
+    served from cached state and does not re-exercise the backend this run.
+    """
+    round_number = result.round_number
+    if result.status == SCORE_STATUS_DIVERGENT:
+        return CheckResult(
+            CHECK_REPRODUCTION,
+            False,
+            f"round {round_number} reproduced but diverged from the foundation",
+        )
+    if (
+        result.status in (SCORE_STATUS_SCORED, SCORE_STATUS_ALREADY_SCORED)
+        and result.matched_levels
+    ):
+        return CheckResult(
+            CHECK_REPRODUCTION,
+            True,
+            f"round {round_number} reproduced; matched "
+            f"{', '.join(result.matched_levels)}",
+        )
+    if result.status == SCORE_STATUS_COMPARISON_PENDING:
+        return CheckResult(
+            CHECK_REPRODUCTION,
+            True,
+            f"round {round_number} reproduced on your runtime; foundation "
+            "comparison not yet available (round still in progress)",
+        )
+    if result.status == SCORE_STATUS_SKIPPED:
+        return CheckResult(
+            CHECK_REPRODUCTION,
+            True,
+            f"round {round_number} was not scorable (override/skipped); inference "
+            "will be exercised on the next normal round",
+        )
+    return CheckResult(
+        CHECK_REPRODUCTION,
+        False,
+        f"round {round_number} reproduction did not succeed (status {result.status})",
+    )
 
 
 def _format_participate_result(result: ParticipateResult) -> str:

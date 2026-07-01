@@ -143,7 +143,7 @@ frozen inputs. Actually checking the foundation's *scoring* — and voting — n
 Set `POSTFIAT_SIDECAR_MODE=participate`. It **refuses to start** — changing nothing
 on-chain — unless all of these are present:
 
-- a **funded operator relay wallet seed** (`POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED`);
+- a **funded operator relay wallet seed or 24-word recovery phrase** (`POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED`);
 - **validator-keys access** (`POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH`, read-only);
 - a **reachable PFTL RPC** (probed at startup);
 - a **discoverable foundation publisher address** (set it, or read from the

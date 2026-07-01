@@ -406,3 +406,54 @@ def test_is_pruned_ledger_detects_lgr_idx_malformed():
     assert _is_pruned_ledger({"error_code": 58}) is True
     assert _is_pruned_ledger({"error": "actNotFound"}) is False
     assert _is_pruned_ledger("not a dict") is False
+
+
+class _FakeBalanceResponse:
+    def __init__(self, result, successful=True):
+        self.result = result
+        self._successful = successful
+
+    def is_successful(self):
+        return self._successful
+
+
+class _FakeBalanceClient:
+    def __init__(self, response):
+        self._response = response
+
+    def request(self, request):
+        return self._response
+
+
+def _balance_client(result, successful=True):
+    from validator_scoring_sidecar.chain import XrplPftlRpcClient
+
+    rpc = XrplPftlRpcClient("https://rpc.example.org")
+    rpc._client = _FakeBalanceClient(_FakeBalanceResponse(result, successful))
+    return rpc
+
+
+def test_account_balance_drops_returns_int_on_success():
+    rpc = _balance_client({"account_data": {"Balance": "7000000"}})
+    assert rpc.account_balance_drops("rAcc") == 7000000
+
+
+def test_account_balance_drops_none_when_account_not_found():
+    rpc = _balance_client({"error": "actNotFound"}, successful=False)
+    assert rpc.account_balance_drops("rAcc") is None
+
+
+def test_account_balance_drops_raises_on_other_rpc_error():
+    from validator_scoring_sidecar.chain import PftlRpcError
+
+    rpc = _balance_client({"error": "someOtherError"}, successful=False)
+    with pytest.raises(PftlRpcError):
+        rpc.account_balance_drops("rAcc")
+
+
+def test_account_balance_drops_raises_when_balance_missing():
+    from validator_scoring_sidecar.chain import PftlRpcError
+
+    rpc = _balance_client({"account_data": {}})
+    with pytest.raises(PftlRpcError):
+        rpc.account_balance_drops("rAcc")

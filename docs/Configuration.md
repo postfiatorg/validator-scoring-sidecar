@@ -38,7 +38,7 @@ Verify-only sync needs none of these. To run the on-chain commit-reveal loop, de
 | Variable | Description |
 |---|---|
 | `POSTFIAT_SIDECAR_MODE` | Set to `participate` to run the commit-reveal loop instead of `sync`. |
-| `POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED` | Seed of the funded operator relay `r...` wallet that pays for and sends the commit/reveal transactions. Secret: read from the runtime environment only, never accepted as a CLI flag, logged, or baked into an image layer. |
+| `POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED` | Secret for the funded operator relay `r...` wallet that pays for and sends the commit/reveal transactions — either an XRPL `s...` family seed or the 24-word BIP39 recovery phrase Task Node issues (paste it as-is). Secret: read from the runtime environment only, never accepted as a CLI flag, logged, or baked into an image layer. |
 | `POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE` | Host path of your `validator-keys.json`; the overlay mounts it read-only into the container. |
 | `POSTFIAT_SIDECAR_PFTL_RPC_URL` | PFTL JSON-RPC endpoint for chain reads and memo submission. Defaults to `https://rpc.<network>.postfiat.org`. |
 | `POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS` | Optional override of the foundation publisher account; auto-discovered from the scoring service config when unset. |
