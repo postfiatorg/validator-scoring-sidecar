@@ -128,6 +128,8 @@ class PftlRpcClient(Protocol):
 
     def latest_validated_ledger_close_time(self) -> datetime: ...
 
+    def account_balance_drops(self, address: str) -> int | None: ...
+
     def submit_memo(
         self,
         *,
@@ -251,6 +253,34 @@ class XrplPftlRpcClient:
         except (KeyError, TypeError) as exc:
             raise PftlRpcError("PFTL ledger response has no close_time") from exc
         return ripple_time_to_datetime(int(close_time))
+
+    def account_balance_drops(self, address: str) -> int | None:
+        """Validated balance of an account in drops, or ``None`` when the account
+        does not exist on the ledger yet (never funded). Raises ``PftlRpcError``
+        on transport or other RPC failures so a reachability problem is distinct
+        from an unfunded account."""
+        from xrpl.models.requests import AccountInfo
+
+        try:
+            response = self._ensure_client().request(
+                AccountInfo(account=address, ledger_index="validated")
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any transport failure uniformly
+            raise PftlRpcError(
+                f"PFTL account_info request failed for {address}: {exc}"
+            ) from exc
+        if not response.is_successful():
+            if response.result.get("error") == "actNotFound":
+                return None
+            raise PftlRpcError(
+                f"PFTL account_info returned an error for {address}: {response.result}"
+            )
+        try:
+            return int(response.result["account_data"]["Balance"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PftlRpcError(
+                f"PFTL account_info response has no Balance for {address}"
+            ) from exc
 
     def submit_memo(
         self,
