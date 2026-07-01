@@ -283,6 +283,33 @@ class SidecarState:
         )
         return [RoundStateRecord.from_row(row) for row in rows]
 
+    def get_rounds_pending_commit(self, network: str) -> list[RoundStateRecord]:
+        """Return scored rounds with a known commit window that have not yet
+        committed, oldest first.
+
+        Mirrors ``get_rounds_pending_reveal``: the commit is driven from local
+        state, not from a one-time chain-cursor pass, so a round scored on a
+        later pass than its announcement still commits while its window is open.
+        Only rounds carrying all three output fingerprints and the announced
+        commit window are returned, so the caller can always build a commitment.
+        """
+
+        rows = self._execute_all(
+            f"""
+            SELECT {_ROUND_COLUMNS}
+            FROM sidecar_rounds
+            WHERE network = ? AND sidecar_state = ? AND commit_tx_hash IS NULL
+              AND commit_opens_at IS NOT NULL AND commit_closes_at IS NOT NULL
+              AND reveal_opens_at IS NOT NULL AND reveal_closes_at IS NOT NULL
+              AND model_response_hash IS NOT NULL
+              AND validator_scores_hash IS NOT NULL
+              AND selected_unl_hash IS NOT NULL
+            ORDER BY round_number ASC
+            """,
+            (network, STATE_SCORED),
+        )
+        return [RoundStateRecord.from_row(row) for row in rows]
+
     def is_input_package_verified(
         self,
         network: str,
@@ -509,6 +536,65 @@ class SidecarState:
                 outcome.commit_closes_at,
                 outcome.reveal_opens_at,
                 outcome.reveal_closes_at,
+                now,
+                now,
+            ),
+        )
+
+    def record_announcement_windows(
+        self,
+        network: str,
+        metadata: RoundMetadata,
+        *,
+        commit_opens_at: str,
+        commit_closes_at: str,
+        reveal_opens_at: str,
+        reveal_closes_at: str,
+    ) -> None:
+        """Persist a round's announced commit/reveal windows.
+
+        Stored when the foundation's on-chain announcement is first decoded and
+        verified, so the state-driven commit can act on the round later
+        regardless of the chain cursor. Only the window columns are written, and
+        only until the round commits: an existing round's lifecycle state,
+        scoring outcome, and fetch columns are left untouched, and an
+        already-committed round's windows are left frozen because the reveal step
+        enforces its reveal window from them. A round not yet in the store is
+        inserted at ``DISCOVERED`` so its windows are not lost before it is
+        scored.
+        """
+
+        now = _utc_now()
+        self._execute_write(
+            """
+            INSERT INTO sidecar_rounds (
+                network, round_id, round_number, scoring_status, sidecar_state,
+                input_package_cid, input_package_hash, input_frozen_at,
+                commit_opens_at, commit_closes_at, reveal_opens_at,
+                reveal_closes_at, discovered_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(network, round_id) DO UPDATE SET
+                commit_opens_at = excluded.commit_opens_at,
+                commit_closes_at = excluded.commit_closes_at,
+                reveal_opens_at = excluded.reveal_opens_at,
+                reveal_closes_at = excluded.reveal_closes_at,
+                updated_at = excluded.updated_at
+            WHERE commit_tx_hash IS NULL
+            """,
+            (
+                network,
+                metadata.round_id,
+                metadata.round_number,
+                metadata.status,
+                STATE_DISCOVERED,
+                metadata.input_package_cid,
+                metadata.input_package_hash,
+                metadata.input_frozen_at,
+                commit_opens_at,
+                commit_closes_at,
+                reveal_opens_at,
+                reveal_closes_at,
                 now,
                 now,
             ),

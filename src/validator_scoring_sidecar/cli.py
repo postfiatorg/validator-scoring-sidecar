@@ -660,6 +660,7 @@ def _format_participate_result(result: ParticipateResult) -> str:
             f"Network: {result.network}",
             f"Round ID: {result.round_id}",
             f"Round number: {result.round_number}",
+            f"Announcements: {_format_advance(result.announcements)}",
             f"Commits: {_format_advance(result.commits)}",
             f"Reveals: {_format_advance(result.reveals)}",
         ]

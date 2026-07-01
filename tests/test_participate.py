@@ -5,7 +5,7 @@ import pytest
 from xrpl.core import keypairs
 from xrpl.core.addresscodec import encode_node_public_key
 
-from validator_scoring_sidecar.chain import VerifiedAnnouncement
+from validator_scoring_sidecar.chain import AnnouncementError, VerifiedAnnouncement
 from validator_scoring_sidecar.config import load_config
 from validator_scoring_sidecar.deployment import (
     ModalDeploymentResult,
@@ -25,6 +25,7 @@ from validator_scoring_sidecar.state import (
     STATE_COMMITTED,
     STATE_REVEALED,
     STATE_SCORED,
+    STATE_SCORING_FAILED,
     ScoreOutcome,
     SidecarState,
 )
@@ -279,27 +280,38 @@ def test_participate_reprocessed_announcement_is_idempotent(tmp_path):
     _seed_scored(tmp_path)
     signer = FakeSigner()
     _participate(tmp_path, signer, FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX]))
+    with SidecarState(tmp_path) as state:
+        first_commit = state.get_round(NETWORK, ROUND_ID).commit_tx_hash
 
-    # Simulate a crash after committing but before the cursor advanced: rewind the
-    # cursor so the announcement re-surfaces. The local commit state must stop a
-    # second submission.
+    # Rewind the cursor so the announcement re-surfaces. The round is already
+    # committed, so it is no longer pending commit and is not re-submitted.
     with SidecarState(tmp_path) as state:
         state.set_chain_cursor(NETWORK, PUBLISHER, 99, "OLDER")
 
     rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
-    result = _participate(tmp_path, signer, rpc)
+    _participate(tmp_path, signer, rpc)
 
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
     assert rpc.submitted == []
-    assert any(entry["status"] == "already_committed" for entry in result.commits)
+    assert record.sidecar_state == STATE_COMMITTED
+    assert record.commit_tx_hash == first_commit
 
 
-def test_participate_skips_announcement_for_unscored_round(tmp_path):
-    # No seeded score: the announced round is not yet scored, so no commit.
+def test_participate_records_windows_for_unscored_round(tmp_path):
+    # The announced round is not yet scored, so nothing commits — but its windows
+    # are persisted so a later pass can commit once it is scored.
     rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
     result = _participate(tmp_path, FakeSigner(), rpc)
 
     assert rpc.submitted == []
-    assert any(entry["status"] == "round_not_scored" for entry in result.commits)
+    assert all(entry["status"] != "committed" for entry in result.commits)
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+    assert record is not None
+    assert record.sidecar_state != STATE_COMMITTED
+    assert record.commit_opens_at is not None
+    assert record.commit_closes_at is not None
 
 
 def test_participate_reveals_when_no_eligible_round(tmp_path):
@@ -328,7 +340,7 @@ def test_participate_reveals_when_no_eligible_round(tmp_path):
     assert any(s["memo_type"] == commit_reveal.VALIDATOR_REVEAL_TYPE for s in rpc.submitted)
 
 
-def test_participate_holds_cursor_until_commit_window_opens(tmp_path):
+def test_participate_commits_when_window_opens_on_later_pass(tmp_path):
     _seed_scored(tmp_path)
     signer = FakeSigner()
     before_commit = datetime(2026, 5, 24, 23, 0, tzinfo=timezone.utc)
@@ -341,15 +353,130 @@ def test_participate_holds_cursor_until_commit_window_opens(tmp_path):
     with SidecarState(tmp_path) as state:
         assert state.get_round(NETWORK, ROUND_ID).sidecar_state == STATE_SCORED
 
-    # The announcement was not consumed, so a later pass with the window open
-    # commits it.
-    rpc2 = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    # The announcement's windows are recorded and the cursor advances past it, so
+    # it is no longer in the feed; the commit is replayed from local state once
+    # the window opens.
+    rpc2 = FakeRpc(close_time=COMMIT_TIME, transactions=[])
     _participate(tmp_path, signer, rpc2)
 
     with SidecarState(tmp_path) as state:
         record = state.get_round(NETWORK, ROUND_ID)
     assert record.sidecar_state == STATE_COMMITTED
     assert len(rpc2.submitted) == 1
+
+
+def _failing_score_runner(
+    config, client, *, source=None, round_limit=None, runtime_provisioner=None
+):
+    return ScoreResult(
+        status="scoring_failed",
+        network=NETWORK,
+        round_id=ROUND_ID,
+        round_number=ROUND_NUMBER,
+        sidecar_state=STATE_SCORING_FAILED,
+        backend_mode="modal",
+        compared=False,
+        matched_levels=[],
+        error_category="INFERENCE_ERROR",
+    )
+
+
+def test_participate_commits_after_transient_score_failure(tmp_path):
+    # The exact production bug: scoring fails transiently on the pass that first
+    # sees the announcement, then succeeds on a later pass. The round must still
+    # commit, even though the announcement has scrolled past the chain cursor.
+    signer = FakeSigner()
+
+    # Pass 1: scoring fails. The announcement's windows are recorded and the
+    # cursor advances past it; nothing commits because the round is not scored.
+    rpc1 = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    _participate(tmp_path, signer, rpc1, score_runner=_failing_score_runner)
+    assert rpc1.submitted == []
+    with SidecarState(tmp_path) as state:
+        recorded = state.get_round(NETWORK, ROUND_ID)
+    assert recorded is not None
+    assert recorded.commit_opens_at is not None  # windows persisted despite failure
+    assert recorded.sidecar_state != STATE_COMMITTED
+
+    # Scoring succeeds on a later pass.
+    _seed_scored(tmp_path)
+
+    # Pass 2: the announcement is no longer in the watcher feed, yet the commit
+    # still happens, driven from local state.
+    rpc2 = FakeRpc(close_time=COMMIT_TIME, transactions=[])
+    result = _participate(tmp_path, signer, rpc2)
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+    assert record.sidecar_state == STATE_COMMITTED
+    assert record.commit_tx_hash is not None
+    assert len(rpc2.submitted) == 1
+    assert any(entry["status"] == "committed" for entry in result.commits)
+
+
+def test_participate_does_not_commit_after_window_closes(tmp_path):
+    _seed_scored(tmp_path)
+    signer = FakeSigner()
+    # By the time the round is processed, the commit window has already closed.
+    rpc = FakeRpc(close_time=AFTER_REVEAL, transactions=[ANNOUNCEMENT_TX])
+    result = _participate(tmp_path, signer, rpc)
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+    assert record.sidecar_state == STATE_SCORED
+    assert record.commit_tx_hash is None
+    assert rpc.submitted == []
+    assert any(entry["status"] == "commit_window_closed" for entry in result.commits)
+
+
+def test_participate_commit_survives_restart(tmp_path):
+    # State persisted before a restart: the round is scored and its windows are
+    # recorded, but it has not committed yet. A fresh pass commits it from state,
+    # with no announcement in the feed.
+    _seed_scored(tmp_path)
+    with SidecarState(tmp_path) as state:
+        state.record_announcement_windows(
+            NETWORK,
+            _metadata(),
+            commit_opens_at="2026-05-25T00:00:00+00:00",
+            commit_closes_at="2026-05-25T00:30:00+00:00",
+            reveal_opens_at="2026-05-25T00:30:00+00:00",
+            reveal_closes_at="2026-05-25T01:00:00+00:00",
+        )
+
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[])
+    result = _participate(tmp_path, FakeSigner(), rpc)
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+    assert record.sidecar_state == STATE_COMMITTED
+    assert len(rpc.submitted) == 1
+    assert any(entry["status"] == "committed" for entry in result.commits)
+
+
+def test_participate_surfaces_announcement_error(tmp_path):
+    # A malformed announcement from the trusted sender is recorded and skipped
+    # (the cursor still advances), and the error is surfaced in the result rather
+    # than silently dropped.
+    def raising_decoder(
+        transaction, config, client, *, package_fetcher=None, round_limit=None
+    ):
+        raise AnnouncementError("malformed announcement")
+
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    result = participate(
+        _config(tmp_path),
+        FakeClient(),
+        rpc_client=rpc,
+        signer=FakeSigner(),
+        score_runner=fake_score_runner,
+        announcement_decoder=raising_decoder,
+    )
+
+    assert rpc.submitted == []
+    assert any(
+        entry["status"] == "announcement_error" for entry in result.announcements
+    )
 
 
 def test_participate_requires_wallet_seed(tmp_path):

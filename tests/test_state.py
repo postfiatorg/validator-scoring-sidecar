@@ -339,6 +339,142 @@ def test_record_commit_persists_commit_state_and_preserves_inputs(tmp_path):
     assert record.fetch_source == "https"
 
 
+def test_record_announcement_windows_inserts_and_preserves_existing(tmp_path):
+    metadata = _metadata()
+    with SidecarState(tmp_path) as state:
+        # A round not yet stored is inserted at DISCOVERED with the windows.
+        state.record_announcement_windows(
+            "testnet",
+            metadata,
+            commit_opens_at="2026-05-25T00:00:00+00:00",
+            commit_closes_at="2026-05-25T00:30:00+00:00",
+            reveal_opens_at="2026-05-25T00:30:00+00:00",
+            reveal_closes_at="2026-05-25T01:00:00+00:00",
+        )
+        fresh = state.get_round("testnet", metadata.round_id)
+        assert fresh.sidecar_state == STATE_DISCOVERED
+        assert fresh.commit_opens_at == "2026-05-25T00:00:00+00:00"
+        assert fresh.reveal_closes_at == "2026-05-25T01:00:00+00:00"
+
+        # Re-recording on a scored round updates only the windows; the lifecycle
+        # state and scoring outcome are preserved.
+        state.record_score(
+            "testnet",
+            metadata,
+            ScoreOutcome(
+                sidecar_state=STATE_SCORED,
+                backend_mode="modal",
+                model_response_hash="m" * 64,
+                validator_scores_hash="v" * 64,
+                selected_unl_hash="u" * 64,
+            ),
+        )
+        state.record_announcement_windows(
+            "testnet",
+            metadata,
+            commit_opens_at="2026-06-01T00:00:00+00:00",
+            commit_closes_at="2026-06-01T00:30:00+00:00",
+            reveal_opens_at="2026-06-01T00:30:00+00:00",
+            reveal_closes_at="2026-06-01T01:00:00+00:00",
+        )
+        updated = state.get_round("testnet", metadata.round_id)
+
+    assert updated.sidecar_state == STATE_SCORED
+    assert updated.model_response_hash == "m" * 64
+    assert updated.commit_opens_at == "2026-06-01T00:00:00+00:00"
+
+
+def test_record_announcement_windows_does_not_overwrite_committed(tmp_path):
+    metadata = _metadata()
+    with SidecarState(tmp_path) as state:
+        state.record_commit(
+            "testnet",
+            metadata,
+            CommitOutcome(
+                validator_master_key="nHValidatorKey",
+                salt="d" * 64,
+                commit_tx_hash="TX1",
+                commitment_hash="c" * 64,
+                commit_opens_at="2026-05-25T00:00:00+00:00",
+                commit_closes_at="2026-05-25T00:30:00+00:00",
+                reveal_opens_at="2026-05-25T00:30:00+00:00",
+                reveal_closes_at="2026-05-25T01:00:00+00:00",
+            ),
+        )
+        # A differing re-announcement for the same round must not move the
+        # committed round's frozen reveal window.
+        state.record_announcement_windows(
+            "testnet",
+            metadata,
+            commit_opens_at="2026-06-01T00:00:00+00:00",
+            commit_closes_at="2026-06-01T00:30:00+00:00",
+            reveal_opens_at="2026-06-01T00:30:00+00:00",
+            reveal_closes_at="2026-06-01T01:00:00+00:00",
+        )
+        record = state.get_round("testnet", metadata.round_id)
+
+    assert record.sidecar_state == STATE_COMMITTED
+    assert record.commit_opens_at == "2026-05-25T00:00:00+00:00"
+    assert record.reveal_closes_at == "2026-05-25T01:00:00+00:00"
+
+
+def test_get_rounds_pending_commit_filters(tmp_path):
+    def _other_metadata(round_id, round_number, package_hash):
+        return RoundMetadata(
+            round_id=round_id,
+            round_number=round_number,
+            status="INPUT_FROZEN",
+            input_package_cid="QmInput",
+            input_package_hash=package_hash,
+            input_frozen_at="2026-05-25T00:00:00+00:00",
+            final_bundle_cid=None,
+        )
+
+    def _windows(state, metadata):
+        state.record_announcement_windows(
+            "testnet",
+            metadata,
+            commit_opens_at="2026-05-25T00:00:00+00:00",
+            commit_closes_at="2026-05-25T00:30:00+00:00",
+            reveal_opens_at="2026-05-25T00:30:00+00:00",
+            reveal_closes_at="2026-05-25T01:00:00+00:00",
+        )
+
+    def _scored(state, metadata, *, selected_unl_hash="u" * 64):
+        state.record_score(
+            "testnet",
+            metadata,
+            ScoreOutcome(
+                sidecar_state=STATE_SCORED,
+                backend_mode="modal",
+                model_response_hash="m" * 64,
+                validator_scores_hash="v" * 64,
+                selected_unl_hash=selected_unl_hash,
+            ),
+        )
+
+    with SidecarState(tmp_path) as state:
+        # Eligible: scored, windows known, all three hashes, not committed.
+        eligible = _metadata()
+        _scored(state, eligible)
+        _windows(state, eligible)
+
+        # Scored but no windows recorded yet -> excluded.
+        _scored(state, _other_metadata(200, 500, "b" * 64))
+
+        # Windows known but never scored -> excluded.
+        _windows(state, _other_metadata(300, 600, "c" * 64))
+
+        # Scored but missing the selected-UNL hash -> cannot commit, excluded.
+        no_unl = _other_metadata(400, 700, "d" * 64)
+        _scored(state, no_unl, selected_unl_hash=None)
+        _windows(state, no_unl)
+
+        pending = state.get_rounds_pending_commit("testnet")
+
+    assert [record.round_id for record in pending] == [eligible.round_id]
+
+
 def test_v1_database_migrates_to_v5(tmp_path):
     db_path = tmp_path / STATE_DB_FILENAME
     connection = sqlite3.connect(db_path)
