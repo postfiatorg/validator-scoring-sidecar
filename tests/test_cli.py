@@ -698,3 +698,61 @@ def test_score_command_deployment_error_exits_operator_error(capsys, monkeypatch
     assert exit_code == 1
     assert "no deployment record" in captured.err
     assert captured.out == ""
+
+
+def test_warm_runtime_human_output(capsys, monkeypatch, tmp_path):
+    from validator_scoring_sidecar.participate import WARM_STATUS_READY, WarmRuntimeResult
+
+    result = WarmRuntimeResult(
+        status=WARM_STATUS_READY, endpoint_url="https://operator--app.modal.run"
+    )
+    monkeypatch.setattr(
+        cli,
+        "warm_modal_runtime",
+        lambda config, client, *, source, round_limit: result,
+    )
+
+    exit_code = cli.main(["warm-runtime", "--data-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert f"Runtime warm-up: {WARM_STATUS_READY}" in captured.out
+    assert "Endpoint URL: https://operator--app.modal.run" in captured.out
+    assert captured.err == ""
+
+
+def test_warm_runtime_json_output(capsys, monkeypatch, tmp_path):
+    from validator_scoring_sidecar.participate import (
+        WARM_STATUS_SKIPPED_NO_CREDENTIALS,
+        WarmRuntimeResult,
+    )
+
+    result = WarmRuntimeResult(status=WARM_STATUS_SKIPPED_NO_CREDENTIALS)
+    monkeypatch.setattr(
+        cli,
+        "warm_modal_runtime",
+        lambda config, client, *, source, round_limit: result,
+    )
+
+    exit_code = cli.main(["warm-runtime", "--data-dir", str(tmp_path), "--json"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out) == result.as_dict()
+    assert captured.err == ""
+
+
+def test_warm_runtime_deploy_error_exits_operator_error(capsys, monkeypatch, tmp_path):
+    from validator_scoring_sidecar.deployment import ModalDeploymentError
+
+    def fake_warm(config, client, *, source, round_limit):
+        raise ModalDeploymentError("modal deploy failed")
+
+    monkeypatch.setattr(cli, "warm_modal_runtime", fake_warm)
+
+    exit_code = cli.main(["warm-runtime", "--data-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "modal deploy failed" in captured.err
+    assert captured.out == ""
