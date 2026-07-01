@@ -18,18 +18,19 @@ relay wallet, validator-keys signing access, a reachable PFTL RPC, and a
 discoverable foundation publisher address are all present — so it never spends on
 inference it cannot follow through on chain.
 
-Each pass is idempotent and restart-safe. The reveal phase is driven from local
-state and runs first, independent of whether there is a new round to score, so a
-round committed on an earlier pass still reveals in its window even when nothing
-new is eligible. The commit phase only acts on the round scored this pass and
-advances the chain cursor past an announcement only once it is terminally handled
-(committed, already committed, window closed, or a round we will not commit) —
-never past an announcement whose commit is still pending or whose handling hit a
-transient error, so nothing is silently skipped. Per-round logic failures are
-recorded without halting the pass; infrastructure failures (a failed account_tx
-poll, a transient RPC or download error, a lock error) propagate so the pass
-retries cleanly rather than advancing past unfinished work. The unattended loop
-is the operator's scheduler invoking this pass at the chain-poll cadence.
+Each pass is idempotent and restart-safe. Reveal and commit are both driven from
+local state, so neither depends on a round being scored this pass nor on the
+chain cursor position; the reveal phase runs first so a commit-phase issue never
+blocks a pending reveal. The announcement walk only records each round's commit
+and reveal windows and then advances the cursor unconditionally, and the commit
+is replayed from local state for any scored round whose window is open and not
+yet committed — so a round scored on a later pass than its announcement (for
+example after a transient scoring failure) still commits while its window is open
+rather than being forfeited. Per-round logic failures are recorded without
+halting the pass; infrastructure failures (a failed account_tx poll, a transient
+RPC or download error, a lock error) propagate so the pass retries cleanly rather
+than advancing past unfinished work. The unattended loop is the operator's
+scheduler invoking this pass at the chain-poll cadence.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ from validator_scoring_sidecar.chain import (
     resolve_foundation_publisher_address,
 )
 from validator_scoring_sidecar.commit import (
-    COMMIT_STATUS_WINDOW_NOT_OPEN,
+    CommitError,
     Signer,
     submit_commit,
 )
@@ -61,8 +62,11 @@ from validator_scoring_sidecar.config import (
     SidecarConfig,
 )
 from validator_scoring_sidecar.deployment import (
+    DEPLOYMENT_MODE_LOCAL,
     NoEligibleRoundError,
     deploy_modal_endpoint,
+    load_round_manifest,
+    select_latest_deployable_round,
 )
 from validator_scoring_sidecar.modal_deployer import (
     ENV_MODAL_TOKEN_ID,
@@ -71,12 +75,18 @@ from validator_scoring_sidecar.modal_deployer import (
 )
 from validator_scoring_sidecar.input_package import (
     SOURCE_AUTO,
+    FetchedInputPackage,
     PackageSource,
     fetch_input_package,
 )
 from validator_scoring_sidecar.reveal import RevealError, submit_reveal
 from validator_scoring_sidecar.round_metadata import RoundMetadata
-from validator_scoring_sidecar.score import RuntimeProvisioner, score_round
+from validator_scoring_sidecar.score import (
+    RuntimeProvisioner,
+    provision_runtime_if_needed,
+    score_round,
+)
+from validator_scoring_sidecar.scoring import commit_reveal
 from validator_scoring_sidecar.scoring_client import ScoringClient, ScoringClientError
 from validator_scoring_sidecar.state import (
     SCORED_OR_FURTHER_STATES,
@@ -91,9 +101,19 @@ from validator_scoring_sidecar.verification import (
 )
 
 SCORE_STATUS_NO_ELIGIBLE_ROUND = "no_eligible_round"
-ADVANCE_STATUS_ROUND_NOT_SCORED = "round_not_scored"
+ANNOUNCE_STATUS_WINDOWS_RECORDED = "windows_recorded"
 ADVANCE_STATUS_ANNOUNCEMENT_ERROR = "announcement_error"
 ADVANCE_STATUS_ERROR = "error"
+
+# Foundation round status carried on a round first learned about from its
+# on-chain announcement (emitted at INPUT_FROZEN); used only when the
+# announcement walk inserts a round the score path has not recorded yet.
+ROUND_STATUS_INPUT_FROZEN = "INPUT_FROZEN"
+
+WARM_STATUS_READY = "ready"
+WARM_STATUS_SKIPPED_NO_CREDENTIALS = "skipped_no_credentials"
+WARM_STATUS_SKIPPED_LOCAL = "skipped_local"
+WARM_STATUS_ROUND_NOT_DEPLOYABLE = "round_not_deployable"
 
 
 class ParticipationConfigError(RuntimeError):
@@ -110,6 +130,7 @@ class ParticipateResult:
     round_number: int
     commits: list[dict[str, Any]]
     reveals: list[dict[str, Any]]
+    announcements: list[dict[str, Any]]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -119,6 +140,7 @@ class ParticipateResult:
             "round_number": self.round_number,
             "commits": list(self.commits),
             "reveals": list(self.reveals),
+            "announcements": list(self.announcements),
         }
 
 
@@ -178,6 +200,64 @@ def modal_runtime_provisioner(
     return provision
 
 
+@dataclass(frozen=True)
+class WarmRuntimeResult:
+    """Outcome of the startup runtime warm-up (see ``warm_modal_runtime``)."""
+
+    status: str
+    endpoint_url: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"status": self.status, "endpoint_url": self.endpoint_url}
+
+
+def warm_modal_runtime(
+    config: SidecarConfig,
+    client: ScoringClient,
+    *,
+    round_limit: int = DEFAULT_SYNC_ROUND_LIMIT,
+    source: PackageSource = SOURCE_AUTO,
+    package_fetcher=fetch_input_package,
+    provisioner_factory: Callable[
+        [SidecarConfig], RuntimeProvisioner | None
+    ] = modal_runtime_provisioner,
+) -> WarmRuntimeResult:
+    """Provision the manifest-pinned Modal endpoint once at startup, before the
+    first participation round.
+
+    Moves the one-time Modal deploy (image build and kernel compilation) and GPU
+    cold start out of the first round's window. Absent Modal credentials it is a
+    no-op — local-SGLang and unconfigured operators keep today's behaviour — and
+    it reuses the score path's runtime-resolution decision
+    (``provision_runtime_if_needed``) so a valid, manifest-current endpoint is
+    not redeployed and a local-mode record is never replaced.
+
+    Configuration and infrastructure failures (a missing manifest, an
+    unreachable scoring service, no eligible round, a Modal deploy error) are not
+    swallowed here — they propagate to the caller, which decides the exit code.
+    The container entrypoint runs this non-fatally, so a failed warm-up never
+    blocks the participation loop, which still provisions the endpoint on demand.
+    """
+
+    provisioner = provisioner_factory(config)
+    if provisioner is None:
+        return WarmRuntimeResult(status=WARM_STATUS_SKIPPED_NO_CREDENTIALS)
+
+    metadata = select_latest_deployable_round(client.fetch_rounds(limit=round_limit))
+    fetched = package_fetcher(metadata, config, client, source=source, force=False)
+    manifest = load_round_manifest(fetched.local_path)
+    record = provision_runtime_if_needed(config, manifest, metadata, provisioner)
+
+    if not record:
+        return WarmRuntimeResult(status=WARM_STATUS_ROUND_NOT_DEPLOYABLE)
+    if record.get("mode") == DEPLOYMENT_MODE_LOCAL:
+        return WarmRuntimeResult(status=WARM_STATUS_SKIPPED_LOCAL)
+    return WarmRuntimeResult(
+        status=WARM_STATUS_READY,
+        endpoint_url=record.get("endpoint_url"),
+    )
+
+
 def participate(
     config: SidecarConfig,
     client: ScoringClient,
@@ -223,8 +303,12 @@ def participate(
         active_round_number = 0
 
     with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
-        # Reveals first: state-driven and independent of the commit phase, so a
-        # commit-phase failure never blocks a pending reveal.
+        # Reveals and commits are both driven from local state, so neither
+        # depends on a round being scored this pass nor on the chain cursor.
+        # Reveals run first so a commit-phase issue never blocks a pending
+        # reveal. The announcement walk only records each round's windows and
+        # advances the cursor; the commit itself is replayed from local state,
+        # so a round scored on a later pass than its announcement is not lost.
         reveals = _advance_reveals(
             config,
             state,
@@ -232,22 +316,22 @@ def participate(
             signer=signer,
             publisher=publisher,
         )
-        commits = (
-            _advance_commits(
-                config,
-                client,
-                state,
-                active_round_id,
-                active_round_number,
-                rpc_client=rpc_client,
-                signer=signer,
-                publisher=publisher,
-                announcement_decoder=announcement_decoder,
-                package_fetcher=package_fetcher,
-                round_limit=round_limit,
-            )
-            if active_round_id is not None
-            else []
+        announcements = _record_announcement_windows(
+            config,
+            client,
+            state,
+            rpc_client=rpc_client,
+            publisher=publisher,
+            announcement_decoder=announcement_decoder,
+            package_fetcher=package_fetcher,
+            round_limit=round_limit,
+        )
+        commits = _advance_commits(
+            config,
+            state,
+            rpc_client=rpc_client,
+            signer=signer,
+            publisher=publisher,
         )
 
     return ParticipateResult(
@@ -257,31 +341,30 @@ def participate(
         round_number=active_round_number,
         commits=commits,
         reveals=reveals,
+        announcements=announcements,
     )
 
 
-def _advance_commits(
+def _record_announcement_windows(
     config: SidecarConfig,
     client: ScoringClient,
     state: SidecarState,
-    active_round_id: int,
-    active_round_number: int,
     *,
     rpc_client: PftlRpcClient,
-    signer: Signer,
     publisher: str,
     announcement_decoder: Callable[..., VerifiedAnnouncement | None],
     package_fetcher,
     round_limit: int,
 ) -> list[dict[str, Any]]:
-    """Commit the round scored this pass when its announcement is in the watcher's
-    feed and its commit window is open.
+    """Persist the commit/reveal windows of every announced round in the feed.
 
-    The chain cursor advances past a transaction only once it is terminally
-    handled, so an announcement whose commit is still pending (window not yet
-    open) or whose handling hit a transient error is reprocessed on a later pass
-    rather than lost. A round newer than the one scored this pass is left in place
-    for a future pass to score and commit.
+    The commit itself is replayed from local state (``_advance_commits``), so the
+    cursor can advance past an announcement as soon as its windows are recorded —
+    even if the round is not yet scored. A round scored on a later pass still
+    commits, because its windows are already persisted, so a transient scoring
+    failure no longer forfeits the round. A malformed announcement from the
+    trusted sender will not improve, so it is recorded and skipped; transient
+    decode failures (download/verify/RPC) propagate so the pass retries them.
     """
 
     watcher = PftlAccountWatcher(
@@ -301,10 +384,6 @@ def _advance_commits(
                 round_limit=round_limit,
             )
         except AnnouncementError as exc:
-            # A malformed announcement from the trusted sender will not improve;
-            # record it and move past so it cannot wedge the cursor. Transient
-            # decode failures (download/verify/RPC) are not caught here, so they
-            # propagate and the announcement is retried on a later pass.
             results.append(
                 {
                     "tx_hash": transaction.tx_hash,
@@ -315,76 +394,114 @@ def _advance_commits(
             watcher.advance_cursor(transaction)
             continue
 
-        if verified is None:
-            # Not a round announcement (e.g. a foundation VL receipt).
-            watcher.advance_cursor(transaction)
-            continue
-        if verified.package.round_id != active_round_id:
-            if verified.announcement.round_number > active_round_number:
-                # A round newer than the one scored this pass; leave it for a
-                # later pass to score and commit rather than skipping it.
-                break
-            # An older round this validator will not commit.
-            watcher.advance_cursor(transaction)
-            continue
-
-        record = state.get_round(config.network, active_round_id)
-        result, advance = _commit_active_round(
-            config,
-            record,
-            verified,
-            rpc_client=rpc_client,
-            signer=signer,
-            state=state,
-            publisher=publisher,
-        )
-        results.append(result)
-        if advance:
-            watcher.advance_cursor(transaction)
-        else:
-            # Commit window not yet open: hold the cursor and retry next pass.
-            break
+        if verified is not None:
+            announcement = verified.announcement
+            state.record_announcement_windows(
+                config.network,
+                _metadata_from_package(verified.package),
+                commit_opens_at=announcement.commit_opens_at.isoformat(),
+                commit_closes_at=announcement.commit_closes_at.isoformat(),
+                reveal_opens_at=announcement.reveal_opens_at.isoformat(),
+                reveal_closes_at=announcement.reveal_closes_at.isoformat(),
+            )
+            results.append(
+                {
+                    "round_number": announcement.round_number,
+                    "status": ANNOUNCE_STATUS_WINDOWS_RECORDED,
+                }
+            )
+        # Whether or not it was a round announcement, the cursor advances: the
+        # commit no longer depends on re-seeing the announcement.
+        watcher.advance_cursor(transaction)
     return results
 
 
-def _commit_active_round(
+def _advance_commits(
     config: SidecarConfig,
-    record: RoundStateRecord | None,
-    verified: VerifiedAnnouncement,
+    state: SidecarState,
     *,
     rpc_client: PftlRpcClient,
     signer: Signer,
-    state: SidecarState,
     publisher: str,
-) -> tuple[dict[str, Any], bool]:
-    """Attempt the commit for the active round and report whether the cursor may
-    advance past its announcement."""
+) -> list[dict[str, Any]]:
+    """Commit every scored round whose announced commit window is recorded and
+    that has not yet committed.
 
-    round_number = verified.announcement.round_number
-    output_hashes = _committable_output_hashes(record)
-    if record is None or output_hashes is None:
-        # Scoring failed or was skipped, or the round has no frozen previous UNL,
-        # so it will not be committed; advancing past it is terminal.
-        return (
-            {"round_number": round_number, "status": ADVANCE_STATUS_ROUND_NOT_SCORED},
-            True,
+    State-driven, mirroring ``_advance_reveals``: each round is committed from
+    its persisted output fingerprints and announced windows, independent of where
+    the chain cursor sits, so a round scored on a later pass than its
+    announcement is not forfeited. ``submit_commit`` self-gates on the commit
+    window (a no-op before it opens, a closed-window outcome after) and on
+    idempotency (local state plus an on-chain check). A per-round ``CommitError``
+    isolates that round and is recorded without halting the pass; transient RPC
+    failures propagate so the pass retries.
+    """
+
+    results: list[dict[str, Any]] = []
+    for record in state.get_rounds_pending_commit(config.network):
+        # get_rounds_pending_commit already guarantees the three fingerprints;
+        # this narrows the type and guards defensively rather than skipping work.
+        output_hashes = _committable_output_hashes(record)
+        if output_hashes is None:
+            continue
+        try:
+            commit = submit_commit(
+                _announcement_from_record(record),
+                output_hashes,
+                config,
+                _metadata_from_record(record),
+                rpc_client=rpc_client,
+                signer=signer,
+                state=state,
+                foundation_publisher_address=publisher,
+            )
+        except (CommitError, commit_reveal.CommitRevealValidationError) as exc:
+            results.append(
+                {
+                    "round_number": record.round_number,
+                    "status": ADVANCE_STATUS_ERROR,
+                    "error": str(exc),
+                }
+            )
+            continue
+        results.append(
+            {
+                "round_number": commit.round_number,
+                "status": commit.status,
+                "tx_hash": commit.commit_tx_hash,
+            }
         )
-    commit = submit_commit(
-        verified.announcement,
-        output_hashes,
-        config,
-        _metadata_from_record(record),
-        rpc_client=rpc_client,
-        signer=signer,
-        state=state,
-        foundation_publisher_address=publisher,
+    return results
+
+
+def _announcement_from_record(
+    record: RoundStateRecord,
+) -> commit_reveal.RoundAnnouncement:
+    """Rebuild the round announcement from persisted state, so ``submit_commit``
+    is reused unchanged for the state-driven commit."""
+
+    return commit_reveal.build_round_announcement(
+        network=record.network,
+        round_number=record.round_number,
+        input_package_cid=record.input_package_cid,
+        input_package_hash=record.input_package_hash,
+        commit_opens_at=record.commit_opens_at,
+        commit_closes_at=record.commit_closes_at,
+        reveal_opens_at=record.reveal_opens_at,
+        reveal_closes_at=record.reveal_closes_at,
     )
-    result = {
-        "round_number": commit.round_number,
-        "status": commit.status,
-        "tx_hash": commit.commit_tx_hash,
-    }
-    return result, commit.status != COMMIT_STATUS_WINDOW_NOT_OPEN
+
+
+def _metadata_from_package(package: FetchedInputPackage) -> RoundMetadata:
+    return RoundMetadata(
+        round_id=package.round_id,
+        round_number=package.round_number,
+        status=ROUND_STATUS_INPUT_FROZEN,
+        input_package_cid=package.input_package_cid,
+        input_package_hash=package.input_package_hash,
+        input_frozen_at=package.input_frozen_at,
+        final_bundle_cid=None,
+    )
 
 
 def _advance_reveals(

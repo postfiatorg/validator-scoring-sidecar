@@ -36,9 +36,24 @@ case "$interval" in
         ;;
 esac
 
-log "starting ${mode} loop (interval=${interval}s)"
-
+# Installed before the warm-up so a shutdown signal during the (potentially long)
+# first Modal build is handled gracefully rather than by default disposition.
 trap 'log "received shutdown signal"; exit 0' TERM INT
+
+# Pre-provision the manifest-pinned Modal endpoint before the first round so the
+# one-time Modal build and cold start do not fall inside a round's commit window.
+# Non-fatal: the participation loop still provisions on demand, and warm-runtime
+# is a no-op for local SGLang and when Modal credentials are absent.
+if [ "$mode" = "participate" ]; then
+    log "provisioning inference runtime before the first round"
+    if validator-scoring-sidecar warm-runtime; then
+        log "runtime warm-up complete"
+    else
+        log "runtime warm-up did not complete; the loop will provision on demand"
+    fi
+fi
+
+log "starting ${mode} loop (interval=${interval}s)"
 
 while true; do
     validator-scoring-sidecar "$command" &
