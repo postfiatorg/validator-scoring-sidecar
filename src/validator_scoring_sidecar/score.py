@@ -381,6 +381,27 @@ def _fetch_foundation_hashes(
     return None
 
 
+def provision_runtime_if_needed(
+    config: SidecarConfig,
+    manifest: dict[str, Any],
+    metadata: RoundMetadata,
+    provisioner: RuntimeProvisioner | None,
+) -> dict[str, Any]:
+    """Resolve — and, if needed, deploy — the inference runtime, returning its
+    deployment record.
+
+    A thin public wrapper over the score path's ``_resolve_runtime`` decision so
+    startup warm-up reuses the exact same rules the participate loop uses: the
+    provisioner deploys only when the recorded runtime is missing or
+    manifest-stale, a valid current record is reused unchanged, and a local-mode
+    record is never replaced. The returned dict is empty only when no deployment
+    record exists and the round itself is not deployable (e.g. a dry-run or
+    wrong-network round); an existing record is always returned as-is.
+    """
+
+    return _resolve_runtime(config, manifest, metadata, provisioner)[0]
+
+
 def _resolve_runtime(
     config: SidecarConfig,
     manifest: dict[str, Any],

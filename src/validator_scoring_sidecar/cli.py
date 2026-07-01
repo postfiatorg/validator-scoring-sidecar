@@ -47,8 +47,10 @@ from validator_scoring_sidecar.score import ScoreResult, score_round
 from validator_scoring_sidecar.participate import (
     ParticipateResult,
     ParticipationConfigError,
+    WarmRuntimeResult,
     participate,
     require_participation_config,
+    warm_modal_runtime,
 )
 from validator_scoring_sidecar.sync import (
     DEFAULT_SYNC_ROUND_LIMIT,
@@ -242,6 +244,32 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_config_arguments(score)
     _add_json_argument(score)
     score.set_defaults(handler=score_command)
+
+    warm = subparsers.add_parser(
+        "warm-runtime",
+        help=(
+            "Provision the manifest-pinned Modal inference endpoint before the "
+            "participation loop starts. No-op without Modal credentials."
+        ),
+    )
+    warm.add_argument(
+        "--source",
+        choices=PACKAGE_SOURCE_CHOICES,
+        default="auto",
+        help="Package retrieval source for round fetches. Defaults to auto.",
+    )
+    warm.add_argument(
+        "--round-limit",
+        type=_round_limit,
+        default=DEFAULT_SYNC_ROUND_LIMIT,
+        help=(
+            "Recent rounds to scan for the latest eligible round. Defaults to "
+            f"{DEFAULT_SYNC_ROUND_LIMIT}."
+        ),
+    )
+    _add_common_config_arguments(warm)
+    _add_json_argument(warm)
+    warm.set_defaults(handler=warm_runtime_command)
 
     participate_parser = subparsers.add_parser(
         "participate",
@@ -572,6 +600,55 @@ def _format_score_result(result: ScoreResult) -> str:
         lines.append(f"Matched levels: {', '.join(result.matched_levels) or 'none'}")
     if result.error_category is not None:
         lines.append(f"Outcome category: {result.error_category}")
+    return "\n".join(lines)
+
+
+def warm_runtime_command(args: argparse.Namespace) -> int:
+    config = load_config(
+        base_url=args.base_url,
+        data_dir=args.data_dir,
+        ipfs_gateway_url=args.ipfs_gateway_url,
+        network=args.network,
+        timeout_seconds=args.timeout,
+    )
+    client = ScoringClient(config)
+    try:
+        result = warm_modal_runtime(
+            config,
+            client,
+            source=args.source,
+            round_limit=args.round_limit,
+        )
+    except MissingFrozenInputMetadata as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except RoundMetadataError as exc:
+        _print_error(f"Malformed round metadata: {exc}")
+        return EXIT_NETWORK_ERROR
+    except (InputPackageVerificationError, InputPackageCacheError) as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except DeploymentError as exc:
+        _print_error(str(exc))
+        return EXIT_OPERATOR_ERROR
+    except (InputPackageDownloadError, ScoringClientError) as exc:
+        _print_error(str(exc))
+        return EXIT_NETWORK_ERROR
+    finally:
+        client.close()
+
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(_format_warm_runtime_result(result))
+
+    return EXIT_OK
+
+
+def _format_warm_runtime_result(result: WarmRuntimeResult) -> str:
+    lines = [f"Runtime warm-up: {result.status}"]
+    if result.endpoint_url is not None:
+        lines.append(f"Endpoint URL: {result.endpoint_url}")
     return "\n".join(lines)
 
 

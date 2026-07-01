@@ -62,8 +62,11 @@ from validator_scoring_sidecar.config import (
     SidecarConfig,
 )
 from validator_scoring_sidecar.deployment import (
+    DEPLOYMENT_MODE_LOCAL,
     NoEligibleRoundError,
     deploy_modal_endpoint,
+    load_round_manifest,
+    select_latest_deployable_round,
 )
 from validator_scoring_sidecar.modal_deployer import (
     ENV_MODAL_TOKEN_ID,
@@ -78,7 +81,11 @@ from validator_scoring_sidecar.input_package import (
 )
 from validator_scoring_sidecar.reveal import RevealError, submit_reveal
 from validator_scoring_sidecar.round_metadata import RoundMetadata
-from validator_scoring_sidecar.score import RuntimeProvisioner, score_round
+from validator_scoring_sidecar.score import (
+    RuntimeProvisioner,
+    provision_runtime_if_needed,
+    score_round,
+)
 from validator_scoring_sidecar.scoring import commit_reveal
 from validator_scoring_sidecar.scoring_client import ScoringClient, ScoringClientError
 from validator_scoring_sidecar.state import (
@@ -102,6 +109,11 @@ ADVANCE_STATUS_ERROR = "error"
 # on-chain announcement (emitted at INPUT_FROZEN); used only when the
 # announcement walk inserts a round the score path has not recorded yet.
 ROUND_STATUS_INPUT_FROZEN = "INPUT_FROZEN"
+
+WARM_STATUS_READY = "ready"
+WARM_STATUS_SKIPPED_NO_CREDENTIALS = "skipped_no_credentials"
+WARM_STATUS_SKIPPED_LOCAL = "skipped_local"
+WARM_STATUS_ROUND_NOT_DEPLOYABLE = "round_not_deployable"
 
 
 class ParticipationConfigError(RuntimeError):
@@ -186,6 +198,64 @@ def modal_runtime_provisioner(
         return record.as_dict()
 
     return provision
+
+
+@dataclass(frozen=True)
+class WarmRuntimeResult:
+    """Outcome of the startup runtime warm-up (see ``warm_modal_runtime``)."""
+
+    status: str
+    endpoint_url: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"status": self.status, "endpoint_url": self.endpoint_url}
+
+
+def warm_modal_runtime(
+    config: SidecarConfig,
+    client: ScoringClient,
+    *,
+    round_limit: int = DEFAULT_SYNC_ROUND_LIMIT,
+    source: PackageSource = SOURCE_AUTO,
+    package_fetcher=fetch_input_package,
+    provisioner_factory: Callable[
+        [SidecarConfig], RuntimeProvisioner | None
+    ] = modal_runtime_provisioner,
+) -> WarmRuntimeResult:
+    """Provision the manifest-pinned Modal endpoint once at startup, before the
+    first participation round.
+
+    Moves the one-time Modal deploy (image build and kernel compilation) and GPU
+    cold start out of the first round's window. Absent Modal credentials it is a
+    no-op — local-SGLang and unconfigured operators keep today's behaviour — and
+    it reuses the score path's runtime-resolution decision
+    (``provision_runtime_if_needed``) so a valid, manifest-current endpoint is
+    not redeployed and a local-mode record is never replaced.
+
+    Configuration and infrastructure failures (a missing manifest, an
+    unreachable scoring service, no eligible round, a Modal deploy error) are not
+    swallowed here — they propagate to the caller, which decides the exit code.
+    The container entrypoint runs this non-fatally, so a failed warm-up never
+    blocks the participation loop, which still provisions the endpoint on demand.
+    """
+
+    provisioner = provisioner_factory(config)
+    if provisioner is None:
+        return WarmRuntimeResult(status=WARM_STATUS_SKIPPED_NO_CREDENTIALS)
+
+    metadata = select_latest_deployable_round(client.fetch_rounds(limit=round_limit))
+    fetched = package_fetcher(metadata, config, client, source=source, force=False)
+    manifest = load_round_manifest(fetched.local_path)
+    record = provision_runtime_if_needed(config, manifest, metadata, provisioner)
+
+    if not record:
+        return WarmRuntimeResult(status=WARM_STATUS_ROUND_NOT_DEPLOYABLE)
+    if record.get("mode") == DEPLOYMENT_MODE_LOCAL:
+        return WarmRuntimeResult(status=WARM_STATUS_SKIPPED_LOCAL)
+    return WarmRuntimeResult(
+        status=WARM_STATUS_READY,
+        endpoint_url=record.get("endpoint_url"),
+    )
 
 
 def participate(
