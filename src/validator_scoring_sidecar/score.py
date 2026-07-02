@@ -51,7 +51,6 @@ from validator_scoring_sidecar.inference import (
     LocalSglangBackend,
     ModalBackend,
     ModelRequestError,
-    DEFAULT_INFERENCE_TIMEOUT_SECONDS,
     load_model_request,
 )
 from validator_scoring_sidecar.input_package import SOURCE_AUTO, fetch_input_package
@@ -281,7 +280,7 @@ def _full_score(
     try:
         model_request = load_model_request(fetched.local_path)
         timeout_seconds = _effective_inference_timeout_seconds(
-            inference_deadline, now
+            inference_deadline, now, config.inference_timeout_seconds
         )
         if timeout_seconds is None:
             return _record_failure(
@@ -372,16 +371,24 @@ def _inference_deadline(
 def _effective_inference_timeout_seconds(
     deadline: datetime | None,
     now_fn: Callable[[], datetime],
+    max_timeout_seconds: float,
 ) -> float | None:
+    """Resolve the read timeout for one inference request.
+
+    ``max_timeout_seconds`` is the operator-configured upper bound. The
+    commit-deadline cap always takes precedence: when a round's commit window is
+    close, the timeout is shortened to what remains (minus a safety margin), and
+    scoring is skipped entirely (``None``) when too little time is left.
+    """
     if deadline is None:
-        return DEFAULT_INFERENCE_TIMEOUT_SECONDS
+        return max_timeout_seconds
 
     remaining = (
         deadline - now_fn()
     ).total_seconds() - INFERENCE_DEADLINE_SAFETY_MARGIN_SECONDS
     if remaining < MIN_INFERENCE_READ_TIMEOUT_SECONDS:
         return None
-    return min(DEFAULT_INFERENCE_TIMEOUT_SECONDS, remaining)
+    return min(max_timeout_seconds, remaining)
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -431,7 +438,7 @@ def _build_backend(
 def _default_backend_factory(
     deployment_record: dict[str, Any],
     *,
-    timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+    timeout_seconds: float,
 ) -> InferenceBackend:
     mode = deployment_record.get("mode")
     endpoint_url = deployment_record.get("endpoint_url")
