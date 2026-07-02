@@ -28,8 +28,16 @@ These have working defaults. Override only if you have a concrete operational re
 |---|---|---|
 | `POSTFIAT_SIDECAR_SYNC_INTERVAL_SECONDS` | `3600` | How often the container loops back for another sync. Foundation rounds happen on a weekly cadence, so the default keeps load light against the scoring service. Has no effect outside the Docker workflow. |
 | `POSTFIAT_SIDECAR_TIMEOUT_SECONDS` | `30` | HTTP request timeout for calls to the scoring service and the IPFS gateway. |
+| `POSTFIAT_SIDECAR_INFERENCE_TIMEOUT_SECONDS` | `180` | Upper bound on one inference request's read timeout during participation scoring. It is only an upper bound: when a round's commit window is close the timeout is shortened to the time remaining, and scoring is skipped entirely if too little is left. Raise it only for a slower self-hosted SGLang runtime that legitimately needs longer than 180s per round; the zero-touch Modal path does not. |
+| `POSTFIAT_SIDECAR_COMMAND_TIMEOUT_SECONDS` | sync `900`, participate derived | Per-pass watchdog for the Docker loop: if a pass runs longer than this the container is terminated and the restart policy recovers it. Sync mode uses a fixed `900`. Participate mode derives its default so the watchdog always contains a full inference (`inference timeout + 180`, with a `360` floor); if you set it explicitly for participate it must exceed the inference timeout plus 60s of head-room or the container fails fast at startup, so that the watchdog can never fire in the middle of a legitimate inference. Has no effect outside the Docker workflow. |
 
 To override a tunable, edit your `.env` before running `docker compose up`.
+
+The inference timeout and the watchdog are coupled: the watchdog budget must be
+large enough to contain a full inference plus the fetch/verify/submit work
+around it. Keep that in mind if you raise `POSTFIAT_SIDECAR_INFERENCE_TIMEOUT_SECONDS`
+for a slow runtime — either leave `POSTFIAT_SIDECAR_COMMAND_TIMEOUT_SECONDS`
+unset so it is derived, or set it comfortably above the inference timeout.
 
 ## Participation mode (opt-in)
 

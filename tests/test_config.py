@@ -4,7 +4,9 @@ import pytest
 
 from validator_scoring_sidecar.config import (
     DEFAULT_DATA_DIR_ROOT,
+    DEFAULT_INFERENCE_TIMEOUT_SECONDS,
     ConfigError,
+    ENV_INFERENCE_TIMEOUT_SECONDS,
     ENV_IPFS_GATEWAY_URL,
     ENV_SCORING_BASE_URL,
     NETWORK_IPFS_GATEWAY_URLS,
@@ -122,6 +124,35 @@ def test_load_config_rejects_invalid_ipfs_gateway_url():
 def test_load_config_rejects_invalid_timeout():
     with pytest.raises(ConfigError, match="greater than zero"):
         load_config(timeout_seconds=0, environ={})
+
+
+def test_inference_timeout_defaults_when_unset():
+    config = load_config(environ={})
+
+    assert config.inference_timeout_seconds == DEFAULT_INFERENCE_TIMEOUT_SECONDS
+
+
+def test_inference_timeout_from_environment():
+    config = load_config(
+        environ={ENV_INFERENCE_TIMEOUT_SECONDS: "600"},
+    )
+
+    assert config.inference_timeout_seconds == 600.0
+
+
+def test_inference_timeout_cli_override_beats_environment():
+    config = load_config(
+        inference_timeout_seconds=450,
+        environ={ENV_INFERENCE_TIMEOUT_SECONDS: "600"},
+    )
+
+    assert config.inference_timeout_seconds == 450.0
+
+
+@pytest.mark.parametrize("bad_value", ["0", "-1", "abc", ""])
+def test_load_config_rejects_invalid_inference_timeout(bad_value):
+    with pytest.raises(ConfigError, match="inference_timeout_seconds"):
+        load_config(inference_timeout_seconds=bad_value, environ={})
 
 
 def test_load_config_requires_base_url_for_unknown_network():

@@ -12,6 +12,11 @@ from urllib.parse import urlparse
 DEFAULT_DATA_DIR_ROOT = "~/.postfiat/validator-scoring-sidecar"
 DEFAULT_NETWORK = "testnet"
 DEFAULT_TIMEOUT_SECONDS = 30.0
+# Upper bound on one inference request's read timeout. It is only an upper
+# bound: the commit-deadline cap in score.py still takes precedence, shortening
+# it when a round's commit window is near. Operators on slower self-hosted
+# runtimes can raise it via POSTFIAT_SIDECAR_INFERENCE_TIMEOUT_SECONDS.
+DEFAULT_INFERENCE_TIMEOUT_SECONDS = 180.0
 DEFAULT_CHAIN_POLL_INTERVAL_SECONDS = 60.0
 NETWORK_SCORING_BASE_URLS = {
     "devnet": "https://scoring-devnet.postfiat.org",
@@ -27,6 +32,7 @@ ENV_DATA_DIR = "POSTFIAT_SIDECAR_DATA_DIR"
 ENV_IPFS_GATEWAY_URL = "POSTFIAT_SIDECAR_IPFS_GATEWAY_URL"
 ENV_NETWORK = "POSTFIAT_SIDECAR_NETWORK"
 ENV_TIMEOUT_SECONDS = "POSTFIAT_SIDECAR_TIMEOUT_SECONDS"
+ENV_INFERENCE_TIMEOUT_SECONDS = "POSTFIAT_SIDECAR_INFERENCE_TIMEOUT_SECONDS"
 ENV_PFTL_RPC_URL = "POSTFIAT_SIDECAR_PFTL_RPC_URL"
 ENV_FOUNDATION_PUBLISHER_ADDRESS = "POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS"
 ENV_CHAIN_POLL_INTERVAL_SECONDS = "POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS"
@@ -52,6 +58,7 @@ class SidecarConfig:
     ipfs_gateway_url: str | None
     network: str
     timeout_seconds: float
+    inference_timeout_seconds: float
     pftl_rpc_url: str
     foundation_publisher_address: str | None
     chain_poll_interval_seconds: float
@@ -67,6 +74,7 @@ def load_config(
     ipfs_gateway_url: str | None = None,
     network: str | None = None,
     timeout_seconds: float | str | None = None,
+    inference_timeout_seconds: float | str | None = None,
     pftl_rpc_url: str | None = None,
     foundation_publisher_address: str | None = None,
     chain_poll_interval_seconds: float | str | None = None,
@@ -102,6 +110,15 @@ def load_config(
         cli_value=str(timeout_seconds) if timeout_seconds is not None else None,
         env_value=env.get(ENV_TIMEOUT_SECONDS),
         default=str(DEFAULT_TIMEOUT_SECONDS),
+    )
+    resolved_inference_timeout = _resolve_value(
+        cli_value=(
+            str(inference_timeout_seconds)
+            if inference_timeout_seconds is not None
+            else None
+        ),
+        env_value=env.get(ENV_INFERENCE_TIMEOUT_SECONDS),
+        default=str(DEFAULT_INFERENCE_TIMEOUT_SECONDS),
     )
     resolved_pftl_rpc_url = _resolve_pftl_rpc_url(
         cli_value=pftl_rpc_url,
@@ -147,6 +164,7 @@ def load_config(
         ),
         network=normalized_network,
         timeout_seconds=_parse_timeout(resolved_timeout),
+        inference_timeout_seconds=_parse_inference_timeout(resolved_inference_timeout),
         pftl_rpc_url=_normalize_url("pftl_rpc_url", resolved_pftl_rpc_url),
         foundation_publisher_address=(
             _require_non_empty(
@@ -301,6 +319,16 @@ def _parse_timeout(value: str) -> float:
         raise ConfigError("timeout_seconds must be a number") from exc
     if timeout <= 0:
         raise ConfigError("timeout_seconds must be greater than zero")
+    return timeout
+
+
+def _parse_inference_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise ConfigError("inference_timeout_seconds must be a number") from exc
+    if timeout <= 0:
+        raise ConfigError("inference_timeout_seconds must be greater than zero")
     return timeout
 
 

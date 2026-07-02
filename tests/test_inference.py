@@ -1,4 +1,7 @@
 import json
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 import httpx
 import pytest
@@ -7,6 +10,10 @@ from validator_scoring_sidecar.failure import FailureCategory
 from validator_scoring_sidecar.inference import (
     BACKEND_MODE_LOCAL,
     BACKEND_MODE_MODAL,
+    DEFAULT_INFERENCE_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_INFERENCE_POOL_TIMEOUT_SECONDS,
+    DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+    DEFAULT_INFERENCE_WRITE_TIMEOUT_SECONDS,
     InferenceConfigError,
     InferenceError,
     LocalSglangBackend,
@@ -174,6 +181,51 @@ def test_timeout_maps_to_inference_timeout():
         _backend(handler).run(_model_request())
 
     assert exc_info.value.category == FailureCategory.INFERENCE_TIMEOUT
+
+
+def test_default_client_uses_bounded_explicit_timeout():
+    backend = LocalSglangBackend()
+    timeout = backend._http.timeout
+
+    assert timeout.connect == DEFAULT_INFERENCE_CONNECT_TIMEOUT_SECONDS
+    assert timeout.read == DEFAULT_INFERENCE_TIMEOUT_SECONDS
+    assert timeout.write == DEFAULT_INFERENCE_WRITE_TIMEOUT_SECONDS
+    assert timeout.pool == DEFAULT_INFERENCE_POOL_TIMEOUT_SECONDS
+    backend.close()
+
+
+def test_non_responding_endpoint_returns_within_read_timeout():
+    class SlowHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            time.sleep(0.3)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(_completion()).encode("utf-8"))
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    backend = LocalSglangBackend(
+        f"http://127.0.0.1:{server.server_port}/v1",
+        timeout_seconds=0.05,
+    )
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(InferenceError) as exc_info:
+            backend.run(_model_request())
+    finally:
+        elapsed = time.monotonic() - started
+        backend.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+    assert exc_info.value.category == FailureCategory.INFERENCE_TIMEOUT
+    assert elapsed < 0.5
 
 
 def test_connection_error_maps_to_runtime_unavailable():
