@@ -18,10 +18,12 @@ case "$mode" in
     sync)
         command="sync"
         interval="${POSTFIAT_SIDECAR_SYNC_INTERVAL_SECONDS:-3600}"
+        command_timeout="${POSTFIAT_SIDECAR_COMMAND_TIMEOUT_SECONDS:-}"
         ;;
     participate)
         command="participate"
         interval="${POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS:-60}"
+        command_timeout="${POSTFIAT_SIDECAR_COMMAND_TIMEOUT_SECONDS:-360}"
         ;;
     *)
         log "POSTFIAT_SIDECAR_MODE must be 'sync' or 'participate', got '${mode}'"
@@ -35,6 +37,19 @@ case "$interval" in
         exit 2
         ;;
 esac
+
+case "$command_timeout" in
+    ''|*[!0-9]*)
+        if [ -n "$command_timeout" ]; then
+            log "command timeout must be a positive integer, got '${command_timeout}'"
+            exit 2
+        fi
+        ;;
+esac
+if [ -n "$command_timeout" ] && [ "$command_timeout" -le 0 ]; then
+    log "command timeout must be greater than zero, got '${command_timeout}'"
+    exit 2
+fi
 
 # Installed before the warm-up so a shutdown signal during the (potentially long)
 # first Modal build is handled gracefully rather than by default disposition.
@@ -58,11 +73,41 @@ log "starting ${mode} loop (interval=${interval}s)"
 while true; do
     validator-scoring-sidecar "$command" &
     run_pid=$!
+    timeout_marker="/tmp/validator-scoring-sidecar-timeout-${run_pid}"
+    watchdog_pid=""
+    if [ -n "$command_timeout" ]; then
+        (
+            sleep "$command_timeout"
+            if kill -0 "$run_pid" 2>/dev/null; then
+                log "${command} exceeded ${command_timeout}s watchdog; terminating"
+                : > "$timeout_marker"
+                kill -TERM "$run_pid" 2>/dev/null || true
+                sleep 10
+                kill -KILL "$run_pid" 2>/dev/null || true
+            fi
+        ) &
+        watchdog_pid=$!
+    fi
     if wait "$run_pid"; then
+        if [ -f "$timeout_marker" ]; then
+            rm -f "$timeout_marker"
+            log "${command} watchdog fired; exiting for container restart"
+            exit 124
+        fi
         log "${command} completed; sleeping ${interval}s"
     else
+        if [ -f "$timeout_marker" ]; then
+            rm -f "$timeout_marker"
+            log "${command} watchdog fired; exiting for container restart"
+            exit 124
+        fi
         log "${command} failed; sleeping ${interval}s before retry"
     fi
+    if [ -n "$watchdog_pid" ]; then
+        kill "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+    fi
+    rm -f "$timeout_marker"
     sleep "$interval" &
     wait $!
 done

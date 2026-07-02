@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from validator_scoring_sidecar.config import SidecarConfig
@@ -50,6 +51,7 @@ from validator_scoring_sidecar.inference import (
     LocalSglangBackend,
     ModalBackend,
     ModelRequestError,
+    DEFAULT_INFERENCE_TIMEOUT_SECONDS,
     load_model_request,
 )
 from validator_scoring_sidecar.input_package import SOURCE_AUTO, fetch_input_package
@@ -105,6 +107,8 @@ _SKIP_CATEGORIES = frozenset(
     }
 )
 
+INFERENCE_DEADLINE_SAFETY_MARGIN_SECONDS = 20.0
+MIN_INFERENCE_READ_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -146,15 +150,20 @@ def score_round(
     foundation_hash_fetcher=None,
     package_fetcher=fetch_input_package,
     runtime_provisioner: RuntimeProvisioner | None = None,
+    now_fn: Callable[[], datetime] | None = None,
 ) -> ScoreResult:
     """Score one round and persist the outcome."""
 
-    factory = backend_factory or _default_backend_factory
+    factory = backend_factory
     fetch_foundation = foundation_hash_fetcher or _fetch_foundation_hashes
+    now = now_fn or _utcnow
+    metadata = _resolve_round(client, round_id, round_limit)
+    deferred_existing: RoundStateRecord | None = None
+    inference_deadline: datetime | None = None
 
     with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
-        metadata = _resolve_round(client, round_id, round_limit)
         existing = state.get_round(config.network, metadata.round_id)
+        inference_deadline = _inference_deadline(metadata, existing)
 
         if (
             existing is not None
@@ -173,25 +182,29 @@ def score_round(
                     matched_levels=_split_levels(existing.comparison_levels_matched),
                     error_category=existing.error_category,
                 )
-            deferred = _attempt_deferred_comparison(
-                config, client, state, metadata, existing, fetch_foundation
-            )
-            if deferred is not None:
-                return deferred
-            # Persisted hashes missing despite SCORED state — fall back to a
-            # full re-score below.
+            deferred_existing = existing
 
-        return _full_score(
-            config,
-            client,
-            state,
-            metadata,
-            source=source,
-            package_fetcher=package_fetcher,
-            factory=factory,
-            fetch_foundation=fetch_foundation,
-            runtime_provisioner=runtime_provisioner,
+    if deferred_existing is not None:
+        deferred = _attempt_deferred_comparison(
+            config, client, metadata, deferred_existing, fetch_foundation
         )
+        if deferred is not None:
+            return deferred
+        # Persisted hashes missing despite SCORED state — fall back to a full
+        # re-score below.
+
+    return _full_score(
+        config,
+        client,
+        metadata,
+        source=source,
+        package_fetcher=package_fetcher,
+        factory=factory,
+        fetch_foundation=fetch_foundation,
+        runtime_provisioner=runtime_provisioner,
+        inference_deadline=inference_deadline,
+        now_fn=now,
+    )
 
 
 def _resolve_round(
@@ -208,7 +221,6 @@ def _resolve_round(
 def _attempt_deferred_comparison(
     config: SidecarConfig,
     client: ScoringClient,
-    state: SidecarState,
     metadata: RoundMetadata,
     existing: RoundStateRecord,
     fetch_foundation,
@@ -232,24 +244,28 @@ def _attempt_deferred_comparison(
         verification,
         sidecar_state=existing.sidecar_state,
     )
-    state.record_score(config.network, metadata, outcome)
+    with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
+        state.record_score(config.network, metadata, outcome)
     return _scored_result(config.network, metadata, outcome, verification.compared)
 
 
 def _full_score(
     config: SidecarConfig,
     client: ScoringClient,
-    state: SidecarState,
     metadata: RoundMetadata,
     *,
     source: str,
     package_fetcher,
-    factory: Callable[[dict[str, Any]], InferenceBackend],
+    factory: Callable[[dict[str, Any]], InferenceBackend] | None,
     fetch_foundation,
     runtime_provisioner: RuntimeProvisioner | None = None,
+    inference_deadline: datetime | None = None,
+    now_fn: Callable[[], datetime] | None = None,
 ) -> ScoreResult:
+    now = now_fn or _utcnow
     fetched = package_fetcher(metadata, config, client, source=source, force=False)
-    state.record_input_verified(config.network, metadata, fetched)
+    with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
+        state.record_input_verified(config.network, metadata, fetched)
 
     manifest = load_round_manifest(fetched.local_path)
     deployment_record, compat = _resolve_runtime(
@@ -257,17 +273,35 @@ def _full_score(
     )
     if not compat.passed:
         outcome = _outcome_from_compat_failure(compat.failure)
-        state.record_score(config.network, metadata, outcome)
+        with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
+            state.record_score(config.network, metadata, outcome)
         return _outcome_result(config.network, metadata, outcome)
 
     backend: InferenceBackend | None = None
     try:
         model_request = load_model_request(fetched.local_path)
-        backend = factory(deployment_record)
+        timeout_seconds = _effective_inference_timeout_seconds(
+            inference_deadline, now
+        )
+        if timeout_seconds is None:
+            return _record_failure(
+                config,
+                metadata,
+                compat.effective_mode,
+                FailureCategory.INFERENCE_TIMEOUT,
+                {
+                    "reason": "round_deadline_elapsed",
+                    "deadline": (
+                        inference_deadline.isoformat()
+                        if inference_deadline is not None
+                        else None
+                    ),
+                },
+            )
+        backend = _build_backend(factory, deployment_record, timeout_seconds)
         inference = backend.run(model_request)
     except ModelRequestError as exc:
         return _record_failure(
-            state,
             config,
             metadata,
             compat.effective_mode,
@@ -276,7 +310,6 @@ def _full_score(
         )
     except InferenceConfigError as exc:
         return _record_failure(
-            state,
             config,
             metadata,
             compat.effective_mode,
@@ -285,7 +318,6 @@ def _full_score(
         )
     except InferenceError as exc:
         return _record_failure(
-            state,
             config,
             metadata,
             compat.effective_mode,
@@ -316,12 +348,59 @@ def _full_score(
     )
     persist_verification_hashes(config, metadata.input_package_hash, verification.hashes)
     outcome = _scored_outcome(compat.effective_mode, verification.hashes, verification)
-    state.record_score(config.network, metadata, outcome)
+    with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
+        state.record_score(config.network, metadata, outcome)
     return _scored_result(config.network, metadata, outcome, verification.compared)
 
 
+def _inference_deadline(
+    metadata: RoundMetadata,
+    existing: RoundStateRecord | None,
+) -> datetime | None:
+    candidates = [
+        existing.commit_closes_at if existing is not None else None,
+        metadata.output_publication_commit_closes_at,
+        metadata.commit_closes_at,
+    ]
+    for value in candidates:
+        parsed = _parse_datetime(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _effective_inference_timeout_seconds(
+    deadline: datetime | None,
+    now_fn: Callable[[], datetime],
+) -> float | None:
+    if deadline is None:
+        return DEFAULT_INFERENCE_TIMEOUT_SECONDS
+
+    remaining = (
+        deadline - now_fn()
+    ).total_seconds() - INFERENCE_DEADLINE_SAFETY_MARGIN_SECONDS
+    if remaining < MIN_INFERENCE_READ_TIMEOUT_SECONDS:
+        return None
+    return min(DEFAULT_INFERENCE_TIMEOUT_SECONDS, remaining)
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _record_failure(
-    state: SidecarState,
     config: SidecarConfig,
     metadata: RoundMetadata,
     backend_mode: str | None,
@@ -334,11 +413,26 @@ def _record_failure(
         error_category=category.value,
         error_details=details,
     )
-    state.record_score(config.network, metadata, outcome)
+    with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
+        state.record_score(config.network, metadata, outcome)
     return _outcome_result(config.network, metadata, outcome)
 
 
-def _default_backend_factory(deployment_record: dict[str, Any]) -> InferenceBackend:
+def _build_backend(
+    factory: Callable[[dict[str, Any]], InferenceBackend] | None,
+    deployment_record: dict[str, Any],
+    timeout_seconds: float,
+) -> InferenceBackend:
+    if factory is not None:
+        return factory(deployment_record)
+    return _default_backend_factory(deployment_record, timeout_seconds=timeout_seconds)
+
+
+def _default_backend_factory(
+    deployment_record: dict[str, Any],
+    *,
+    timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+) -> InferenceBackend:
     mode = deployment_record.get("mode")
     endpoint_url = deployment_record.get("endpoint_url")
     if not isinstance(endpoint_url, str) or not endpoint_url.strip():
@@ -346,9 +440,13 @@ def _default_backend_factory(deployment_record: dict[str, Any]) -> InferenceBack
             "deployment record is missing a valid endpoint_url; redeploy"
         )
     if mode == DEPLOYMENT_MODE_MODAL:
-        return ModalBackend.from_environment(endpoint_url)
+        return ModalBackend.from_environment(
+            endpoint_url, timeout_seconds=timeout_seconds
+        )
     if mode == DEPLOYMENT_MODE_LOCAL:
-        return LocalSglangBackend.from_environment(endpoint_url)
+        return LocalSglangBackend.from_environment(
+            endpoint_url, timeout_seconds=timeout_seconds
+        )
     raise DeploymentError(
         f"deployment record mode {mode!r} is not a supported inference backend"
     )

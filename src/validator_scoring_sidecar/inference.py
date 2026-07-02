@@ -39,7 +39,10 @@ ENV_LOCAL_ENDPOINT_URL = "POSTFIAT_SIDECAR_LOCAL_ENDPOINT_URL"
 MODEL_REQUEST_RELATIVE_PATH = "inputs/model_request.json"
 BACKEND_MODE_MODAL = "modal"
 BACKEND_MODE_LOCAL = "local"
-DEFAULT_INFERENCE_TIMEOUT_SECONDS = 2100.0
+DEFAULT_INFERENCE_TIMEOUT_SECONDS = 180.0
+DEFAULT_INFERENCE_CONNECT_TIMEOUT_SECONDS = 10.0
+DEFAULT_INFERENCE_WRITE_TIMEOUT_SECONDS = 10.0
+DEFAULT_INFERENCE_POOL_TIMEOUT_SECONDS = 5.0
 DEFAULT_LOCAL_ENDPOINT_URL = "http://localhost:8000/v1"
 PROXY_AUTH_KEY_HEADER = "Modal-Key"
 PROXY_AUTH_SECRET_HEADER = "Modal-Secret"
@@ -106,6 +109,22 @@ class InferenceBackend(Protocol):
     def close(self) -> None: ...
 
 
+def inference_timeout(read_timeout_seconds: float | None = None) -> httpx.Timeout:
+    """Build the explicit timeout used for one inference request."""
+
+    read_timeout = (
+        DEFAULT_INFERENCE_TIMEOUT_SECONDS
+        if read_timeout_seconds is None
+        else max(float(read_timeout_seconds), 0.001)
+    )
+    return httpx.Timeout(
+        connect=DEFAULT_INFERENCE_CONNECT_TIMEOUT_SECONDS,
+        read=read_timeout,
+        write=DEFAULT_INFERENCE_WRITE_TIMEOUT_SECONDS,
+        pool=DEFAULT_INFERENCE_POOL_TIMEOUT_SECONDS,
+    )
+
+
 def load_model_request(package_path: Path) -> dict[str, Any]:
     """Load the frozen ``inputs/model_request.json`` from a verified package."""
 
@@ -151,7 +170,7 @@ class _ChatCompletionsBackend:
         # foundation's OpenAI-SDK client follows it by default and this client
         # must match, or every cold-start round fails with INFERENCE_ERROR 303.
         self._http = http_client or httpx.Client(
-            timeout=timeout_seconds, follow_redirects=True
+            timeout=inference_timeout(timeout_seconds), follow_redirects=True
         )
         self._owns_client = http_client is None
 

@@ -1,4 +1,10 @@
 import json
+import os
+import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -192,6 +198,23 @@ class FakeBackend:
         self.closed = True
 
 
+class BlockingBackend(FakeBackend):
+    def __init__(self, entered: threading.Event, release: threading.Event):
+        super().__init__()
+        self.entered = entered
+        self.release = release
+
+    def run(self, model_request):
+        self.run_count += 1
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise AssertionError("blocking backend was not released")
+        return InferenceResult(
+            content=self.content,
+            response_payload={"choices": [{"message": {"content": self.content}}]},
+        )
+
+
 def _make_package_fetcher(manifest):
     def fetcher(metadata, config, client, *, source, force):
         local_path = config.data_dir / "packages" / metadata.input_package_hash
@@ -326,6 +349,88 @@ def test_full_score_inference_failure_records_scoring_failed(tmp_path):
     assert result.sidecar_state == STATE_SCORING_FAILED
     assert result.error_category == FailureCategory.INFERENCE_TIMEOUT.value
     assert backend.closed is True
+
+
+def test_full_score_releases_sidecar_lock_during_inference(tmp_path):
+    config = _setup(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    backend = BlockingBackend(entered, release)
+
+    env = dict(os.environ)
+    src_path = os.path.abspath("src")
+    env["PYTHONPATH"] = (
+        src_path
+        if not env.get("PYTHONPATH")
+        else os.pathsep.join([src_path, env["PYTHONPATH"]])
+    )
+    lock_probe = """
+import sys
+from pathlib import Path
+from validator_scoring_sidecar.sync import SidecarLock
+
+with SidecarLock(Path(sys.argv[1])):
+    print("acquired")
+"""
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            score_round,
+            config,
+            FakeClient(),
+            round_id=123,
+            backend_factory=lambda record: backend,
+            foundation_hash_fetcher=lambda client, metadata, cfg: dict(EXPECTED_HASHES),
+            package_fetcher=_make_package_fetcher(_manifest()),
+        )
+        try:
+            assert entered.wait(timeout=5)
+            probe = subprocess.run(
+                [sys.executable, "-c", lock_probe, str(tmp_path)],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                env=env,
+            )
+            assert probe.returncode == 0, probe.stderr
+            assert "acquired" in probe.stdout
+        finally:
+            release.set()
+
+        result = future.result(timeout=5)
+
+    assert result.status == SCORE_STATUS_SCORED
+    assert backend.closed is True
+
+
+def test_full_score_abandons_when_round_deadline_budget_elapsed(tmp_path):
+    deadline = (
+        datetime.now(timezone.utc) + timedelta(seconds=5)
+    ).isoformat()
+    config = _setup(tmp_path)
+    backend = FakeBackend()
+
+    result = score_round(
+        config,
+        FakeClient(
+            payload=_round_payload(output_publication_commit_closes_at=deadline)
+        ),
+        round_id=123,
+        backend_factory=lambda record: backend,
+        foundation_hash_fetcher=lambda *args: None,
+        package_fetcher=_make_package_fetcher(_manifest()),
+        now_fn=lambda: datetime.now(timezone.utc),
+    )
+
+    assert result.status == SCORE_STATUS_SCORING_FAILED
+    assert result.error_category == FailureCategory.INFERENCE_TIMEOUT.value
+    assert backend.run_count == 0
+    assert backend.closed is False
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round("testnet", 123)
+    assert record.sidecar_state == STATE_SCORING_FAILED
+    assert "round_deadline_elapsed" in record.error_details
 
 
 def test_override_round_is_skipped_without_inference(tmp_path):
