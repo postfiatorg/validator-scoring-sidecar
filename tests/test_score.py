@@ -18,12 +18,15 @@ from validator_scoring_sidecar.inference import (
 )
 from validator_scoring_sidecar.input_package import FetchedInputPackage
 from validator_scoring_sidecar.score import (
+    INFERENCE_DEADLINE_SAFETY_MARGIN_SECONDS,
+    MIN_INFERENCE_READ_TIMEOUT_SECONDS,
     SCORE_STATUS_ALREADY_SCORED,
     SCORE_STATUS_COMPARISON_PENDING,
     SCORE_STATUS_DIVERGENT,
     SCORE_STATUS_SCORED,
     SCORE_STATUS_SCORING_FAILED,
     SCORE_STATUS_SKIPPED,
+    _effective_inference_timeout_seconds,
     score_round,
 )
 from validator_scoring_sidecar.scoring import (
@@ -401,6 +404,41 @@ with SidecarLock(Path(sys.argv[1])):
 
     assert result.status == SCORE_STATUS_SCORED
     assert backend.closed is True
+
+
+def _fixed_now():
+    return datetime(2026, 7, 2, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_effective_timeout_uses_configured_bound_without_deadline():
+    # No commit deadline → the configured upper bound is used as-is.
+    assert _effective_inference_timeout_seconds(None, _fixed_now, 600.0) == 600.0
+    assert _effective_inference_timeout_seconds(None, _fixed_now, 180.0) == 180.0
+
+
+def test_effective_timeout_deadline_cap_beats_large_configured_bound():
+    # A far-off configured bound must not override a near commit deadline.
+    now = datetime(2026, 7, 2, 12, 0, 0, tzinfo=timezone.utc)
+    deadline = now + timedelta(seconds=200)
+    result = _effective_inference_timeout_seconds(deadline, lambda: now, 600.0)
+    assert result == 200.0 - INFERENCE_DEADLINE_SAFETY_MARGIN_SECONDS
+
+
+def test_effective_timeout_configured_bound_wins_when_smaller_than_remaining():
+    now = datetime(2026, 7, 2, 12, 0, 0, tzinfo=timezone.utc)
+    deadline = now + timedelta(seconds=10_000)
+    result = _effective_inference_timeout_seconds(deadline, lambda: now, 120.0)
+    assert result == 120.0
+
+
+def test_effective_timeout_skips_when_too_little_time_remains():
+    now = datetime(2026, 7, 2, 12, 0, 0, tzinfo=timezone.utc)
+    deadline = now + timedelta(
+        seconds=INFERENCE_DEADLINE_SAFETY_MARGIN_SECONDS
+        + MIN_INFERENCE_READ_TIMEOUT_SECONDS
+        - 1
+    )
+    assert _effective_inference_timeout_seconds(deadline, lambda: now, 600.0) is None
 
 
 def test_full_score_abandons_when_round_deadline_budget_elapsed(tmp_path):

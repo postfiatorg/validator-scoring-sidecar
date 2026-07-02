@@ -14,16 +14,57 @@ log() {
 # run the full on-chain commit-reveal participation pass at the chain-poll cadence
 # (requires the participation prerequisites; the command fails fast otherwise).
 mode="${POSTFIAT_SIDECAR_MODE:-sync}"
+
+# Watchdog budgets, in seconds. DEFAULT_INFERENCE_TIMEOUT must stay in sync with
+# DEFAULT_INFERENCE_TIMEOUT_SECONDS in src/validator_scoring_sidecar/config.py —
+# it is only a fallback for sizing the watchdog when the env var is unset.
+DEFAULT_INFERENCE_TIMEOUT=180
+WATCHDOG_HEADROOM=60           # slack the participate watchdog keeps over one inference
+PARTICIPATE_PASS_BUDGET=180    # fetch/verify/submit work wrapped around the inference
+PARTICIPATE_WATCHDOG_FLOOR=360 # never derive a participate watchdog below this
+SYNC_WATCHDOG=900              # verify-only default; a first sync fetches a full package
+
+# The inference read timeout (POSTFIAT_SIDECAR_INFERENCE_TIMEOUT_SECONDS) bounds
+# one scoring call. The participation watchdog must stay large enough to contain
+# a full inference plus the work around it, so it is derived from — and validated
+# against — that bound. The Python config loader is the authority on the actual
+# timeout; here we only need a safe integer to size the watchdog. Trim whitespace
+# (a common .env artifact), then take the integer part. A set-but-unparseable
+# value fails closed rather than silently shrinking the budget, which would let
+# the watchdog fire mid-inference.
+raw_inference_timeout="${POSTFIAT_SIDECAR_INFERENCE_TIMEOUT_SECONDS:-$DEFAULT_INFERENCE_TIMEOUT}"
+inference_timeout_int="$(printf '%s' "$raw_inference_timeout" | tr -d ' \t\n\r')"
+inference_timeout_int="${inference_timeout_int%%.*}"
+case "$inference_timeout_int" in
+    ''|*[!0-9]*)
+        log "POSTFIAT_SIDECAR_INFERENCE_TIMEOUT_SECONDS must be a positive integer number of seconds, got '${raw_inference_timeout}'"
+        exit 2
+        ;;
+esac
+if [ "$inference_timeout_int" -le 0 ]; then
+    log "POSTFIAT_SIDECAR_INFERENCE_TIMEOUT_SECONDS must be greater than zero, got '${raw_inference_timeout}'"
+    exit 2
+fi
+watchdog_min=$((inference_timeout_int + WATCHDOG_HEADROOM))
+
 case "$mode" in
     sync)
         command="sync"
         interval="${POSTFIAT_SIDECAR_SYNC_INTERVAL_SECONDS:-3600}"
-        command_timeout="${POSTFIAT_SIDECAR_COMMAND_TIMEOUT_SECONDS:-}"
+        # Verify-only mode still needs a watchdog: a stuck package download would
+        # otherwise hang the container indefinitely.
+        command_timeout="${POSTFIAT_SIDECAR_COMMAND_TIMEOUT_SECONDS:-$SYNC_WATCHDOG}"
         ;;
     participate)
         command="participate"
         interval="${POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS:-60}"
-        command_timeout="${POSTFIAT_SIDECAR_COMMAND_TIMEOUT_SECONDS:-360}"
+        # Derive the default so it always contains a full inference plus the work
+        # around it, and never drops below the floor.
+        default_participate_timeout=$((inference_timeout_int + PARTICIPATE_PASS_BUDGET))
+        if [ "$default_participate_timeout" -lt "$PARTICIPATE_WATCHDOG_FLOOR" ]; then
+            default_participate_timeout="$PARTICIPATE_WATCHDOG_FLOOR"
+        fi
+        command_timeout="${POSTFIAT_SIDECAR_COMMAND_TIMEOUT_SECONDS:-$default_participate_timeout}"
         ;;
     *)
         log "POSTFIAT_SIDECAR_MODE must be 'sync' or 'participate', got '${mode}'"
@@ -48,6 +89,14 @@ case "$command_timeout" in
 esac
 if [ -n "$command_timeout" ] && [ "$command_timeout" -le 0 ]; then
     log "command timeout must be greater than zero, got '${command_timeout}'"
+    exit 2
+fi
+
+# The participation watchdog must never be able to fire mid-inference: reject a
+# command timeout that leaves no room for a full inference plus head-room.
+if [ "$mode" = "participate" ] && [ -n "$command_timeout" ] \
+    && [ "$command_timeout" -le "$watchdog_min" ]; then
+    log "command timeout ${command_timeout}s must exceed the inference timeout ${inference_timeout_int}s plus head-room (> ${watchdog_min}s)"
     exit 2
 fi
 
