@@ -478,17 +478,30 @@ class SidecarState:
             ),
         )
 
-    def record_commit(
+    def record_commit_pending(
         self,
         network: str,
         metadata: RoundMetadata,
-        outcome: CommitOutcome,
+        *,
+        validator_master_key: str,
+        salt: str,
+        commitment_hash: str,
+        commit_opens_at: str,
+        commit_closes_at: str,
+        reveal_opens_at: str,
+        reveal_closes_at: str,
     ) -> None:
-        """Advance a scored round to ``COMMITTED`` and persist its commit.
+        """Persist the reveal secret before the commit is broadcast on chain.
 
-        Writes the commit columns and the committed ``commitment_hash`` (needed
-        by the reveal integrity check), and moves the round to ``COMMITTED``. The
-        scored output hashes set by ``record_score`` are left untouched.
+        Writes the salt, commitment hash, validator identity, and windows while
+        leaving the round in its current (``SCORED``) state with no
+        ``commit_tx_hash``. This is the durability half of persist-then-submit:
+        the salt is the only way to open the commitment, so it must be on disk
+        before the transaction is broadcast — a process kill after broadcast can
+        then still reveal, because the salt survives and the on-chain commit is
+        recovered by the idempotency scan on a later pass. The round stays
+        eligible for ``get_rounds_pending_commit`` (still ``SCORED``, still no
+        tx hash) so an interrupted submit is retried and reuses this salt.
         """
 
         now = _utc_now()
@@ -497,20 +510,13 @@ class SidecarState:
             INSERT INTO sidecar_rounds (
                 network, round_id, round_number, scoring_status, sidecar_state,
                 input_package_cid, input_package_hash, input_frozen_at,
-                salt, commit_tx_hash, validator_master_key, commitment_hash,
+                salt, validator_master_key, commitment_hash,
                 commit_opens_at, commit_closes_at, reveal_opens_at,
                 reveal_closes_at, discovered_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(network, round_id) DO UPDATE SET
-                round_number = excluded.round_number,
-                scoring_status = excluded.scoring_status,
-                sidecar_state = excluded.sidecar_state,
-                input_package_cid = excluded.input_package_cid,
-                input_package_hash = excluded.input_package_hash,
-                input_frozen_at = excluded.input_frozen_at,
                 salt = excluded.salt,
-                commit_tx_hash = excluded.commit_tx_hash,
                 validator_master_key = excluded.validator_master_key,
                 commitment_hash = excluded.commitment_hash,
                 commit_opens_at = excluded.commit_opens_at,
@@ -524,21 +530,94 @@ class SidecarState:
                 metadata.round_id,
                 metadata.round_number,
                 metadata.status,
+                STATE_SCORED,
+                metadata.input_package_cid,
+                metadata.input_package_hash,
+                metadata.input_frozen_at,
+                salt,
+                validator_master_key,
+                commitment_hash,
+                commit_opens_at,
+                commit_closes_at,
+                reveal_opens_at,
+                reveal_closes_at,
+                now,
+                now,
+            ),
+        )
+
+    def record_commit_submitted(
+        self,
+        network: str,
+        metadata: RoundMetadata,
+        *,
+        commit_tx_hash: str,
+    ) -> None:
+        """Advance a pending commit to ``COMMITTED`` once its tx hash is known.
+
+        The submit half of persist-then-submit: the salt, commitment hash, and
+        windows were already persisted by ``record_commit_pending``, so this only
+        attaches the broadcast (or idempotency-recovered) transaction hash and
+        flips the lifecycle state. Reached both after a fresh broadcast and when
+        a later pass finds an already-authored commit on chain.
+        """
+
+        now = _utc_now()
+        self._execute_write(
+            """
+            INSERT INTO sidecar_rounds (
+                network, round_id, round_number, scoring_status, sidecar_state,
+                input_package_cid, input_package_hash, input_frozen_at,
+                commit_tx_hash, discovered_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(network, round_id) DO UPDATE SET
+                sidecar_state = excluded.sidecar_state,
+                commit_tx_hash = excluded.commit_tx_hash,
+                updated_at = excluded.updated_at
+            """,
+            (
+                network,
+                metadata.round_id,
+                metadata.round_number,
+                metadata.status,
                 STATE_COMMITTED,
                 metadata.input_package_cid,
                 metadata.input_package_hash,
                 metadata.input_frozen_at,
-                outcome.salt,
-                outcome.commit_tx_hash,
-                outcome.validator_master_key,
-                outcome.commitment_hash,
-                outcome.commit_opens_at,
-                outcome.commit_closes_at,
-                outcome.reveal_opens_at,
-                outcome.reveal_closes_at,
+                commit_tx_hash,
                 now,
                 now,
             ),
+        )
+
+    def record_commit(
+        self,
+        network: str,
+        metadata: RoundMetadata,
+        outcome: CommitOutcome,
+    ) -> None:
+        """Persist a fully-known commit atomically (pending secret + tx hash).
+
+        Convenience wrapper over ``record_commit_pending`` followed by
+        ``record_commit_submitted`` for callers holding a complete
+        ``CommitOutcome`` — chiefly test seeding. The live commit path uses the
+        two steps separately so the salt is durable before broadcast.
+        """
+
+        self.record_commit_pending(
+            network,
+            metadata,
+            validator_master_key=outcome.validator_master_key,
+            salt=outcome.salt,
+            commitment_hash=outcome.commitment_hash,
+            commit_opens_at=outcome.commit_opens_at,
+            commit_closes_at=outcome.commit_closes_at,
+            reveal_opens_at=outcome.reveal_opens_at,
+            reveal_closes_at=outcome.reveal_closes_at,
+        )
+        self.record_commit_submitted(
+            network, metadata, commit_tx_hash=outcome.commit_tx_hash
         )
 
     def record_announcement_windows(
@@ -556,12 +635,14 @@ class SidecarState:
         Stored when the foundation's on-chain announcement is first decoded and
         verified, so the state-driven commit can act on the round later
         regardless of the chain cursor. Only the window columns are written, and
-        only until the round commits: an existing round's lifecycle state,
-        scoring outcome, and fetch columns are left untouched, and an
-        already-committed round's windows are left frozen because the reveal step
-        enforces its reveal window from them. A round not yet in the store is
-        inserted at ``DISCOVERED`` so its windows are not lost before it is
-        scored.
+        only until the round has a commit in flight: an existing round's
+        lifecycle state, scoring outcome, and fetch columns are left untouched,
+        and the windows are frozen once a salt is persisted (``record_commit_pending``)
+        or the commit lands, because from that point the commitment is bound to
+        those windows and the reveal enforces its window from them — a later
+        re-announcement must not move them out from under an in-flight commit. A
+        round not yet in the store is inserted at ``DISCOVERED`` so its windows
+        are not lost before it is scored.
         """
 
         now = _utc_now()
@@ -580,7 +661,7 @@ class SidecarState:
                 reveal_opens_at = excluded.reveal_opens_at,
                 reveal_closes_at = excluded.reveal_closes_at,
                 updated_at = excluded.updated_at
-            WHERE commit_tx_hash IS NULL
+            WHERE commit_tx_hash IS NULL AND salt IS NULL
             """,
             (
                 network,
