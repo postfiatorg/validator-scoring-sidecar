@@ -21,6 +21,7 @@ from validator_scoring_sidecar.config import load_config
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.scoring import commit_reveal
 from validator_scoring_sidecar.state import (
+    STATE_COMMITTED,
     STATE_SCORED,
     STATE_SKIPPED,
     ScoreOutcome,
@@ -158,6 +159,256 @@ def _in_window():
     return datetime(2026, 5, 25, 0, 15, tzinfo=timezone.utc)
 
 
+def _seed_scored(state, metadata):
+    state.record_score(
+        NETWORK,
+        metadata,
+        ScoreOutcome(
+            sidecar_state=STATE_SCORED,
+            backend_mode="modal",
+            model_response_hash=OUTPUT_HASHES[HASH_MODEL_RESPONSE],
+            validator_scores_hash=OUTPUT_HASHES[HASH_VALIDATOR_SCORES],
+            selected_unl_hash=OUTPUT_HASHES[HASH_SELECTED_UNL],
+        ),
+    )
+
+
+class KillAfterBroadcastRpc(FakeRpc):
+    """The commit reaches the ledger, then the process is killed before its tx
+    hash is persisted — the exact crash window the pass watchdog opened live.
+    ``submit_memo`` records the landed transaction (so a later account_tx scan
+    finds it) and then raises to model the abrupt termination."""
+
+    def submit_memo(self, *, wallet_seed, destination, memo_type, memo_data):
+        self.transactions.append(
+            {
+                "tx_json": {
+                    "Account": "rRelay",
+                    "Memos": [
+                        {
+                            "Memo": {
+                                "MemoType": memo_type.encode("utf-8").hex(),
+                                "MemoData": memo_data.encode("utf-8").hex(),
+                            }
+                        }
+                    ],
+                },
+                "hash": "LANDEDTX",
+            }
+        )
+        raise RuntimeError("process killed by watchdog before persist")
+
+
+def test_commit_persists_salt_before_broadcast_surviving_crash(tmp_path):
+    # A kill between broadcast and persist must not lose the reveal secret.
+    rpc = KillAfterBroadcastRpc(close_time=_in_window())
+    metadata = _metadata()
+    with SidecarState(tmp_path) as state:
+        _seed_scored(state, metadata)
+        with pytest.raises(RuntimeError):
+            submit_commit(
+                _announcement(), OUTPUT_HASHES, _config(tmp_path), metadata,
+                rpc_client=rpc, signer=FakeSigner(), state=state,
+                foundation_publisher_address=PUBLISHER,
+            )
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    # Salt + commitment are durable even though the tx hash never persisted.
+    assert record.salt is not None and len(record.salt) == 64
+    assert record.commitment_hash is not None
+    assert record.commit_tx_hash is None
+    assert record.sidecar_state == STATE_SCORED  # still pending commit → retried
+    assert len(rpc.transactions) == 1  # the commit did reach the ledger
+
+
+def test_commit_recovers_landed_commit_on_later_pass(tmp_path):
+    signer = FakeSigner()
+    announcement = _announcement()
+    metadata = _metadata()
+
+    kill_rpc = KillAfterBroadcastRpc(close_time=_in_window())
+    with SidecarState(tmp_path) as state:
+        _seed_scored(state, metadata)
+        with pytest.raises(RuntimeError):
+            submit_commit(
+                announcement, OUTPUT_HASHES, _config(tmp_path), metadata,
+                rpc_client=kill_rpc, signer=signer, state=state,
+                foundation_publisher_address=PUBLISHER,
+            )
+        salt_before = state.get_round(NETWORK, ROUND_ID).salt
+
+    # Next pass: the landed commit is visible on chain; recovery attaches its
+    # hash and advances to COMMITTED with the salt preserved, no re-broadcast.
+    recover_rpc = FakeRpc(close_time=_in_window(), transactions=kill_rpc.transactions)
+    with SidecarState(tmp_path) as state:
+        result = submit_commit(
+            announcement, OUTPUT_HASHES, _config(tmp_path), metadata,
+            rpc_client=recover_rpc, signer=signer, state=state,
+            foundation_publisher_address=PUBLISHER,
+        )
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert result.status == COMMIT_STATUS_ALREADY_COMMITTED
+    assert result.commit_tx_hash == "LANDEDTX"
+    assert recover_rpc.submitted == []  # no duplicate broadcast
+    assert record.sidecar_state == STATE_COMMITTED
+    assert record.commit_tx_hash == "LANDEDTX"
+    assert record.salt == salt_before  # preserved → the reveal can be built
+
+
+def test_commit_retry_reuses_persisted_salt_when_broadcast_did_not_land(tmp_path):
+    signer = FakeSigner()
+    announcement = _announcement()
+    metadata = _metadata()
+
+    # Pass 1: pending salt persisted, but the broadcast fails before landing.
+    fail_rpc = FakeRpc(
+        close_time=_in_window(), submit_error=RuntimeError("network drop")
+    )
+    with SidecarState(tmp_path) as state:
+        _seed_scored(state, metadata)
+        with pytest.raises(RuntimeError):
+            submit_commit(
+                announcement, OUTPUT_HASHES, _config(tmp_path), metadata,
+                rpc_client=fail_rpc, signer=signer, state=state,
+                foundation_publisher_address=PUBLISHER,
+            )
+        row = state.get_round(NETWORK, ROUND_ID)
+        salt_before, commitment_before = row.salt, row.commitment_hash
+    assert fail_rpc.submitted == []  # never landed
+
+    # Pass 2: nothing on chain; retry reuses the salt so the rebuilt commitment
+    # is byte-identical to what any prior attempt would have produced.
+    ok_rpc = FakeRpc(close_time=_in_window())
+    with SidecarState(tmp_path) as state:
+        result = submit_commit(
+            announcement, OUTPUT_HASHES, _config(tmp_path), metadata,
+            rpc_client=ok_rpc, signer=signer, state=state,
+            foundation_publisher_address=PUBLISHER,
+        )
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert result.status == COMMIT_STATUS_SUBMITTED
+    assert record.salt == salt_before
+    assert record.commitment_hash == commitment_before
+    assert record.sidecar_state == STATE_COMMITTED
+    submitted = commit_reveal.validate_commit_payload(
+        json.loads(ok_rpc.submitted[0]["memo_data"])
+    )
+    assert submitted.commitment_hash == commitment_before
+    assert commit_reveal.verify_commit_signature(submitted)
+
+
+def _after_window():
+    return datetime(2026, 5, 25, 0, 45, tzinfo=timezone.utc)
+
+
+def test_commit_recovers_landed_commit_after_window_closed(tmp_path):
+    # The incident shape: the pass that broadcast was killed late in the window,
+    # and the recovery pass only runs after the commit window has closed. The
+    # landed commit must still be recovered — the window-closed gate must not
+    # pre-empt the recovery scan.
+    signer = FakeSigner()
+    announcement = _announcement()
+    metadata = _metadata()
+
+    kill_rpc = KillAfterBroadcastRpc(close_time=_in_window())
+    with SidecarState(tmp_path) as state:
+        _seed_scored(state, metadata)
+        with pytest.raises(RuntimeError):
+            submit_commit(
+                announcement, OUTPUT_HASHES, _config(tmp_path), metadata,
+                rpc_client=kill_rpc, signer=signer, state=state,
+                foundation_publisher_address=PUBLISHER,
+            )
+
+    recover_rpc = FakeRpc(close_time=_after_window(), transactions=kill_rpc.transactions)
+    with SidecarState(tmp_path) as state:
+        result = submit_commit(
+            announcement, OUTPUT_HASHES, _config(tmp_path), metadata,
+            rpc_client=recover_rpc, signer=signer, state=state,
+            foundation_publisher_address=PUBLISHER,
+        )
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert result.status == COMMIT_STATUS_ALREADY_COMMITTED
+    assert result.commit_tx_hash == "LANDEDTX"
+    assert record.sidecar_state == STATE_COMMITTED
+    assert record.commit_tx_hash == "LANDEDTX"
+
+
+def test_commit_recovery_skips_round_without_local_salt(tmp_path):
+    # A pre-fix orphan (or a cross-host commit): the commit is on chain but no
+    # salt was ever persisted locally. Advancing to COMMITTED would create a
+    # round that can never reveal, so recovery must leave it untouched.
+    signer = FakeSigner()
+    announcement = _announcement()
+    metadata = _metadata()
+    onchain = {
+        "tx_json": {"Account": "rRelay", "Memos": [_commit_memo(announcement, signer)]},
+        "hash": "ORPHANTX",
+    }
+    rpc = FakeRpc(close_time=_in_window(), transactions=[onchain])
+    with SidecarState(tmp_path) as state:
+        _seed_scored(state, metadata)  # SCORED, but no salt persisted
+        result = submit_commit(
+            announcement, OUTPUT_HASHES, _config(tmp_path), metadata,
+            rpc_client=rpc, signer=signer, state=state,
+            foundation_publisher_address=PUBLISHER,
+        )
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert result.status == COMMIT_STATUS_ALREADY_COMMITTED
+    assert result.commit_tx_hash == "ORPHANTX"
+    # Not advanced: no salt means it could never reveal, so it must not become a
+    # COMMITTED round that loops the reveal integrity guard forever.
+    assert record.sidecar_state == STATE_SCORED
+    assert record.commit_tx_hash is None
+    assert rpc.submitted == []
+
+
+def test_commit_recovery_rejects_commitment_mismatch(tmp_path):
+    # Local pending state holds salt B (commitment B), but the commit found on
+    # chain was authored with a different salt A (commitment A). Recording it
+    # would make the sidecar reveal H(B) against an on-chain H(A) the foundation
+    # rejects, so recovery must refuse to advance.
+    signer = FakeSigner()
+    announcement = _announcement()
+    metadata = _metadata()
+    onchain_A = {
+        "tx_json": {
+            "Account": "rRelay",
+            "Memos": [_commit_memo(announcement, signer, salt="a" * 64)],
+        },
+        "hash": "SALTA_TX",
+    }
+    rpc = FakeRpc(close_time=_in_window(), transactions=[onchain_A])
+    with SidecarState(tmp_path) as state:
+        _seed_scored(state, metadata)
+        # Persist a DIFFERENT local pending salt B.
+        state.record_commit_pending(
+            NETWORK, metadata,
+            validator_master_key=signer.master_key,
+            salt="b" * 64,
+            commitment_hash="deadbeef" * 8,
+            commit_opens_at="2026-05-25T00:00:00+00:00",
+            commit_closes_at="2026-05-25T00:30:00+00:00",
+            reveal_opens_at="2026-05-25T00:30:00+00:00",
+            reveal_closes_at="2026-05-25T01:00:00+00:00",
+        )
+        result = submit_commit(
+            announcement, OUTPUT_HASHES, _config(tmp_path), metadata,
+            rpc_client=rpc, signer=signer, state=state,
+            foundation_publisher_address=PUBLISHER,
+        )
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert result.status == COMMIT_STATUS_ALREADY_COMMITTED
+    # Not advanced: local commitment B != on-chain commitment A.
+    assert record.sidecar_state == STATE_SCORED
+    assert record.commit_tx_hash is None
+
+
 def test_submit_commit_success(tmp_path):
     rpc = FakeRpc(close_time=_in_window())
     with SidecarState(tmp_path) as state:
@@ -219,17 +470,7 @@ def test_submit_commit_low_balance_marks_opt_out_and_preserves_scores(tmp_path):
     )
     metadata = _metadata()
     with SidecarState(tmp_path) as state:
-        state.record_score(
-            NETWORK,
-            metadata,
-            ScoreOutcome(
-                sidecar_state=STATE_SCORED,
-                backend_mode="modal",
-                model_response_hash=OUTPUT_HASHES[HASH_MODEL_RESPONSE],
-                validator_scores_hash=OUTPUT_HASHES[HASH_VALIDATOR_SCORES],
-                selected_unl_hash=OUTPUT_HASHES[HASH_SELECTED_UNL],
-            ),
-        )
+        _seed_scored(state, metadata)
         result = submit_commit(
             _announcement(), OUTPUT_HASHES, _config(tmp_path), metadata,
             rpc_client=rpc, signer=FakeSigner(), state=state,

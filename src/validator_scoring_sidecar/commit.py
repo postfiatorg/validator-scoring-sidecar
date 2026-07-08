@@ -24,16 +24,13 @@ from validator_scoring_sidecar.chain import (
     ChainWatcherError,
     PftlInsufficientFundsError,
     PftlRpcClient,
-    find_authored_memo_tx_hash,
+    find_authored_memo,
 )
 from validator_scoring_sidecar.config import SidecarConfig
 from validator_scoring_sidecar.failure import FailureCategory
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.scoring import commit_reveal
-from validator_scoring_sidecar.state import (
-    CommitOutcome,
-    SidecarState,
-)
+from validator_scoring_sidecar.state import RoundStateRecord, SidecarState
 from validator_scoring_sidecar.verification import (
     HASH_MODEL_RESPONSE,
     HASH_SELECTED_UNL,
@@ -142,6 +139,34 @@ class CommitResult:
     commit_tx_hash: str | None = None
 
 
+def _recoverable(
+    existing: RoundStateRecord | None, onchain_commitment_hash: str
+) -> bool:
+    """Whether a found on-chain commit can be safely recorded as ``COMMITTED``.
+
+    True only when local state can still build the matching reveal: the salt,
+    commitment, validator identity, and both windows are persisted, and the
+    local commitment equals the one accepted on chain. A salt-less pre-fix round
+    or a commitment mismatch (a divergent prior salt) must not advance — doing so
+    would strand the round ``COMMITTED`` but unable to reveal, looping the reveal
+    integrity guard every pass.
+    """
+
+    if existing is None:
+        return False
+    if not (
+        existing.salt
+        and existing.commitment_hash
+        and existing.validator_master_key
+        and existing.commit_opens_at
+        and existing.commit_closes_at
+        and existing.reveal_opens_at
+        and existing.reveal_closes_at
+    ):
+        return False
+    return existing.commitment_hash == onchain_commitment_hash
+
+
 def submit_commit(
     announcement: commit_reveal.RoundAnnouncement,
     output_hashes: dict[str, str],
@@ -176,21 +201,20 @@ def submit_commit(
             existing.commit_tx_hash,
         )
 
-    missing = [name for name in _REQUIRED_OUTPUT_HASHES if not output_hashes.get(name)]
-    if missing:
-        raise CommitError(
-            f"missing output hashes required to commit: {', '.join(missing)}"
-        )
-
     master_key = signer.master_key
 
     close_time = rpc_client.latest_validated_ledger_close_time()
     if close_time < announcement.commit_opens_at:
+        # Nothing could be committed before the window opens, so there is no
+        # prior broadcast to recover — return without scanning the chain.
         return CommitResult(COMMIT_STATUS_WINDOW_NOT_OPEN, announcement.round_number)
-    if close_time >= announcement.commit_closes_at:
-        return CommitResult(COMMIT_STATUS_WINDOW_CLOSED, announcement.round_number)
 
-    onchain_hash = find_authored_memo_tx_hash(
+    # Recovery scan runs BEFORE the window-closed gate: a commit that landed on
+    # chain before a crash (the pass watchdog killing a slow pass after broadcast
+    # but before persist) must still be recovered on a later pass even if that
+    # pass runs after the commit window has closed — otherwise the durable salt
+    # is useless and the round forfeits its reveal.
+    onchain = find_authored_memo(
         rpc_client,
         account=foundation_publisher_address,
         memo_type=commit_reveal.VALIDATOR_COMMIT_TYPE,
@@ -201,12 +225,36 @@ def submit_commit(
         validator_master_key=master_key,
         limit=account_tx_limit,
     )
-    if onchain_hash is not None:
+    if onchain is not None:
+        onchain_hash, onchain_payload = onchain
+        # Only advance to COMMITTED when local state can still open this exact
+        # commitment: the salt/commitment/identity/windows are all persisted and
+        # the local commitment matches the one on chain. Otherwise (a salt-less
+        # pre-fix round, or a mismatch from a divergent prior salt) advancing
+        # would strand the round COMMITTED-but-unrevealable, so leave it in place.
+        if _recoverable(existing, onchain_payload.commitment_hash):
+            state.record_commit_submitted(
+                config.network, metadata, commit_tx_hash=onchain_hash
+            )
         return CommitResult(
             COMMIT_STATUS_ALREADY_COMMITTED, announcement.round_number, onchain_hash
         )
 
-    salt = salt or os.urandom(SALT_BYTES).hex()
+    if close_time >= announcement.commit_closes_at:
+        return CommitResult(COMMIT_STATUS_WINDOW_CLOSED, announcement.round_number)
+
+    missing = [name for name in _REQUIRED_OUTPUT_HASHES if not output_hashes.get(name)]
+    if missing:
+        raise CommitError(
+            f"missing output hashes required to commit: {', '.join(missing)}"
+        )
+
+    # Reuse a salt persisted by an interrupted prior attempt so the rebuilt
+    # commitment is byte-identical to anything already on chain; only mint a new
+    # salt for a genuinely first attempt.
+    salt = salt or (existing.salt if existing is not None else None) or os.urandom(
+        SALT_BYTES
+    ).hex()
     output_hashes_obj = commit_reveal.OutputHashes(
         model_response_hash=output_hashes[HASH_MODEL_RESPONSE],
         validator_scores_hash=output_hashes[HASH_VALIDATOR_SCORES],
@@ -251,6 +299,23 @@ def submit_commit(
     )
     memo_data = commit_reveal.canonical_json_bytes(commit_payload).decode("utf-8")
 
+    # Persist the reveal secret BEFORE broadcasting. If the process is killed in
+    # the window between broadcast and persist (observed live when the pass
+    # watchdog terminated a slow pass), the salt still survives on disk, so the
+    # on-chain commit is recoverable and revealable on a later pass. The round
+    # stays SCORED with no tx hash until the broadcast is confirmed below.
+    state.record_commit_pending(
+        config.network,
+        metadata,
+        validator_master_key=master_key,
+        salt=salt,
+        commitment_hash=commitment_hash,
+        commit_opens_at=announcement.commit_opens_at.isoformat(),
+        commit_closes_at=announcement.commit_closes_at.isoformat(),
+        reveal_opens_at=announcement.reveal_opens_at.isoformat(),
+        reveal_closes_at=announcement.reveal_closes_at.isoformat(),
+    )
+
     try:
         tx_hash = rpc_client.submit_memo(
             wallet_seed=wallet_seed,
@@ -269,18 +334,7 @@ def submit_commit(
             COMMIT_STATUS_SKIPPED_LOW_BALANCE, announcement.round_number
         )
 
-    state.record_commit(
-        config.network,
-        metadata,
-        CommitOutcome(
-            validator_master_key=master_key,
-            salt=salt,
-            commit_tx_hash=tx_hash,
-            commitment_hash=commitment_hash,
-            commit_opens_at=announcement.commit_opens_at.isoformat(),
-            commit_closes_at=announcement.commit_closes_at.isoformat(),
-            reveal_opens_at=announcement.reveal_opens_at.isoformat(),
-            reveal_closes_at=announcement.reveal_closes_at.isoformat(),
-        ),
+    state.record_commit_submitted(
+        config.network, metadata, commit_tx_hash=tx_hash
     )
     return CommitResult(COMMIT_STATUS_SUBMITTED, announcement.round_number, tx_hash)
