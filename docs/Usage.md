@@ -135,11 +135,11 @@ Participation also needs an inference runtime — scoring runs there, and a pass
 
 ## Participation lifecycle and recovery
 
-Once participation mode is configured and the container is up, there is nothing to do per round. The loop runs one `participate` pass at the chain-poll cadence (`POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS`, default 60s). Each pass scores the latest eligible round, watches the foundation publisher account for that round's on-chain announcement, and — inside the announced windows — submits your commit and, on a later pass, your reveal. You "join" a round simply by running while its windows are open. Each pass logs `participate completed`, or `participate failed; sleeping ...` on an infrastructure error that is retried next pass.
+Once participation mode is configured and the container is up, there is nothing to do per round. The loop runs one `participate` pass at the chain-poll cadence (`POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS`, default 60s). Each pass scores the latest eligible round, watches the foundation publisher account for that round's on-chain announcement, and — inside the announced windows — submits your commit and, on a later pass, your reveal. You "join" a round simply by running while its windows are open. Each pass logs `participate completed`, or `participate failed; sleeping ...` on an infrastructure error that is retried next pass. A foundation scoring-service outage is not an infrastructure failure for the chain work: the pass still completes, reporting `score=scoring_unavailable`, and pending commits and reveals are still submitted from local state (see *Restart and crash safety*).
 
 ### Round states
 
-The sidecar records one row per round in its local SQLite store (`/data/sidecar.db` in the named volume, schema v5). A round advances through:
+The sidecar records one row per round in its local SQLite store (`/data/sidecar.db` in the named volume, schema v6). A round advances through:
 
 ```
 DISCOVERED → INPUT_PACKAGE_VERIFIED → SCORED → COMMITTED → REVEALED
@@ -178,6 +178,7 @@ Each pass is idempotent and restart-safe — you can stop, update, or crash the 
 - Before submitting a commit or reveal, the sidecar scans the publisher account's recent validated history for a payload you already authored for that round; if it finds one it records that transaction hash instead of double-submitting. A run that crashed after broadcasting but before persisting recovers correctly.
 - The chain watcher advances its cursor past an announcement only once it is terminally handled, never past one whose commit is still pending or hit a transient error, so nothing is silently skipped.
 - A reveal refuses to broadcast unless your stored outputs and salt still reproduce the committed commitment (a local-state corruption guard).
+- The chain phases do not depend on the foundation scoring service being up. A commit or reveal is a pure PFTL transaction built from local state, so during a foundation-API outage the pass skips scoring (`score=scoring_unavailable`), halts the announcement walk without advancing its cursor, and still submits pending commits and reveals. The foundation publisher address discovered on earlier passes is cached locally for this; only a first-ever pass with the API down and no cached or configured address fails fast.
 
 ### Recoverable vs terminal conditions
 
@@ -234,6 +235,7 @@ The sidecar records failures in two separate columns of `sidecar_rounds`, and te
 |---|---|---|
 | A commit or reveal status is `skipped_low_balance` | Relay wallet underfunded | Check the relay `r...` account balance on chain and fund it. A low-balance **reveal** retries while its window is open; a low-balance **commit** is terminal (`SKIPPED`) — see [Recoverable vs terminal conditions](#recoverable-vs-terminal-conditions). |
 | Participation won't start: `PFTL RPC at … is not reachable` | RPC endpoint down or wrong URL | Fix `POSTFIAT_SIDECAR_PFTL_RPC_URL`; confirm the node answers `server_info`. |
+| Pass completes with `score=scoring_unavailable` | Foundation scoring service unreachable, or the round's input package could not be downloaded or verified | Scoring retries next pass, and pending commits/reveals were still submitted from local state. If it persists, check the scoring service status; if the `Scoring unavailable:` line reports a hash mismatch, refetch the round with `--force` (see [Recovering from a corrupt cache](#recovering-from-a-corrupt-cache)). |
 | `participate failed; sleeping …` with an `account_tx`/RPC error | Transient RPC failure | No action needed — the watcher cursor is not advanced, so the round is retried next pass. If it persists, check the RPC node. |
 | Logs report the cursor below retained history / `lgrIdxMalformed` | A non-archive RPC node pruned ledgers below the watcher's cursor after an idle gap | Automatic: the watcher clamps its floor forward to the node's earliest retained ledger and retries, and only already-closed commit windows are ever skipped. If it recurs, point the sidecar at an RPC node with deeper history. |
 | Memo submission rejected with `telREQUIRES_NETWORK_ID` | The RPC's `server_info` returns no usable `network_id` | The sidecar stamps the discovered `NetworkID` on every memo automatically; point at an RPC endpoint for the correct PFTL network. |

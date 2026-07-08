@@ -20,7 +20,7 @@ STATE_COMMITTED = "COMMITTED"
 STATE_REVEALED = "REVEALED"
 STATE_SCORING_FAILED = "SCORING_FAILED"
 STATE_SKIPPED = "SKIPPED"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # A round in any of these states already has its verified input package, so
 # sync must treat it as handled and not re-fetch it.
@@ -735,6 +735,37 @@ class SidecarState:
             ),
         )
 
+    def get_cached_publisher_address(self, network: str) -> str | None:
+        """Return the foundation publisher address discovered on an earlier
+        pass, or ``None`` when no address has been cached for the network."""
+
+        row = self._execute_one(
+            """
+            SELECT address
+            FROM foundation_publisher
+            WHERE network = ?
+            """,
+            (network,),
+        )
+        return row["address"] if row is not None else None
+
+    def cache_publisher_address(self, network: str, address: str) -> None:
+        """Persist the discovered foundation publisher address for the network,
+        so chain phases can run when the foundation config endpoint is
+        unreachable on a later pass."""
+
+        now = _utc_now()
+        self._execute_write(
+            """
+            INSERT INTO foundation_publisher (network, address, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(network) DO UPDATE SET
+                address = excluded.address,
+                updated_at = excluded.updated_at
+            """,
+            (network, address, now),
+        )
+
     def get_chain_cursor(self, network: str, account: str) -> ChainCursor | None:
         row = self._execute_one(
             """
@@ -798,6 +829,8 @@ class SidecarState:
                 self._migrate_v3_to_v4()
             if current_version < 5:
                 self._migrate_v4_to_v5()
+            if current_version < 6:
+                self._migrate_v5_to_v6()
         self._execute_write(f"PRAGMA user_version = {SCHEMA_VERSION}", ())
 
     def _create_schema(self) -> None:
@@ -849,6 +882,7 @@ class SidecarState:
             (),
         )
         self._create_chain_cursor_table()
+        self._create_foundation_publisher_table()
 
     def _migrate_v1_to_v2(self) -> None:
         existing = self._existing_columns("sidecar_rounds")
@@ -879,6 +913,22 @@ class SidecarState:
                     f"ALTER TABLE sidecar_rounds ADD COLUMN {name} {column_type}",
                     (),
                 )
+
+    def _migrate_v5_to_v6(self) -> None:
+        self._create_foundation_publisher_table()
+
+    def _create_foundation_publisher_table(self) -> None:
+        self._execute_write(
+            """
+            CREATE TABLE IF NOT EXISTS foundation_publisher (
+                network TEXT NOT NULL,
+                address TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (network)
+            )
+            """,
+            (),
+        )
 
     def _create_chain_cursor_table(self) -> None:
         self._execute_write(

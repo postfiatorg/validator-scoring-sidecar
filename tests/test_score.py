@@ -448,11 +448,29 @@ def test_full_score_abandons_when_round_deadline_budget_elapsed(tmp_path):
     config = _setup(tmp_path)
     backend = FakeBackend()
 
+    # The commit window is known only from the on-chain announcement windows
+    # persisted in local state on an earlier pass.
+    with SidecarState(tmp_path) as state:
+        state.record_announcement_windows(
+            "testnet",
+            RoundMetadata(
+                round_id=123,
+                round_number=456,
+                status="INPUT_FROZEN",
+                input_package_cid="QmInput",
+                input_package_hash=PACKAGE_HASH,
+                input_frozen_at="2026-05-25T00:00:00+00:00",
+                final_bundle_cid=None,
+            ),
+            commit_opens_at="2026-05-25T00:00:00+00:00",
+            commit_closes_at=deadline,
+            reveal_opens_at=deadline,
+            reveal_closes_at=deadline,
+        )
+
     result = score_round(
         config,
-        FakeClient(
-            payload=_round_payload(output_publication_commit_closes_at=deadline)
-        ),
+        FakeClient(),
         round_id=123,
         backend_factory=lambda record: backend,
         foundation_hash_fetcher=lambda *args: None,

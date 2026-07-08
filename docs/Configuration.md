@@ -49,7 +49,7 @@ Verify-only sync needs none of these. To run the on-chain commit-reveal loop, de
 | `POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED` | Secret for the funded operator relay `r...` wallet that pays for and sends the commit/reveal transactions — either an XRPL `s...` family seed or the 24-word BIP39 recovery phrase Task Node issues (paste it as-is). Secret: read from the runtime environment only, never accepted as a CLI flag, logged, or baked into an image layer. |
 | `POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE` | Host path of your `validator-keys.json`; the overlay mounts it read-only into the container. |
 | `POSTFIAT_SIDECAR_PFTL_RPC_URL` | PFTL JSON-RPC endpoint for chain reads and memo submission. Defaults to `https://rpc.<network>.postfiat.org`. |
-| `POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS` | Optional override of the foundation publisher account; auto-discovered from the scoring service config when unset. |
+| `POSTFIAT_SIDECAR_FOUNDATION_PUBLISHER_ADDRESS` | Optional override of the foundation publisher account; auto-discovered from the scoring service config when unset. The discovered address is cached in local state, so once one pass has succeeded the commit/reveal chain phases keep running through a scoring-service outage. |
 | `POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS` | How often the participate loop runs a pass (default `60`). Keep it well below the announced commit/reveal windows. |
 
 `POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH` — the in-container path of the mounted key file — is container-managed: the overlay pins it to `/keys/validator-keys.json`. Set it yourself only when running the CLI outside Docker.

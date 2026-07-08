@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
 
+from validator_scoring_sidecar import __version__
 from validator_scoring_sidecar.chain import (
     ChainWatcherError,
     FoundationConfig,
@@ -102,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="validator-scoring-sidecar",
         description="Post Fiat Dynamic UNL validator scoring sidecar tooling.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"validator-scoring-sidecar {__version__}",
+        help="Print the installed sidecar version and exit.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -893,17 +900,18 @@ def _reproduction_result_to_check(result: ScoreResult) -> CheckResult:
 
 
 def _format_participate_result(result: ParticipateResult) -> str:
-    return "\n".join(
-        [
-            f"Participate status: score={result.score_status}",
-            f"Network: {result.network}",
-            f"Round ID: {result.round_id}",
-            f"Round number: {result.round_number}",
-            f"Announcements: {_format_advance(result.announcements)}",
-            f"Commits: {_format_advance(result.commits)}",
-            f"Reveals: {_format_advance(result.reveals)}",
-        ]
-    )
+    lines = [
+        f"Participate status: score={result.score_status}",
+        f"Network: {result.network}",
+        f"Round ID: {result.round_id}",
+        f"Round number: {result.round_number}",
+        f"Announcements: {_format_advance(result.announcements)}",
+        f"Commits: {_format_advance(result.commits)}",
+        f"Reveals: {_format_advance(result.reveals)}",
+    ]
+    if result.score_error:
+        lines.insert(1, f"Scoring unavailable: {result.score_error}")
+    return "\n".join(lines)
 
 
 def _format_advance(entries: list[dict[str, Any]]) -> str:
