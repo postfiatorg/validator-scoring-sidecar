@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
 
+from validator_scoring_sidecar import __version__
 from validator_scoring_sidecar.chain import (
     ChainWatcherError,
     FoundationConfig,
@@ -102,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="validator-scoring-sidecar",
         description="Post Fiat Dynamic UNL validator scoring sidecar tooling.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"validator-scoring-sidecar {__version__}",
+        help="Print the installed sidecar version and exit.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

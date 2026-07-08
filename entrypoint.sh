@@ -117,6 +117,10 @@ if [ "$mode" = "participate" ]; then
     fi
 fi
 
+# `--version` prints "validator-scoring-sidecar X.Y.Z"; log() already prefixes
+# the name, so keep only the version field to avoid repeating it.
+version="$(validator-scoring-sidecar --version 2>/dev/null | awk '{print $NF}')"
+log "version ${version:-unknown}"
 log "starting ${mode} loop (interval=${interval}s)"
 
 while true; do
