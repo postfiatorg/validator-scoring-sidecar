@@ -42,8 +42,6 @@ class RoundMetadata:
     input_package_hash: str
     input_frozen_at: str
     final_bundle_cid: str | None
-    commit_closes_at: str | None = None
-    output_publication_commit_closes_at: str | None = None
 
     @classmethod
     def from_api_payload(
@@ -63,10 +61,6 @@ class RoundMetadata:
         )
 
         final_bundle_cid = _optional_string(payload, "final_bundle_cid")
-        commit_closes_at = _optional_string(payload, "commit_closes_at")
-        output_publication_commit_closes_at = _optional_string(
-            payload, "output_publication_commit_closes_at"
-        )
 
         return cls(
             round_id=round_id,
@@ -76,12 +70,10 @@ class RoundMetadata:
             input_package_hash=frozen_input["input_package_hash"],
             input_frozen_at=frozen_input["input_frozen_at"],
             final_bundle_cid=final_bundle_cid,
-            commit_closes_at=commit_closes_at,
-            output_publication_commit_closes_at=output_publication_commit_closes_at,
         )
 
     def as_dict(self) -> dict[str, Any]:
-        payload = {
+        return {
             "round_id": self.round_id,
             "round_number": self.round_number,
             "status": self.status,
@@ -90,13 +82,6 @@ class RoundMetadata:
             "input_frozen_at": self.input_frozen_at,
             "final_bundle_cid": self.final_bundle_cid,
         }
-        if self.commit_closes_at is not None:
-            payload["commit_closes_at"] = self.commit_closes_at
-        if self.output_publication_commit_closes_at is not None:
-            payload["output_publication_commit_closes_at"] = (
-                self.output_publication_commit_closes_at
-            )
-        return payload
 
 
 def round_identifier(payload: dict[str, Any]) -> int:

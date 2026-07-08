@@ -66,7 +66,7 @@ jobs:
       - name: Check out sidecar
         uses: actions/checkout@v4
 
-      - name: Resolve environment and immutable tag
+      - name: Resolve environment, version, and immutable tag
         id: meta
         run: |
           case "${{ github.ref_name }}" in
@@ -76,8 +76,38 @@ jobs:
               exit 1
               ;;
           esac
+          VERSION=$(grep -m1 -oP '^version\s*=\s*"\K[^"]+' pyproject.toml)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not extract version from pyproject.toml"
+            exit 1
+          fi
           echo "env=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      # The version tag is immutable: a build that reuses an already-published
+      # version would silently ship different bytes under the same name. Refuse
+      # to publish until pyproject.toml is bumped, and fail safe (do not publish)
+      # if the registry cannot be queried. Both images share one version and the
+      # verify-only image is pushed first, so its tag is the single gate. Trade-off
+      # of one shared gate: if the participate build fails after verify-only pushed,
+      # re-publishing needs a version bump (the verify tag already exists), so that
+      # version keeps a verify image with no participate counterpart.
+      - name: Refuse to overwrite an existing version tag
+        run: |
+          TAG="${{ steps.meta.outputs.env }}-${{ steps.meta.outputs.version }}"
+          echo "Checking Docker Hub for tag '$TAG'..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://hub.docker.com/v2/repositories/${{ env.IMAGE_NAME }}/tags/$TAG")
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "::error::Tag '$TAG' already exists. Bump 'version' in pyproject.toml."
+            exit 1
+          elif [ "$HTTP_STATUS" != "404" ]; then
+            echo "::error::Docker Hub API returned HTTP $HTTP_STATUS. Failing safe."
+            exit 1
+          fi
+          echo "Tag does not exist. Proceeding."
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -97,6 +127,7 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.env }}-latest
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.env }}-${{ steps.meta.outputs.version }}
             ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.env }}-${{ steps.meta.outputs.sha }}
           cache-from: type=gha,scope=verify
           cache-to: type=gha,mode=max,scope=verify
@@ -119,6 +150,7 @@ jobs:
             VALIDATOR_KEYS_IMAGE=agtipft/postfiatd:${{ steps.meta.outputs.env }}-light-latest
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.env }}-participate-latest
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.env }}-participate-${{ steps.meta.outputs.version }}
             ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.env }}-participate-${{ steps.meta.outputs.sha }}
           cache-from: type=gha,scope=participate
           cache-to: type=gha,mode=max,scope=participate

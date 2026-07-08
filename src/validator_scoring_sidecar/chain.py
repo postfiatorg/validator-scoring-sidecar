@@ -720,7 +720,7 @@ def find_memo_payload(
     return None
 
 
-def find_authored_memo_tx_hash(
+def find_authored_memo(
     rpc_client: PftlRpcClient,
     *,
     account: str,
@@ -731,15 +731,19 @@ def find_authored_memo_tx_hash(
     input_package_hash: str,
     validator_master_key: str,
     limit: int,
-) -> str | None:
-    """Return the hash of the most recent ``account`` transaction carrying a
-    ``memo_type`` memo whose validated payload binds to this round and validator.
+) -> tuple[str, Any] | None:
+    """Return the ``(tx_hash, validated_payload)`` of the most recent ``account``
+    transaction carrying a ``memo_type`` memo that binds to this round and
+    validator, or ``None`` when there is none.
 
     Shared by commit and reveal idempotency: before submitting, scan the
     foundation publisher account's recent validated history for a payload this
     validator already authored for the round. ``validate`` is the protocol
     validator for the memo kind (``validate_commit_payload`` /
-    ``validate_reveal_payload``); a payload that fails validation is skipped.
+    ``validate_reveal_payload``); a payload that fails validation is skipped. The
+    validated payload is returned alongside the hash so a caller can compare
+    protocol fields it does not match on here (the commit recovery path checks
+    the on-chain ``commitment_hash`` against local state before revealing).
     """
 
     result = rpc_client.account_tx(
@@ -776,7 +780,8 @@ def find_authored_memo_tx_hash(
             tx_hash = entry.get("hash") or (
                 tx.get("hash") if isinstance(tx, dict) else None
             )
-            return tx_hash if isinstance(tx_hash, str) else None
+            if isinstance(tx_hash, str):
+                return tx_hash, authored
     return None
 
 

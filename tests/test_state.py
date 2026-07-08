@@ -292,7 +292,20 @@ def test_chain_cursor_round_trip(tmp_path):
         assert updated.last_processed_tx_hash == "b" * 64
 
 
-def test_fresh_database_is_schema_v5(tmp_path):
+def test_publisher_cache_round_trip(tmp_path):
+    with SidecarState(tmp_path) as state:
+        assert state.get_cached_publisher_address("testnet") is None
+
+        state.cache_publisher_address("testnet", "rPublisherOne")
+        assert state.get_cached_publisher_address("testnet") == "rPublisherOne"
+        # Per-network isolation.
+        assert state.get_cached_publisher_address("devnet") is None
+
+        state.cache_publisher_address("testnet", "rPublisherTwo")
+        assert state.get_cached_publisher_address("testnet") == "rPublisherTwo"
+
+
+def test_fresh_database_is_current_schema(tmp_path):
     with SidecarState(tmp_path) as state:
         state.set_chain_cursor("testnet", "rPub", 1, "h")
 
@@ -475,7 +488,7 @@ def test_get_rounds_pending_commit_filters(tmp_path):
     assert [record.round_id for record in pending] == [eligible.round_id]
 
 
-def test_v1_database_migrates_to_v5(tmp_path):
+def test_v1_database_migrates_to_current_schema(tmp_path):
     db_path = tmp_path / STATE_DB_FILENAME
     connection = sqlite3.connect(db_path)
     try:
@@ -508,6 +521,9 @@ def test_v1_database_migrates_to_v5(tmp_path):
         committed = state.get_round("testnet", _metadata().round_id)
         assert committed.commit_tx_hash == "TX1"
         assert committed.commitment_hash == "c" * 64
+        # v6 adds the foundation publisher cache table.
+        state.cache_publisher_address("testnet", "rPub")
+        assert state.get_cached_publisher_address("testnet") == "rPub"
 
     connection = sqlite3.connect(db_path)
     try:

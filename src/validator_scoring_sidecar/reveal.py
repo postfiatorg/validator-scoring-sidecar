@@ -25,7 +25,7 @@ from validator_scoring_sidecar.chain import (
     ChainWatcherError,
     PftlInsufficientFundsError,
     PftlRpcClient,
-    find_authored_memo_tx_hash,
+    find_authored_memo,
 )
 from validator_scoring_sidecar.commit import DEFAULT_ACCOUNT_TX_SCAN_LIMIT, Signer
 from validator_scoring_sidecar.config import SidecarConfig
@@ -127,7 +127,7 @@ def submit_reveal(
     # Scan the chain before declaring a miss: a reveal may already be on-chain
     # from a prior run that crashed before persisting its hash, in which case the
     # round was revealed, not missed.
-    onchain_hash = find_authored_memo_tx_hash(
+    onchain = find_authored_memo(
         rpc_client,
         account=foundation_publisher_address,
         memo_type=commit_reveal.VALIDATOR_REVEAL_TYPE,
@@ -138,7 +138,8 @@ def submit_reveal(
         validator_master_key=committed.validator_master_key,
         limit=account_tx_limit,
     )
-    if onchain_hash is not None:
+    if onchain is not None:
+        onchain_hash, _ = onchain
         state.record_reveal(config.network, metadata, reveal_tx_hash=onchain_hash)
         return RevealResult(
             REVEAL_STATUS_ALREADY_REVEALED, committed.round_number, onchain_hash

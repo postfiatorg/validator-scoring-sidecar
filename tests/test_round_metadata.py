@@ -77,27 +77,6 @@ def test_round_metadata_allows_missing_final_bundle_cid():
     assert metadata.final_bundle_cid is None
 
 
-def test_round_metadata_parses_optional_commit_close_deadlines():
-    metadata = RoundMetadata.from_api_payload(
-        _payload(
-            commit_closes_at=" 2026-05-25T00:30:00+00:00 ",
-            output_publication_commit_closes_at="2026-05-25T00:31:00+00:00",
-        ),
-        requested_round_id=123,
-    )
-
-    assert metadata.commit_closes_at == "2026-05-25T00:30:00+00:00"
-    assert (
-        metadata.output_publication_commit_closes_at
-        == "2026-05-25T00:31:00+00:00"
-    )
-    assert metadata.as_dict()["commit_closes_at"] == "2026-05-25T00:30:00+00:00"
-    assert (
-        metadata.as_dict()["output_publication_commit_closes_at"]
-        == "2026-05-25T00:31:00+00:00"
-    )
-
-
 def test_round_metadata_treats_blank_final_bundle_cid_as_missing():
     metadata = RoundMetadata.from_api_payload(
         _payload(final_bundle_cid=" "),

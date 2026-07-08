@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from validator_scoring_sidecar import cli
+from validator_scoring_sidecar import __version__, cli
 from validator_scoring_sidecar.deployment import (
     DeploymentRecord,
     ModalNotAvailableError,
@@ -90,6 +90,23 @@ def _payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def test_version_flag_prints_and_exits(capsys):
+    # argparse's version action raises SystemExit(0) after printing.
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--version"])
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 0
+    assert captured.out.strip() == f"validator-scoring-sidecar {__version__}"
+
+
+def test_version_resolves_from_installed_metadata():
+    # Proves the importlib.metadata path is taken (an installed package), not the
+    # source-tree "0.0.0+unknown" fallback — the version tracks pyproject.toml.
+    assert __version__ != "0.0.0+unknown"
+    assert __version__[0].isdigit()
 
 
 def test_invalid_config_exits_usage_error(capsys):

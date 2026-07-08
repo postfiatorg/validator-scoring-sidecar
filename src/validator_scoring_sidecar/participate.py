@@ -27,10 +27,23 @@ is replayed from local state for any scored round whose window is open and not
 yet committed — so a round scored on a later pass than its announcement (for
 example after a transient scoring failure) still commits while its window is open
 rather than being forfeited. Per-round logic failures are recorded without
-halting the pass; infrastructure failures (a failed account_tx poll, a transient
-RPC or download error, a lock error) propagate so the pass retries cleanly rather
-than advancing past unfinished work. The unattended loop is the operator's
-scheduler invoking this pass at the chain-poll cadence.
+halting the pass. The unattended loop is the operator's scheduler invoking this
+pass at the chain-poll cadence.
+
+The chain phases are independent of foundation-service availability: a commit or
+reveal is a pure PFTL transaction built from persisted local state, so a
+foundation-API outage must never forfeit one. Foundation-side failures
+(unreachable service, undownloadable or unverifiable input package) are
+therefore contained — scoring is skipped for the pass (``scoring_unavailable``),
+the announcement walk halts without advancing the cursor so the interrupted work
+retries on a later pass, and publisher discovery falls back to the address cached
+from an earlier successful pass — while the reveal and commit phases still run.
+Everything else keeps failing the pass loudly: PFTL RPC failures and lock errors
+(without the ledger no chain phase can proceed), local-state and package-cache
+disk errors (a host that cannot write state cannot participate), and
+runtime-provisioning or configuration errors raised while scoring (an operator
+problem to surface, not to soften). The pass retries cleanly on the next tick
+rather than advancing past unfinished work.
 """
 
 from __future__ import annotations
@@ -77,6 +90,8 @@ from validator_scoring_sidecar.modal_deployer import (
 from validator_scoring_sidecar.input_package import (
     SOURCE_AUTO,
     FetchedInputPackage,
+    InputPackageDownloadError,
+    InputPackageVerificationError,
     PackageSource,
     fetch_input_package,
 )
@@ -107,9 +122,23 @@ from validator_scoring_sidecar.verification import (
 )
 
 SCORE_STATUS_NO_ELIGIBLE_ROUND = "no_eligible_round"
+SCORE_STATUS_SCORING_UNAVAILABLE = "scoring_unavailable"
 ANNOUNCE_STATUS_WINDOWS_RECORDED = "windows_recorded"
 ADVANCE_STATUS_ANNOUNCEMENT_ERROR = "announcement_error"
+ADVANCE_STATUS_FOUNDATION_UNAVAILABLE = "foundation_unavailable"
 ADVANCE_STATUS_ERROR = "error"
+
+# Foundation-side failures: the scoring service API is unreachable, or its
+# frozen input package cannot be downloaded or does not verify against its
+# published hash. Contained so the chain phases still run; the skipped work
+# retries on a later pass. Local faults are deliberately NOT in this set —
+# InputPackageCacheError (disk) and SidecarStateError stay strict, because a
+# host that cannot write local state cannot run the chain phases either.
+_FOUNDATION_AVAILABILITY_ERRORS = (
+    ScoringClientError,
+    InputPackageDownloadError,
+    InputPackageVerificationError,
+)
 
 # Foundation round status carried on a round first learned about from its
 # on-chain announcement (emitted at INPUT_FROZEN); used only when the
@@ -138,11 +167,13 @@ class ParticipateResult:
     reveals: list[dict[str, Any]]
     announcements: list[dict[str, Any]]
     protocol_violations: list[dict[str, Any]]
+    score_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "network": self.network,
             "score_status": self.score_status,
+            "score_error": self.score_error,
             "round_id": self.round_id,
             "round_number": self.round_number,
             "commits": list(self.commits),
@@ -284,7 +315,8 @@ def participate(
     """Run one unattended participation pass for the latest eligible round."""
 
     require_participation_config(config)
-    publisher = _resolve_publisher(config, client)
+    with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
+        publisher = _resolve_publisher(config, client, state)
     _probe_rpc(config, rpc_client)
 
     provisioner = (
@@ -292,6 +324,7 @@ def participate(
         if runtime_provisioner is not None
         else modal_runtime_provisioner(config)
     )
+    score_error: str | None = None
     try:
         score = score_runner(
             config,
@@ -307,6 +340,15 @@ def participate(
         # No round to score this pass; the reveal phase is still driven from local
         # state, so a committed round in its reveal window must still be handled.
         score_status = SCORE_STATUS_NO_ELIGIBLE_ROUND
+        active_round_id = None
+        active_round_number = 0
+    except _FOUNDATION_AVAILABILITY_ERRORS as exc:
+        # The foundation scoring service (or the package retrieval path) is
+        # unreachable. Scoring retries on a later pass; the chain phases below
+        # are pure PFTL work driven from local state and must still run — a
+        # foundation outage must never forfeit a pending commit or reveal.
+        score_status = SCORE_STATUS_SCORING_UNAVAILABLE
+        score_error = str(exc)
         active_round_id = None
         active_round_number = 0
 
@@ -357,6 +399,7 @@ def participate(
         reveals=reveals,
         announcements=announcements,
         protocol_violations=protocol_violations,
+        score_error=score_error,
     )
 
 
@@ -378,8 +421,11 @@ def _record_announcement_windows(
     even if the round is not yet scored. A round scored on a later pass still
     commits, because its windows are already persisted, so a transient scoring
     failure no longer forfeits the round. A malformed announcement from the
-    trusted sender will not improve, so it is recorded and skipped; transient
-    decode failures (download/verify/RPC) propagate so the pass retries them.
+    trusted sender will not improve, so it is recorded and skipped. A
+    foundation-availability failure while content-binding an announcement halts
+    the walk without advancing the cursor — the interrupted announcement retries
+    on a later pass, and the chain phases of this pass still run. RPC failures
+    propagate so the pass retries them.
     """
 
     watcher = PftlAccountWatcher(
@@ -408,6 +454,20 @@ def _record_announcement_windows(
             )
             watcher.advance_cursor(transaction)
             continue
+        except _FOUNDATION_AVAILABILITY_ERRORS as exc:
+            # The foundation service or package retrieval is unreachable, so the
+            # announcement cannot be content-bound this pass. Halt the walk
+            # without advancing the cursor — this transaction and everything
+            # after it re-surfaces on a later pass — and let the chain phases
+            # of this pass proceed.
+            results.append(
+                {
+                    "tx_hash": transaction.tx_hash,
+                    "status": ADVANCE_STATUS_FOUNDATION_UNAVAILABLE,
+                    "error": str(exc),
+                }
+            )
+            break
 
         if verified is not None:
             announcement = verified.announcement
@@ -669,19 +729,40 @@ def _metadata_from_record(record: RoundStateRecord) -> RoundMetadata:
     )
 
 
-def _resolve_publisher(config: SidecarConfig, client: ScoringClient) -> str:
-    foundation_config: FoundationConfig | None = None
-    if not config.foundation_publisher_address:
-        try:
-            foundation_config = FoundationConfig.from_api_payload(client.fetch_config())
-        except ScoringClientError as exc:
-            raise ParticipationConfigError(
-                f"could not fetch foundation config for publisher discovery: {exc}"
-            ) from exc
+def _resolve_publisher(
+    config: SidecarConfig,
+    client: ScoringClient,
+    state: SidecarState,
+) -> str:
+    """Effective publisher address: explicit override, fetched config, then the
+    locally cached address from an earlier successful discovery.
+
+    A successful discovery is written through to the cache so a later pass can
+    run its chain phases while the foundation config endpoint is unreachable.
+    The cache backstops only a fetch *failure*: a config endpoint that answers
+    without a publisher address is a foundation-side contract change, and
+    silently reusing a cached address could send memos to a retired account, so
+    that case stays strict.
+    """
+
+    if config.foundation_publisher_address:
+        return config.foundation_publisher_address
     try:
-        return resolve_foundation_publisher_address(config, foundation_config)
+        foundation_config = FoundationConfig.from_api_payload(client.fetch_config())
+    except ScoringClientError as exc:
+        cached = state.get_cached_publisher_address(config.network)
+        if cached:
+            return cached
+        raise ParticipationConfigError(
+            "could not fetch foundation config for publisher discovery and no "
+            f"previously discovered address is cached: {exc}"
+        ) from exc
+    try:
+        publisher = resolve_foundation_publisher_address(config, foundation_config)
     except ChainWatcherError as exc:
         raise ParticipationConfigError(str(exc)) from exc
+    state.cache_publisher_address(config.network, publisher)
+    return publisher
 
 
 def _probe_rpc(config: SidecarConfig, rpc_client: PftlRpcClient) -> None:
