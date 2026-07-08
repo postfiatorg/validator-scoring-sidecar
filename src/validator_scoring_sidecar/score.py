@@ -162,7 +162,7 @@ def score_round(
 
     with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
         existing = state.get_round(config.network, metadata.round_id)
-        inference_deadline = _inference_deadline(metadata, existing)
+        inference_deadline = _inference_deadline(existing)
 
         if (
             existing is not None
@@ -352,20 +352,13 @@ def _full_score(
     return _scored_result(config.network, metadata, outcome, verification.compared)
 
 
-def _inference_deadline(
-    metadata: RoundMetadata,
-    existing: RoundStateRecord | None,
-) -> datetime | None:
-    candidates = [
-        existing.commit_closes_at if existing is not None else None,
-        metadata.output_publication_commit_closes_at,
-        metadata.commit_closes_at,
-    ]
-    for value in candidates:
-        parsed = _parse_datetime(value)
-        if parsed is not None:
-            return parsed
-    return None
+def _inference_deadline(existing: RoundStateRecord | None) -> datetime | None:
+    """The round's commit-window close, known only from the on-chain
+    announcement windows persisted in local state."""
+
+    if existing is None:
+        return None
+    return _parse_datetime(existing.commit_closes_at)
 
 
 def _effective_inference_timeout_seconds(

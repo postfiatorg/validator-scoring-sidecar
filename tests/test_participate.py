@@ -26,7 +26,10 @@ from validator_scoring_sidecar.participate import (
 )
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.score import ScoreResult
-from validator_scoring_sidecar.scoring_client import ScoringHTTPError
+from validator_scoring_sidecar.scoring_client import (
+    ScoringHTTPError,
+    ScoringNetworkError,
+)
 from validator_scoring_sidecar.scoring import (
     SUPPORTED_PARSER_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
@@ -122,6 +125,25 @@ class FakeClient:
 class LeakyFakeClient(FakeClient):
     def fetch_final_bundle_file(self, round_number, file_path):
         return {"model_response_hash": "1" * 64}
+
+
+class DownClient:
+    """Scoring service client during a full foundation-API outage."""
+
+    def fetch_config(self):
+        raise ScoringNetworkError("scoring service unreachable")
+
+    def fetch_rounds(self, *, limit, offset=0):
+        raise ScoringNetworkError("scoring service unreachable")
+
+    def fetch_final_bundle_file(self, round_number, file_path):
+        raise ScoringNetworkError("scoring service unreachable")
+
+
+def _unavailable_score_runner(
+    config, client, *, source=None, round_limit=None, runtime_provisioner=None
+):
+    raise ScoringNetworkError("scoring service unreachable")
 
 
 def _announcement():
@@ -518,6 +540,188 @@ def test_participate_surfaces_announcement_error(tmp_path):
     assert any(
         entry["status"] == "announcement_error" for entry in result.announcements
     )
+
+
+def test_participate_caches_discovered_publisher(tmp_path):
+    _participate(tmp_path, FakeSigner(), FakeRpc(close_time=COMMIT_TIME))
+
+    with SidecarState(tmp_path) as state:
+        assert state.get_cached_publisher_address(NETWORK) == PUBLISHER
+
+
+def test_participate_reveals_during_foundation_api_outage(tmp_path):
+    # Commit on a healthy pass (which also caches the publisher address), then
+    # take the foundation API fully down for the reveal window. The reveal is a
+    # pure chain transaction from local state and must still land.
+    _seed_scored(tmp_path)
+    signer = FakeSigner()
+    _participate(tmp_path, signer, FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX]))
+
+    rpc = FakeRpc(close_time=REVEAL_TIME, transactions=[])
+    result = participate(
+        _config(tmp_path),
+        DownClient(),
+        rpc_client=rpc,
+        signer=signer,
+        score_runner=_unavailable_score_runner,
+        announcement_decoder=fake_decoder,
+    )
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert result.score_status == "scoring_unavailable"
+    assert result.score_error is not None
+    assert record.sidecar_state == STATE_REVEALED
+    assert any(s["memo_type"] == commit_reveal.VALIDATOR_REVEAL_TYPE for s in rpc.submitted)
+
+
+def test_participate_commits_during_foundation_api_outage(tmp_path):
+    # A round scored earlier, with its announced windows persisted and the
+    # publisher address cached, commits inside its window even though the
+    # foundation API is down for the whole pass.
+    _seed_scored(tmp_path)
+    with SidecarState(tmp_path) as state:
+        state.cache_publisher_address(NETWORK, PUBLISHER)
+        state.record_announcement_windows(
+            NETWORK,
+            _metadata(),
+            commit_opens_at="2026-05-25T00:00:00+00:00",
+            commit_closes_at="2026-05-25T00:30:00+00:00",
+            reveal_opens_at="2026-05-25T00:30:00+00:00",
+            reveal_closes_at="2026-05-25T01:00:00+00:00",
+        )
+
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[])
+    result = participate(
+        _config(tmp_path),
+        DownClient(),
+        rpc_client=rpc,
+        signer=FakeSigner(),
+        score_runner=_unavailable_score_runner,
+        announcement_decoder=fake_decoder,
+    )
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round(NETWORK, ROUND_ID)
+
+    assert result.score_status == "scoring_unavailable"
+    assert record.sidecar_state == STATE_COMMITTED
+    assert len(rpc.submitted) == 1
+    assert rpc.submitted[0]["memo_type"] == commit_reveal.VALIDATOR_COMMIT_TYPE
+
+
+def test_participate_ignores_cache_when_config_answers_without_publisher(tmp_path):
+    # The retired-account protection: the cache backstops only a fetch failure.
+    # A config endpoint that answers WITHOUT a publisher address is a
+    # foundation-side contract change, and a cached address must not be used.
+    class NoPublisherClient(FakeClient):
+        def fetch_config(self):
+            return {}
+
+    with SidecarState(tmp_path) as state:
+        state.cache_publisher_address(NETWORK, PUBLISHER)
+
+    rpc = FakeRpc(close_time=COMMIT_TIME)
+    with pytest.raises(ParticipationConfigError):
+        participate(
+            _config(tmp_path),
+            NoPublisherClient(),
+            rpc_client=rpc,
+            signer=FakeSigner(),
+            score_runner=_no_score,
+            announcement_decoder=fake_decoder,
+        )
+    assert rpc.submitted == []
+
+
+def test_participate_walk_halt_preserves_earlier_cursor_advance(tmp_path):
+    # Partial progress: transaction 1 binds and its cursor advance sticks;
+    # binding transaction 2 hits a foundation outage, halting the walk there.
+    # Only the unhandled transaction re-surfaces on the next pass.
+    second_tx = dict(ANNOUNCEMENT_TX, hash="ANNTX2", ledger_index=101)
+
+    def flaky_decoder(
+        transaction, config, client, *, package_fetcher=None, round_limit=None
+    ):
+        if transaction.tx_hash == "ANNTX2":
+            raise ScoringNetworkError("scoring service unreachable")
+        return fake_decoder(transaction, config, client)
+
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX, second_tx])
+    result = participate(
+        _config(tmp_path),
+        FakeClient(),
+        rpc_client=rpc,
+        signer=FakeSigner(),
+        score_runner=fake_score_runner,
+        announcement_decoder=flaky_decoder,
+    )
+
+    assert any(
+        entry["status"] == "windows_recorded" for entry in result.announcements
+    )
+    assert any(
+        entry["status"] == "foundation_unavailable"
+        and entry["tx_hash"] == "ANNTX2"
+        for entry in result.announcements
+    )
+    with SidecarState(tmp_path) as state:
+        cursor = state.get_chain_cursor(NETWORK, PUBLISHER)
+    assert cursor is not None
+    assert cursor.last_processed_tx_hash == "ANNTX"
+
+
+def test_participate_fails_fast_when_api_down_and_no_cached_publisher(tmp_path):
+    # All-or-nothing is preserved on a first-ever pass: with the API down and
+    # nothing cached, the pass fails before scoring and changes nothing on chain.
+    rpc = FakeRpc(close_time=COMMIT_TIME)
+    with pytest.raises(ParticipationConfigError):
+        participate(
+            _config(tmp_path),
+            DownClient(),
+            rpc_client=rpc,
+            signer=FakeSigner(),
+            score_runner=_no_score,
+            announcement_decoder=fake_decoder,
+        )
+    assert rpc.submitted == []
+
+
+def test_participate_announcement_binding_outage_leaves_cursor(tmp_path):
+    # The config endpoint answers but package retrieval fails while binding the
+    # announcement (partial outage). The walk halts without advancing the
+    # cursor, the pass still completes, and a later healthy pass processes the
+    # same announcement.
+    def outage_decoder(
+        transaction, config, client, *, package_fetcher=None, round_limit=None
+    ):
+        raise ScoringNetworkError("scoring service unreachable")
+
+    rpc = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    result = participate(
+        _config(tmp_path),
+        FakeClient(),
+        rpc_client=rpc,
+        signer=FakeSigner(),
+        score_runner=fake_score_runner,
+        announcement_decoder=outage_decoder,
+    )
+
+    assert any(
+        entry["status"] == "foundation_unavailable" for entry in result.announcements
+    )
+    with SidecarState(tmp_path) as state:
+        assert state.get_chain_cursor(NETWORK, PUBLISHER) is None
+
+    # The next healthy pass re-surfaces the announcement and records its windows.
+    rpc2 = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
+    second = _participate(tmp_path, FakeSigner(), rpc2)
+    assert any(
+        entry["status"] == "windows_recorded" for entry in second.announcements
+    )
+    with SidecarState(tmp_path) as state:
+        assert state.get_round(NETWORK, ROUND_ID).commit_opens_at is not None
 
 
 def test_participate_requires_wallet_seed(tmp_path):

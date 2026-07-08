@@ -893,17 +893,18 @@ def _reproduction_result_to_check(result: ScoreResult) -> CheckResult:
 
 
 def _format_participate_result(result: ParticipateResult) -> str:
-    return "\n".join(
-        [
-            f"Participate status: score={result.score_status}",
-            f"Network: {result.network}",
-            f"Round ID: {result.round_id}",
-            f"Round number: {result.round_number}",
-            f"Announcements: {_format_advance(result.announcements)}",
-            f"Commits: {_format_advance(result.commits)}",
-            f"Reveals: {_format_advance(result.reveals)}",
-        ]
-    )
+    lines = [
+        f"Participate status: score={result.score_status}",
+        f"Network: {result.network}",
+        f"Round ID: {result.round_id}",
+        f"Round number: {result.round_number}",
+        f"Announcements: {_format_advance(result.announcements)}",
+        f"Commits: {_format_advance(result.commits)}",
+        f"Reveals: {_format_advance(result.reveals)}",
+    ]
+    if result.score_error:
+        lines.insert(1, f"Scoring unavailable: {result.score_error}")
+    return "\n".join(lines)
 
 
 def _format_advance(entries: list[dict[str, Any]]) -> str:
