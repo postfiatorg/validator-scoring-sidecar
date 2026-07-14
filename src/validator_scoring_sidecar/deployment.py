@@ -108,9 +108,16 @@ class RuntimeSpec:
 
 @dataclass(frozen=True)
 class ModalDeploymentResult:
-    """What the Modal deployer observed after standing up the endpoint."""
+    """What the Modal deployer observed after standing up the endpoint.
+
+    ``submit_url`` / ``result_url`` are the app's submit-and-poll job
+    interface; ``None`` on an app version that predates it, in which case the
+    backend falls back to the direct long-lived transport.
+    """
 
     endpoint_url: str
+    submit_url: str | None = None
+    result_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -123,7 +130,13 @@ class LocalStartResult:
 class ModalDeployer(Protocol):
     """Stands up a Modal endpoint for a spec and reports where it lives."""
 
-    def deploy(self, spec: RuntimeSpec, *, app_name: str) -> ModalDeploymentResult: ...
+    def deploy(
+        self,
+        spec: RuntimeSpec,
+        *,
+        app_name: str,
+        scaledown_minutes: int,
+    ) -> ModalDeploymentResult: ...
 
 
 class LocalRuntimeStarter(Protocol):
@@ -158,6 +171,8 @@ class DeploymentRecord:
     model_revision: str
     endpoint_url: str
     deployed_at: str
+    submit_url: str | None = None
+    result_url: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -171,6 +186,8 @@ class DeploymentRecord:
             "model_revision": self.model_revision,
             "endpoint_url": self.endpoint_url,
             "deployed_at": self.deployed_at,
+            "submit_url": self.submit_url,
+            "result_url": self.result_url,
         }
 
 
@@ -391,6 +408,8 @@ def build_deployment_record(
     mode: str,
     endpoint_url: str,
     deployed_at: str,
+    submit_url: str | None = None,
+    result_url: str | None = None,
 ) -> DeploymentRecord:
     """Assemble the deployment record from the spec and resolved endpoint."""
 
@@ -405,6 +424,8 @@ def build_deployment_record(
         model_revision=spec.model_revision,
         endpoint_url=endpoint_url,
         deployed_at=deployed_at,
+        submit_url=submit_url,
+        result_url=result_url,
     )
 
 
@@ -420,7 +441,11 @@ def deploy_modal_endpoint(
 
     spec = extract_runtime_spec(manifest)
     resolved_app_name = app_name or default_app_name(config.network)
-    result = deployer.deploy(spec, app_name=resolved_app_name)
+    result = deployer.deploy(
+        spec,
+        app_name=resolved_app_name,
+        scaledown_minutes=config.modal_scaledown_minutes,
+    )
     if not isinstance(result, ModalDeploymentResult) or not result.endpoint_url.strip():
         raise ModalDeploymentError("Modal deployment did not return an endpoint URL")
     record = build_deployment_record(
@@ -428,6 +453,8 @@ def deploy_modal_endpoint(
         mode=DEPLOYMENT_MODE_MODAL,
         endpoint_url=result.endpoint_url,
         deployed_at=now if now is not None else _utc_now(),
+        submit_url=result.submit_url,
+        result_url=result.result_url,
     )
     _write_deployment_record(record, config)
     return record

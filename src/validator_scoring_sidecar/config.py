@@ -18,6 +18,13 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 # runtimes can raise it via POSTFIAT_SIDECAR_INFERENCE_TIMEOUT_SECONDS.
 DEFAULT_INFERENCE_TIMEOUT_SECONDS = 180.0
 DEFAULT_CHAIN_POLL_INTERVAL_SECONDS = 60.0
+# Idle minutes Modal keeps the GPU container (and its billing) alive after a
+# request. Production is one inference per weekly round, so a long window
+# mostly bills an idle H100; the default is just enough that a failed pass
+# retried on the next loop tick does not pay a fresh cold start. Modal caps
+# scaledown_window at 20 minutes, so values above that would fail the deploy.
+DEFAULT_MODAL_SCALEDOWN_MINUTES = 5
+MAX_MODAL_SCALEDOWN_MINUTES = 20
 NETWORK_SCORING_BASE_URLS = {
     "devnet": "https://scoring-devnet.postfiat.org",
     "testnet": "https://scoring-testnet.postfiat.org",
@@ -39,6 +46,7 @@ ENV_CHAIN_POLL_INTERVAL_SECONDS = "POSTFIAT_SIDECAR_CHAIN_POLL_INTERVAL_SECONDS"
 ENV_VALIDATOR_WALLET_SEED = "POSTFIAT_SIDECAR_VALIDATOR_WALLET_SEED"
 ENV_VALIDATOR_KEYS_PATH = "POSTFIAT_SIDECAR_VALIDATOR_KEYS_PATH"
 ENV_MODAL_APP_NAME = "POSTFIAT_SIDECAR_MODAL_APP_NAME"
+ENV_MODAL_SCALEDOWN_MINUTES = "POSTFIAT_SIDECAR_MODAL_SCALEDOWN_MINUTES"
 
 # Mirror Modal's own app-name charset so a malformed value fails here, at config
 # load, rather than deep in a Modal deploy the participate loop cannot recover.
@@ -65,6 +73,7 @@ class SidecarConfig:
     validator_wallet_seed: str | None
     validator_keys_path: str | None
     modal_app_name: str | None
+    modal_scaledown_minutes: int
 
 
 def load_config(
@@ -153,6 +162,11 @@ def load_config(
         cli_value=None,
         env_value=env.get(ENV_MODAL_APP_NAME),
     )
+    resolved_modal_scaledown = _resolve_value(
+        cli_value=None,
+        env_value=env.get(ENV_MODAL_SCALEDOWN_MINUTES),
+        default=str(DEFAULT_MODAL_SCALEDOWN_MINUTES),
+    )
 
     return SidecarConfig(
         scoring_base_url=_normalize_base_url(resolved_base_url),
@@ -180,6 +194,9 @@ def load_config(
             _validate_modal_app_name(resolved_modal_app_name)
             if resolved_modal_app_name is not None
             else None
+        ),
+        modal_scaledown_minutes=_parse_modal_scaledown_minutes(
+            resolved_modal_scaledown
         ),
     )
 
@@ -330,6 +347,21 @@ def _parse_inference_timeout(value: str) -> float:
     if timeout <= 0:
         raise ConfigError("inference_timeout_seconds must be greater than zero")
     return timeout
+
+
+def _parse_modal_scaledown_minutes(value: str) -> int:
+    try:
+        minutes = int(value)
+    except ValueError as exc:
+        raise ConfigError("modal_scaledown_minutes must be an integer") from exc
+    if minutes <= 0:
+        raise ConfigError("modal_scaledown_minutes must be greater than zero")
+    if minutes > MAX_MODAL_SCALEDOWN_MINUTES:
+        raise ConfigError(
+            "modal_scaledown_minutes must not exceed "
+            f"{MAX_MODAL_SCALEDOWN_MINUTES} (Modal's scaledown_window cap)"
+        )
+    return minutes
 
 
 def _parse_chain_poll_interval(value: str) -> float:

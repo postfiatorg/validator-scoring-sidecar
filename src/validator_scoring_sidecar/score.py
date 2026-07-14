@@ -45,6 +45,8 @@ from validator_scoring_sidecar.deployment import (
 )
 from validator_scoring_sidecar.failure import Failure, FailureCategory
 from validator_scoring_sidecar.inference import (
+    FAILURE_REASON_CONFIGURATION,
+    FAILURE_REASON_KEY,
     InferenceBackend,
     InferenceConfigError,
     InferenceError,
@@ -65,8 +67,13 @@ from validator_scoring_sidecar.state import (
     RoundStateRecord,
     ScoreOutcome,
     SidecarState,
+    SidecarStateError,
 )
-from validator_scoring_sidecar.sync import DEFAULT_SYNC_ROUND_LIMIT, SidecarLock
+from validator_scoring_sidecar.sync import (
+    DEFAULT_SYNC_ROUND_LIMIT,
+    SidecarLock,
+    SyncLockError,
+)
 from validator_scoring_sidecar.verification import (
     HASH_MODEL_RESPONSE,
     HASH_VALIDATOR_SCORES,
@@ -123,6 +130,7 @@ class ScoreResult:
     compared: bool
     matched_levels: list[str]
     error_category: str | None
+    error_details: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +143,9 @@ class ScoreResult:
             "compared": self.compared,
             "matched_levels": list(self.matched_levels),
             "error_category": self.error_category,
+            "error_details": (
+                dict(self.error_details) if self.error_details is not None else None
+            ),
         }
 
 
@@ -159,10 +170,15 @@ def score_round(
     metadata = _resolve_round(client, round_id, round_limit)
     deferred_existing: RoundStateRecord | None = None
     inference_deadline: datetime | None = None
+    pending_call_id: str | None = None
 
     with SidecarLock(config.data_dir), SidecarState(config.data_dir) as state:
         existing = state.get_round(config.network, metadata.round_id)
         inference_deadline = _inference_deadline(existing)
+        # A persisted in-flight Modal call is resumable only for the same
+        # frozen inputs; anything else must submit fresh.
+        if existing is not None and existing.matches_frozen_input(metadata):
+            pending_call_id = existing.inference_call_id
 
         if (
             existing is not None
@@ -180,6 +196,7 @@ def score_round(
                     compared=True,
                     matched_levels=_split_levels(existing.comparison_levels_matched),
                     error_category=existing.error_category,
+                    error_details=_parse_persisted_details(existing.error_details),
                 )
             deferred_existing = existing
 
@@ -202,6 +219,7 @@ def score_round(
         fetch_foundation=fetch_foundation,
         runtime_provisioner=runtime_provisioner,
         inference_deadline=inference_deadline,
+        pending_call_id=pending_call_id,
         now_fn=now,
     )
 
@@ -259,6 +277,7 @@ def _full_score(
     fetch_foundation,
     runtime_provisioner: RuntimeProvisioner | None = None,
     inference_deadline: datetime | None = None,
+    pending_call_id: str | None = None,
     now_fn: Callable[[], datetime] | None = None,
 ) -> ScoreResult:
     now = now_fn or _utcnow
@@ -289,7 +308,7 @@ def _full_score(
                 compat.effective_mode,
                 FailureCategory.INFERENCE_TIMEOUT,
                 {
-                    "reason": "round_deadline_elapsed",
+                    FAILURE_REASON_KEY: "round_deadline_elapsed",
                     "deadline": (
                         inference_deadline.isoformat()
                         if inference_deadline is not None
@@ -297,7 +316,27 @@ def _full_score(
                     ),
                 },
             )
-        backend = _build_backend(factory, deployment_record, timeout_seconds)
+
+        def persist_call_id(call_id: str) -> None:
+            # Best-effort durability: a failed write must not kill the
+            # in-flight generation it was meant to make resumable.
+            try:
+                with SidecarLock(config.data_dir), SidecarState(
+                    config.data_dir
+                ) as state:
+                    state.record_inference_call(
+                        config.network, metadata, inference_call_id=call_id
+                    )
+            except (SyncLockError, SidecarStateError):
+                pass
+
+        backend = _build_backend(
+            factory,
+            deployment_record,
+            timeout_seconds,
+            pending_call_id=pending_call_id,
+            on_call_submitted=persist_call_id,
+        )
         inference = backend.run(model_request)
     except ModelRequestError as exc:
         return _record_failure(
@@ -313,15 +352,17 @@ def _full_score(
             metadata,
             compat.effective_mode,
             FailureCategory.RUNTIME_UNAVAILABLE,
-            {"message": str(exc)},
+            {"message": str(exc), FAILURE_REASON_KEY: FAILURE_REASON_CONFIGURATION},
         )
     except InferenceError as exc:
+        # The failure message is the operator's diagnosis (endpoint, underlying
+        # transport error); persist it with the structured details.
         return _record_failure(
             config,
             metadata,
             compat.effective_mode,
             exc.category,
-            exc.failure.details or None,
+            {"message": str(exc), **exc.failure.details},
         )
     finally:
         if backend is not None:
@@ -422,16 +463,26 @@ def _build_backend(
     factory: Callable[[dict[str, Any]], InferenceBackend] | None,
     deployment_record: dict[str, Any],
     timeout_seconds: float,
+    *,
+    pending_call_id: str | None = None,
+    on_call_submitted: Callable[[str], None] | None = None,
 ) -> InferenceBackend:
     if factory is not None:
         return factory(deployment_record)
-    return _default_backend_factory(deployment_record, timeout_seconds=timeout_seconds)
+    return _default_backend_factory(
+        deployment_record,
+        timeout_seconds=timeout_seconds,
+        pending_call_id=pending_call_id,
+        on_call_submitted=on_call_submitted,
+    )
 
 
 def _default_backend_factory(
     deployment_record: dict[str, Any],
     *,
     timeout_seconds: float,
+    pending_call_id: str | None = None,
+    on_call_submitted: Callable[[str], None] | None = None,
 ) -> InferenceBackend:
     mode = deployment_record.get("mode")
     endpoint_url = deployment_record.get("endpoint_url")
@@ -441,7 +492,12 @@ def _default_backend_factory(
         )
     if mode == DEPLOYMENT_MODE_MODAL:
         return ModalBackend.from_environment(
-            endpoint_url, timeout_seconds=timeout_seconds
+            endpoint_url,
+            timeout_seconds=timeout_seconds,
+            submit_url=_optional_record_url(deployment_record, "submit_url"),
+            result_url=_optional_record_url(deployment_record, "result_url"),
+            pending_call_id=pending_call_id,
+            on_call_submitted=on_call_submitted,
         )
     if mode == DEPLOYMENT_MODE_LOCAL:
         return LocalSglangBackend.from_environment(
@@ -450,6 +506,13 @@ def _default_backend_factory(
     raise DeploymentError(
         f"deployment record mode {mode!r} is not a supported inference backend"
     )
+
+
+def _optional_record_url(record: dict[str, Any], key: str) -> str | None:
+    value = record.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _fetch_foundation_hashes(
@@ -674,6 +737,7 @@ def _scored_result(
         compared=compared,
         matched_levels=list(outcome.comparison_levels_matched or []),
         error_category=outcome.error_category,
+        error_details=outcome.error_details,
     )
 
 
@@ -697,6 +761,7 @@ def _outcome_result(
         compared=False,
         matched_levels=[],
         error_category=outcome.error_category,
+        error_details=outcome.error_details,
     )
 
 
@@ -723,3 +788,15 @@ def _split_levels(value: str | None) -> list[str]:
     if not value:
         return []
     return value.split(",")
+
+
+def _parse_persisted_details(value: str | None) -> dict[str, Any] | None:
+    """Decode error details persisted as JSON in the round state, or ``None``."""
+
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None

@@ -13,6 +13,9 @@ from validator_scoring_sidecar.deployment import DeploymentError
 from validator_scoring_sidecar.failure import FailureCategory
 from validator_scoring_sidecar.inference import (
     BACKEND_MODE_MODAL,
+    FAILURE_REASON_CONFIGURATION,
+    FAILURE_REASON_ENDPOINT_UNREACHABLE,
+    FAILURE_REASON_KEY,
     InferenceError,
     InferenceResult,
 )
@@ -335,6 +338,36 @@ def test_full_score_divergence(tmp_path):
     assert result.matched_levels == ["PARSED_MATCH"]
 
 
+def test_already_scored_divergent_round_returns_persisted_details(tmp_path):
+    config = _setup(tmp_path)
+    foundation = dict(EXPECTED_HASHES)
+    foundation[HASH_MODEL_RESPONSE] = "0" * 64
+
+    score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=lambda record: FakeBackend(),
+        foundation_hash_fetcher=lambda *args: foundation,
+        package_fetcher=_make_package_fetcher(_manifest()),
+    )
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=_no_backend,
+        foundation_hash_fetcher=lambda *args: foundation,
+        package_fetcher=_no_fetch,
+    )
+
+    assert result.status == SCORE_STATUS_ALREADY_SCORED
+    assert result.error_details == {
+        "matched_levels": ["PARSED_MATCH"],
+        "diverged_levels": ["RAW_MATCH"],
+    }
+
+
 def test_full_score_inference_failure_records_scoring_failed(tmp_path):
     config = _setup(tmp_path)
     backend = FakeBackend(error=InferenceError(FailureCategory.INFERENCE_TIMEOUT, "slow"))
@@ -351,7 +384,47 @@ def test_full_score_inference_failure_records_scoring_failed(tmp_path):
     assert result.status == SCORE_STATUS_SCORING_FAILED
     assert result.sidecar_state == STATE_SCORING_FAILED
     assert result.error_category == FailureCategory.INFERENCE_TIMEOUT.value
+    assert result.error_details == {"message": "slow"}
     assert backend.closed is True
+
+
+def test_full_score_endpoint_unreachable_preserves_diagnostics(tmp_path):
+    config = _setup(tmp_path)
+    message = (
+        "could not reach inference endpoint at https://operator--app.modal.run"
+        "/v1/chat/completions: Server disconnected without sending a response."
+    )
+    backend = FakeBackend(
+        error=InferenceError(
+            FailureCategory.RUNTIME_UNAVAILABLE,
+            message,
+            details={FAILURE_REASON_KEY: FAILURE_REASON_ENDPOINT_UNREACHABLE},
+        )
+    )
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=lambda record: backend,
+        foundation_hash_fetcher=lambda *args: None,
+        package_fetcher=_make_package_fetcher(_manifest()),
+    )
+
+    assert result.status == SCORE_STATUS_SCORING_FAILED
+    assert result.error_category == FailureCategory.RUNTIME_UNAVAILABLE.value
+    assert result.error_details == {
+        "message": message,
+        FAILURE_REASON_KEY: FAILURE_REASON_ENDPOINT_UNREACHABLE,
+    }
+    assert result.as_dict()["error_details"] == result.error_details
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round("testnet", 123)
+    assert record.sidecar_state == STATE_SCORING_FAILED
+    persisted = json.loads(record.error_details)
+    assert persisted["message"] == message
+    assert persisted[FAILURE_REASON_KEY] == FAILURE_REASON_ENDPOINT_UNREACHABLE
 
 
 def test_full_score_releases_sidecar_lock_during_inference(tmp_path):
@@ -670,6 +743,14 @@ def test_default_factory_missing_credentials_records_scoring_failed(tmp_path, mo
     assert result.status == SCORE_STATUS_SCORING_FAILED
     assert result.sidecar_state == STATE_SCORING_FAILED
     assert result.error_category == FailureCategory.RUNTIME_UNAVAILABLE.value
+    assert result.error_details[FAILURE_REASON_KEY] == FAILURE_REASON_CONFIGURATION
+    assert "POSTFIAT_SIDECAR_MODAL_KEY" in result.error_details["message"]
+
+    with SidecarState(tmp_path) as state:
+        record = state.get_round("testnet", 123)
+    persisted = json.loads(record.error_details)
+    assert persisted[FAILURE_REASON_KEY] == FAILURE_REASON_CONFIGURATION
+    assert "POSTFIAT_SIDECAR_MODAL_KEY" in persisted["message"]
 
 
 def test_deferred_falls_back_to_rescore_when_persisted_hashes_missing(tmp_path):
@@ -835,3 +916,54 @@ def test_dry_run_round_is_skipped_without_provisioning(tmp_path):
 
     assert result.status == SCORE_STATUS_SKIPPED
     assert result.error_category == FailureCategory.SKIPPED_OPERATOR_OPT_OUT.value
+
+
+def test_score_round_wires_persisted_call_id_into_default_factory(
+    tmp_path, monkeypatch
+):
+    config = _setup(tmp_path)
+    metadata = RoundMetadata(
+        round_id=123,
+        round_number=456,
+        status="INPUT_FROZEN",
+        input_package_cid="QmInput",
+        input_package_hash=PACKAGE_HASH,
+        input_frozen_at="2026-05-25T00:00:00+00:00",
+        final_bundle_cid=None,
+    )
+    with SidecarState(tmp_path) as state:
+        state.record_discovered("testnet", metadata)
+        state.record_inference_call(
+            "testnet", metadata, inference_call_id="fc-resume"
+        )
+
+    captured = {}
+
+    def fake_default_factory(record, *, timeout_seconds, pending_call_id=None,
+                             on_call_submitted=None):
+        captured["pending_call_id"] = pending_call_id
+        captured["on_call_submitted"] = on_call_submitted
+        return FakeBackend()
+
+    import validator_scoring_sidecar.score as score_module
+
+    monkeypatch.setattr(
+        score_module, "_default_backend_factory", fake_default_factory
+    )
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        foundation_hash_fetcher=lambda *args: None,
+        package_fetcher=_make_package_fetcher(_manifest()),
+    )
+
+    assert result.sidecar_state == STATE_SCORED
+    assert captured["pending_call_id"] == "fc-resume"
+
+    # The submit callback persists the new call id into the round state.
+    captured["on_call_submitted"]("fc-fresh")
+    with SidecarState(tmp_path) as state:
+        record = state.get_round("testnet", 123)
+    assert record.inference_call_id == "fc-fresh"

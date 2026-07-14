@@ -20,7 +20,7 @@ STATE_COMMITTED = "COMMITTED"
 STATE_REVEALED = "REVEALED"
 STATE_SCORING_FAILED = "SCORING_FAILED"
 STATE_SKIPPED = "SKIPPED"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # A round in any of these states already has its verified input package, so
 # sync must treat it as handled and not re-fetch it.
@@ -66,6 +66,13 @@ _V5_COLUMNS: tuple[tuple[str, str], ...] = (
     ("reveal_error_category", "TEXT"),
 )
 
+# The in-flight Modal inference call for the round, persisted at submit time so
+# a restarted sidecar resumes polling the same generation instead of paying for
+# a new one.
+_V7_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("inference_call_id", "TEXT"),
+)
+
 # The full sidecar_rounds column list, in RoundStateRecord.from_row order, shared
 # by every round read so the SELECT and the row mapping cannot drift apart.
 _ROUND_COLUMNS = (
@@ -78,7 +85,7 @@ _ROUND_COLUMNS = (
     "salt, commit_tx_hash, validator_master_key, "
     "commit_opens_at, commit_closes_at, reveal_opens_at, "
     "reveal_closes_at, reveal_tx_hash, commitment_hash, "
-    "reveal_error_category"
+    "reveal_error_category, inference_call_id"
 )
 
 
@@ -157,6 +164,7 @@ class RoundStateRecord:
     reveal_tx_hash: str | None
     commitment_hash: str | None
     reveal_error_category: str | None
+    inference_call_id: str | None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "RoundStateRecord":
@@ -190,6 +198,7 @@ class RoundStateRecord:
             reveal_tx_hash=row["reveal_tx_hash"],
             commitment_hash=row["commitment_hash"],
             reveal_error_category=row["reveal_error_category"],
+            inference_call_id=row["inference_call_id"],
         )
 
     def matches_frozen_input(self, metadata: RoundMetadata) -> bool:
@@ -346,6 +355,7 @@ class SidecarState:
                 fetch_source = NULL,
                 verified_file_count = NULL,
                 input_verified_at = NULL,
+                inference_call_id = NULL,
                 updated_at = excluded.updated_at
             """,
             (
@@ -389,6 +399,9 @@ class SidecarState:
                 fetch_source = excluded.fetch_source,
                 verified_file_count = excluded.verified_file_count,
                 input_verified_at = excluded.input_verified_at,
+                inference_call_id = CASE
+                    WHEN input_package_hash != excluded.input_package_hash
+                    THEN NULL ELSE inference_call_id END,
                 updated_at = excluded.updated_at
             """,
             (
@@ -454,6 +467,9 @@ class SidecarState:
                 comparison_levels_matched = excluded.comparison_levels_matched,
                 error_category = excluded.error_category,
                 error_details = excluded.error_details,
+                inference_call_id = CASE
+                    WHEN excluded.sidecar_state = 'SCORED'
+                    THEN NULL ELSE inference_call_id END,
                 updated_at = excluded.updated_at
             """,
             (
@@ -816,6 +832,49 @@ class SidecarState:
             ),
         )
 
+    def record_inference_call(
+        self,
+        network: str,
+        metadata: RoundMetadata,
+        *,
+        inference_call_id: str,
+    ) -> None:
+        """Persist the round's in-flight Modal inference call identifier.
+
+        Written the moment a generation is submitted, before any polling, so a
+        crash or restart mid-generation resumes the same server-side call
+        instead of paying for a new one. Only this column is written; the
+        round's lifecycle state and fetch columns are untouched.
+        """
+
+        now = _utc_now()
+        self._execute_write(
+            """
+            INSERT INTO sidecar_rounds (
+                network, round_id, round_number, scoring_status, sidecar_state,
+                input_package_cid, input_package_hash, input_frozen_at,
+                inference_call_id, discovered_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(network, round_id) DO UPDATE SET
+                inference_call_id = excluded.inference_call_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                network,
+                metadata.round_id,
+                metadata.round_number,
+                metadata.status,
+                STATE_INPUT_PACKAGE_VERIFIED,
+                metadata.input_package_cid,
+                metadata.input_package_hash,
+                metadata.input_frozen_at,
+                inference_call_id,
+                now,
+                now,
+            ),
+        )
+
     def get_cached_publisher_address(self, network: str) -> str | None:
         """Return the foundation publisher address discovered on an earlier
         pass, or ``None`` when no address has been cached for the network."""
@@ -912,6 +971,8 @@ class SidecarState:
                 self._migrate_v4_to_v5()
             if current_version < 6:
                 self._migrate_v5_to_v6()
+            if current_version < 7:
+                self._migrate_v6_to_v7()
         self._execute_write(f"PRAGMA user_version = {SCHEMA_VERSION}", ())
 
     def _create_schema(self) -> None:
@@ -947,6 +1008,7 @@ class SidecarState:
                 reveal_tx_hash TEXT,
                 commitment_hash TEXT,
                 reveal_error_category TEXT,
+                inference_call_id TEXT,
                 discovered_at TEXT NOT NULL,
                 input_verified_at TEXT,
                 updated_at TEXT NOT NULL,
@@ -997,6 +1059,15 @@ class SidecarState:
 
     def _migrate_v5_to_v6(self) -> None:
         self._create_foundation_publisher_table()
+
+    def _migrate_v6_to_v7(self) -> None:
+        existing = self._existing_columns("sidecar_rounds")
+        for name, column_type in _V7_COLUMNS:
+            if name not in existing:
+                self._execute_write(
+                    f"ALTER TABLE sidecar_rounds ADD COLUMN {name} {column_type}",
+                    (),
+                )
 
     def _create_foundation_publisher_table(self) -> None:
         self._execute_write(

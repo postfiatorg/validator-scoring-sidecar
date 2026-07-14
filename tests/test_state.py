@@ -545,3 +545,119 @@ def test_state_rejects_newer_schema_version(tmp_path):
     with pytest.raises(SidecarStateError, match="newer than supported"):
         with SidecarState(tmp_path):
             pass
+
+
+def test_record_inference_call_round_trip(tmp_path):
+    metadata = _metadata()
+    with SidecarState(tmp_path) as state:
+        state.record_discovered("testnet", metadata)
+        state.record_inference_call(
+            "testnet", metadata, inference_call_id="fc-123"
+        )
+        record = state.get_round("testnet", metadata.round_id)
+        assert record.inference_call_id == "fc-123"
+
+        # A successful score consumes the job and clears the id.
+        state.record_score(
+            "testnet",
+            metadata,
+            ScoreOutcome(sidecar_state=STATE_SCORED, backend_mode="modal"),
+        )
+        record = state.get_round("testnet", metadata.round_id)
+        assert record.inference_call_id is None
+        assert record.sidecar_state == STATE_SCORED
+
+
+def test_record_inference_call_inserts_unknown_round(tmp_path):
+    metadata = _metadata()
+    with SidecarState(tmp_path) as state:
+        state.record_inference_call(
+            "testnet", metadata, inference_call_id="fc-9"
+        )
+        record = state.get_round("testnet", metadata.round_id)
+        assert record.inference_call_id == "fc-9"
+        assert record.input_package_hash == metadata.input_package_hash
+
+
+def test_input_refreeze_clears_stale_inference_call(tmp_path):
+    metadata = _metadata()
+    refrozen = RoundMetadata(
+        round_id=metadata.round_id,
+        round_number=metadata.round_number,
+        status="INPUT_FROZEN",
+        input_package_cid="QmRefrozen",
+        input_package_hash="b" * 64,
+        input_frozen_at="2026-05-26T00:00:00+00:00",
+        final_bundle_cid=None,
+    )
+    with SidecarState(tmp_path) as state:
+        state.record_discovered("testnet", metadata)
+        state.record_inference_call(
+            "testnet", metadata, inference_call_id="fc-old"
+        )
+
+        # A re-discovered round with changed frozen inputs must not resume the
+        # old input's generation.
+        state.record_discovered("testnet", refrozen)
+        assert state.get_round("testnet", metadata.round_id).inference_call_id is None
+
+
+def test_input_verified_preserves_call_id_for_same_input_only(tmp_path):
+    metadata = _metadata()
+    package = _fetched_package(tmp_path, metadata)
+    with SidecarState(tmp_path) as state:
+        state.record_input_verified("testnet", metadata, package)
+        state.record_inference_call(
+            "testnet", metadata, inference_call_id="fc-keep"
+        )
+
+        # Same frozen input re-verified (every full score does this): resume
+        # survives.
+        state.record_input_verified("testnet", metadata, package)
+        assert (
+            state.get_round("testnet", metadata.round_id).inference_call_id
+            == "fc-keep"
+        )
+
+        refrozen = RoundMetadata(
+            round_id=metadata.round_id,
+            round_number=metadata.round_number,
+            status="INPUT_FROZEN",
+            input_package_cid="QmRefrozen",
+            input_package_hash="b" * 64,
+            input_frozen_at="2026-05-26T00:00:00+00:00",
+            final_bundle_cid=None,
+        )
+        state.record_input_verified(
+            "testnet", refrozen, _fetched_package(tmp_path, refrozen)
+        )
+        assert state.get_round("testnet", metadata.round_id).inference_call_id is None
+
+
+def test_record_score_clears_call_id_only_when_scored(tmp_path):
+    metadata = _metadata()
+    with SidecarState(tmp_path) as state:
+        state.record_discovered("testnet", metadata)
+        state.record_inference_call(
+            "testnet", metadata, inference_call_id="fc-live"
+        )
+
+        # A failed attempt (e.g. budget exhausted mid-generation) must keep the
+        # id so the next pass resumes the same server-side call.
+        state.record_score(
+            "testnet",
+            metadata,
+            ScoreOutcome(sidecar_state=STATE_SCORING_FAILED, backend_mode="modal"),
+        )
+        assert (
+            state.get_round("testnet", metadata.round_id).inference_call_id
+            == "fc-live"
+        )
+
+        # A successful score consumes the job; the id is cleared.
+        state.record_score(
+            "testnet",
+            metadata,
+            ScoreOutcome(sidecar_state=STATE_SCORED, backend_mode="modal"),
+        )
+        assert state.get_round("testnet", metadata.round_id).inference_call_id is None

@@ -29,6 +29,8 @@ from validator_scoring_sidecar.deployment import (
 APP_MODULE_PATH = Path(__file__).with_name("_modal_app.py")
 ENDPOINT_CLASS_NAME = "SidecarScoringEndpoint"
 ENDPOINT_WEB_METHOD = "serve"
+CONTROL_SUBMIT_FUNCTION = "submit"
+CONTROL_RESULT_FUNCTION = "result"
 # The Modal SDK's own credential variables; the deploy subprocess inherits them.
 ENV_MODAL_TOKEN_ID = "MODAL_TOKEN_ID"
 ENV_MODAL_TOKEN_SECRET = "MODAL_TOKEN_SECRET"
@@ -51,17 +53,32 @@ ENV_LAUNCH_ARGS = "SIDECAR_MODAL_LAUNCH_ARGS"
 ENV_ENVIRONMENT = "SIDECAR_MODAL_ENVIRONMENT"
 ENV_MODEL_REPO_ID = "SIDECAR_MODAL_MODEL_REPO_ID"
 ENV_MODEL_REVISION = "SIDECAR_MODAL_MODEL_REVISION"
+ENV_SCALEDOWN_MINUTES = "SIDECAR_MODAL_SCALEDOWN_MINUTES"
 
 
 class RealModalDeployer:
     """Deploys the bundled Modal app under the operator's account."""
 
-    def deploy(self, spec: RuntimeSpec, *, app_name: str) -> ModalDeploymentResult:
+    def deploy(
+        self,
+        spec: RuntimeSpec,
+        *,
+        app_name: str,
+        scaledown_minutes: int,
+    ) -> ModalDeploymentResult:
         self._require_modal_installed()
         self._require_modal_login()
-        completed = self._run_modal_deploy(spec, app_name)
+        completed = self._run_modal_deploy(spec, app_name, scaledown_minutes)
         endpoint_url = self._resolve_endpoint_url(app_name, completed.stdout)
-        return ModalDeploymentResult(endpoint_url=endpoint_url)
+        return ModalDeploymentResult(
+            endpoint_url=endpoint_url,
+            submit_url=self._lookup_function_web_url(
+                app_name, CONTROL_SUBMIT_FUNCTION
+            ),
+            result_url=self._lookup_function_web_url(
+                app_name, CONTROL_RESULT_FUNCTION
+            ),
+        )
 
     def _require_modal_installed(self) -> None:
         if importlib.util.find_spec("modal") is None:
@@ -80,11 +97,12 @@ class RealModalDeployer:
         self,
         spec: RuntimeSpec,
         app_name: str,
+        scaledown_minutes: int,
     ) -> subprocess.CompletedProcess[str]:
         try:
             completed = subprocess.run(
                 ["modal", "deploy", str(APP_MODULE_PATH)],
-                env=self._deploy_environment(spec, app_name),
+                env=self._deploy_environment(spec, app_name, scaledown_minutes),
                 capture_output=True,
                 text=True,
                 timeout=_DEPLOY_TIMEOUT_SECONDS,
@@ -104,6 +122,7 @@ class RealModalDeployer:
         self,
         spec: RuntimeSpec,
         app_name: str,
+        scaledown_minutes: int,
     ) -> dict[str, str]:
         import json
 
@@ -118,6 +137,7 @@ class RealModalDeployer:
                 ENV_ENVIRONMENT: json.dumps(spec.environment),
                 ENV_MODEL_REPO_ID: spec.model_repo_id,
                 ENV_MODEL_REVISION: spec.model_revision,
+                ENV_SCALEDOWN_MINUTES: str(scaledown_minutes),
             }
         )
         return environment
@@ -145,6 +165,19 @@ class RealModalDeployer:
             endpoint = modal.Cls.from_name(app_name, ENDPOINT_CLASS_NAME)
             web_method = getattr(endpoint(), ENDPOINT_WEB_METHOD)
             return web_method.get_web_url()
+        except Exception:
+            return None
+
+    def _lookup_function_web_url(
+        self, app_name: str, function_name: str
+    ) -> str | None:
+        """Best-effort URL of a control endpoint; ``None`` degrades the backend
+        to the direct transport rather than failing the deploy."""
+
+        try:
+            import modal
+
+            return modal.Function.from_name(app_name, function_name).get_web_url()
         except Exception:
             return None
 

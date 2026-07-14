@@ -135,8 +135,9 @@ round is already committed or revealed.
 | **`participate`** | The full lifecycle: score, commit, and reveal on-chain in the announced windows. | Inference runtime **and** the participation prerequisites below. |
 
 `sync` is the safe default and a continuous integrity monitor for the foundation's
-frozen inputs. Actually checking the foundation's *scoring* — and voting — needs
-`participate`.
+frozen inputs. It needs no validator at all, which makes it a zero-risk first
+step for anyone. Actually checking the foundation's *scoring* — and voting —
+needs `participate`.
 
 ## Participation is all-or-nothing
 

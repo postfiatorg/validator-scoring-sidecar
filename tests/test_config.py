@@ -255,3 +255,17 @@ def test_modal_app_name_rejects_invalid_value():
 def test_modal_app_name_blank_treated_as_unset():
     config = load_config(environ={"POSTFIAT_SIDECAR_MODAL_APP_NAME": "   "})
     assert config.modal_app_name is None
+
+
+def test_modal_scaledown_minutes_defaults_and_reads_env():
+    assert load_config(environ={}).modal_scaledown_minutes == 5
+    config = load_config(
+        environ={"POSTFIAT_SIDECAR_MODAL_SCALEDOWN_MINUTES": "12"}
+    )
+    assert config.modal_scaledown_minutes == 12
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "2.5", "soon", "25"])
+def test_modal_scaledown_minutes_rejects_invalid_value(value):
+    with pytest.raises(ConfigError, match="modal_scaledown_minutes"):
+        load_config(environ={"POSTFIAT_SIDECAR_MODAL_SCALEDOWN_MINUTES": value})
