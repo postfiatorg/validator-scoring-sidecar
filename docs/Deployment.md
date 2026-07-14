@@ -56,6 +56,10 @@ Unlike Modal, a local container holds the GPU for as long as it runs. The comman
 
 The deployment record points at the endpoint as seen from the GPU host (`localhost` by default), which is not reachable from inside the sidecar container. Set `POSTFIAT_SIDECAR_LOCAL_ENDPOINT_URL` in `.env` to the container-reachable address — `http://host.docker.internal:8000/v1` for a runtime on the same host (the participation overlay maps that name to the host), or the GPU host's address when it is a separate machine. If the record was written on a different machine than the sidecar runs on, copy it into the data volume with `docker compose cp <path> sidecar:/data/runtime/deployment_record.json`.
 
+## Weight downloads and `HF_TOKEN`
+
+Both paths download the manifest's pinned model snapshot (roughly 30 GB) from Hugging Face before the endpoint can serve — the Modal container on its first start, the local starter before launching the container. Anonymous downloads work but the Hub throttles them, which can stretch a first deploy by tens of minutes. To authenticate, supply the standard `HF_TOKEN` variable (a read-only token is enough) where the downloading process actually runs: for **Modal**, set it in `.env` — it reaches the deploy through the container environment and is handed to the GPU container as a runtime-injected Modal Secret, never through the baked image environment, and a rotated value applies at the next redeploy; for **local SGLang**, export it in the GPU-host shell that runs `start-sglang` — `.env` never reaches that process. The token only authenticates the download; the manifest-pinned revision, and therefore the served weights, are unchanged. Without the variable both paths download anonymously, exactly as before.
+
 ## The deployment record
 
 `deployment_record.json` is the local description of the runtime you stood up: its mode (`modal` or `local`), image, GPU class, tensor parallelism, launch arguments, environment, served model name, model revision, and endpoint URL.

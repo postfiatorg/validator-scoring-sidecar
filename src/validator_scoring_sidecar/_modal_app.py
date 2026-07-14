@@ -61,6 +61,16 @@ _DEPLOY_CONFIG["SIDECAR_MODAL_MODEL_VOLUME"] = MODEL_VOLUME_NAME
 # POSTFIAT_SIDECAR_MODAL_SCALEDOWN_MINUTES (validated in config.py).
 SCALEDOWN_MINUTES = int(_DEPLOY_CONFIG["SIDECAR_MODAL_SCALEDOWN_MINUTES"])
 
+# Optional Hugging Face token for authenticated (unthrottled) weight downloads;
+# huggingface_hub reads HF_TOKEN from the environment on its own. Injected as a
+# Modal Secret at container runtime and kept out of _DEPLOY_CONFIG: the baked
+# image environment is recorded in the image definition, where a credential
+# must never land.
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+CONTAINER_SECRETS = (
+    [modal.Secret.from_dict({"HF_TOKEN": HF_TOKEN})] if HF_TOKEN else []
+)
+
 # The manifest environment is reproduced verbatim; HF cache locations are added
 # so weight downloads persist in the Modal volume across cold starts.
 RUNTIME_ENV = {
@@ -125,6 +135,7 @@ def _wait_for_server(timeout: int = 30 * MINUTES) -> None:
     image=sglang_image,
     gpu=GPU_TYPE,
     volumes={HF_CACHE_PATH: model_volume},
+    secrets=CONTAINER_SECRETS,
     timeout=60 * MINUTES,
     scaledown_window=SCALEDOWN_MINUTES * MINUTES,
     max_containers=1,

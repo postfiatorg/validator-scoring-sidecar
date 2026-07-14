@@ -19,6 +19,9 @@ dependencies = [
 dev = [
   "pytest>=8,<9",
   "ruff>=0.15,<1",
+  # The bundled Modal app's tests import the real SDK; without it the whole
+  # test_modal_app.py module skips silently, in CI included.
+  "modal>=0.73",
 ]
 modal = [
   "modal>=0.73",
