@@ -49,6 +49,7 @@ rather than advancing past unfinished work.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -77,6 +78,7 @@ from validator_scoring_sidecar.config import (
 )
 from validator_scoring_sidecar.deployment import (
     DEPLOYMENT_MODE_LOCAL,
+    DeploymentError,
     NoEligibleRoundError,
     deploy_modal_endpoint,
     load_round_manifest,
@@ -94,6 +96,10 @@ from validator_scoring_sidecar.input_package import (
     InputPackageVerificationError,
     PackageSource,
     fetch_input_package,
+)
+from validator_scoring_sidecar.inference import (
+    modal_proxy_auth_headers,
+    probe_endpoint_ready,
 )
 from validator_scoring_sidecar.reveal import RevealError, submit_reveal
 from validator_scoring_sidecar.round_metadata import RoundMetadata
@@ -149,6 +155,16 @@ WARM_STATUS_READY = "ready"
 WARM_STATUS_SKIPPED_NO_CREDENTIALS = "skipped_no_credentials"
 WARM_STATUS_SKIPPED_LOCAL = "skipped_local"
 WARM_STATUS_ROUND_NOT_DEPLOYABLE = "round_not_deployable"
+WARM_STATUS_ENDPOINT_STILL_STARTING = "endpoint_still_starting"
+WARM_STATUS_ENDPOINT_UNVERIFIED = "endpoint_unverified"
+
+# Budget for the readiness poll after the deployment record is in place. The
+# first probe triggers the Modal cold start (container boot plus pinned-weight
+# load), so the budget must hold a full cold start while staying under the
+# bundled app's startup ceiling (STARTUP_TIMEOUT in _modal_app.py, 35 minutes)
+# — a poll outliving the ceiling could only ever report failure late.
+WARM_READINESS_TIMEOUT_SECONDS = 1500.0
+WARM_PROBE_INTERVAL_SECONDS = 15.0
 
 
 class ParticipationConfigError(RuntimeError):
@@ -157,7 +173,13 @@ class ParticipationConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class ParticipateResult:
-    """Summary of one participation pass."""
+    """Summary of one participation pass.
+
+    ``score_error_category`` and ``score_error_details`` mirror the scoring
+    outcome's failure classification so the unattended loop's log line carries
+    the diagnosis — the loop is where production scoring failures surface, and
+    an operator must not need a manual ``score`` re-run to read them.
+    """
 
     network: str
     score_status: str
@@ -168,12 +190,20 @@ class ParticipateResult:
     announcements: list[dict[str, Any]]
     protocol_violations: list[dict[str, Any]]
     score_error: str | None = None
+    score_error_category: str | None = None
+    score_error_details: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "network": self.network,
             "score_status": self.score_status,
             "score_error": self.score_error,
+            "score_error_category": self.score_error_category,
+            "score_error_details": (
+                dict(self.score_error_details)
+                if self.score_error_details is not None
+                else None
+            ),
             "round_id": self.round_id,
             "round_number": self.round_number,
             "commits": list(self.commits),
@@ -260,9 +290,12 @@ def warm_modal_runtime(
     provisioner_factory: Callable[
         [SidecarConfig], RuntimeProvisioner | None
     ] = modal_runtime_provisioner,
+    readiness_prober: Callable[[str], bool] | None = None,
+    readiness_timeout_seconds: float = WARM_READINESS_TIMEOUT_SECONDS,
+    probe_interval_seconds: float = WARM_PROBE_INTERVAL_SECONDS,
 ) -> WarmRuntimeResult:
-    """Provision the manifest-pinned Modal endpoint once at startup, before the
-    first participation round.
+    """Provision the manifest-pinned Modal endpoint at startup and drive it to
+    actual serving readiness, before the first participation round.
 
     Moves the one-time Modal deploy (image build and kernel compilation) and GPU
     cold start out of the first round's window. Absent Modal credentials it is a
@@ -271,11 +304,19 @@ def warm_modal_runtime(
     (``provision_runtime_if_needed``) so a valid, manifest-current endpoint is
     not redeployed and a local-mode record is never replaced.
 
+    A deployment record alone is paperwork: the served endpoint may still be
+    booting and pulling weights. Once the record is in place the pass probes the
+    endpoint's health through Modal proxy auth — the first probe is what starts
+    a scaled-to-zero container, so the cold start genuinely happens here — and
+    polls within ``readiness_timeout_seconds``. ``ready`` is reported only on a
+    confirmed probe; an elapsed budget reports ``endpoint_still_starting`` and
+    missing proxy credentials report ``endpoint_unverified``, both of which the
+    CLI maps to a non-zero exit so the entrypoint's non-fatal handling logs the
+    truth (the loop still provisions and retries on demand).
+
     Configuration and infrastructure failures (a missing manifest, an
     unreachable scoring service, no eligible round, a Modal deploy error) are not
     swallowed here — they propagate to the caller, which decides the exit code.
-    The container entrypoint runs this non-fatally, so a failed warm-up never
-    blocks the participation loop, which still provisions the endpoint on demand.
     """
 
     provisioner = provisioner_factory(config)
@@ -291,10 +332,46 @@ def warm_modal_runtime(
         return WarmRuntimeResult(status=WARM_STATUS_ROUND_NOT_DEPLOYABLE)
     if record.get("mode") == DEPLOYMENT_MODE_LOCAL:
         return WarmRuntimeResult(status=WARM_STATUS_SKIPPED_LOCAL)
-    return WarmRuntimeResult(
-        status=WARM_STATUS_READY,
-        endpoint_url=record.get("endpoint_url"),
-    )
+
+    endpoint_url = record.get("endpoint_url")
+    # The record is read back from disk, so guard it like the score path does
+    # rather than letting the prober crash on a corrupted record.
+    if not isinstance(endpoint_url, str) or not endpoint_url.strip():
+        raise DeploymentError(
+            "deployment record is missing a valid endpoint_url; redeploy"
+        )
+    prober = readiness_prober or _default_readiness_prober()
+    if prober is None:
+        return WarmRuntimeResult(
+            status=WARM_STATUS_ENDPOINT_UNVERIFIED, endpoint_url=endpoint_url
+        )
+
+    deadline = time.monotonic() + readiness_timeout_seconds
+    while True:
+        if prober(endpoint_url):
+            return WarmRuntimeResult(
+                status=WARM_STATUS_READY, endpoint_url=endpoint_url
+            )
+        if time.monotonic() >= deadline:
+            return WarmRuntimeResult(
+                status=WARM_STATUS_ENDPOINT_STILL_STARTING,
+                endpoint_url=endpoint_url,
+            )
+        time.sleep(probe_interval_seconds)
+
+
+def _default_readiness_prober() -> Callable[[str], bool] | None:
+    """The real health prober, or ``None`` without proxy credentials to probe
+    with — an unprobeable endpoint must be reported, not guessed at."""
+
+    headers = modal_proxy_auth_headers()
+    if headers is None:
+        return None
+
+    def probe(endpoint_url: str) -> bool:
+        return probe_endpoint_ready(endpoint_url, headers=headers)
+
+    return probe
 
 
 def participate(
@@ -325,6 +402,8 @@ def participate(
         else modal_runtime_provisioner(config)
     )
     score_error: str | None = None
+    score_error_category: str | None = None
+    score_error_details: dict[str, Any] | None = None
     try:
         score = score_runner(
             config,
@@ -334,6 +413,8 @@ def participate(
             runtime_provisioner=provisioner,
         )
         score_status = score.status
+        score_error_category = score.error_category
+        score_error_details = score.error_details
         active_round_id: int | None = score.round_id
         active_round_number = score.round_number
     except NoEligibleRoundError:
@@ -400,6 +481,8 @@ def participate(
         announcements=announcements,
         protocol_violations=protocol_violations,
         score_error=score_error,
+        score_error_category=score_error_category,
+        score_error_details=score_error_details,
     )
 
 

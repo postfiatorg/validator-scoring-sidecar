@@ -14,12 +14,16 @@ from validator_scoring_sidecar.inference import (
     DEFAULT_INFERENCE_POOL_TIMEOUT_SECONDS,
     DEFAULT_INFERENCE_TIMEOUT_SECONDS,
     DEFAULT_INFERENCE_WRITE_TIMEOUT_SECONDS,
+    FAILURE_REASON_ENDPOINT_UNREACHABLE,
+    FAILURE_REASON_KEY,
     InferenceConfigError,
     InferenceError,
     LocalSglangBackend,
     ModalBackend,
     ModelRequestError,
     load_model_request,
+    modal_proxy_auth_headers,
+    probe_endpoint_ready,
 )
 
 ENDPOINT = "https://operator--app.modal.run"
@@ -236,6 +240,10 @@ def test_connection_error_maps_to_runtime_unavailable():
         _backend(handler).run(_model_request())
 
     assert exc_info.value.category == FailureCategory.RUNTIME_UNAVAILABLE
+    assert exc_info.value.failure.details == {
+        FAILURE_REASON_KEY: FAILURE_REASON_ENDPOINT_UNREACHABLE
+    }
+    assert "connection refused" in str(exc_info.value)
 
 
 def test_http_error_status_maps_to_inference_error():
@@ -273,6 +281,233 @@ def test_missing_message_content_maps_to_inference_error():
         ).run(_model_request())
 
     assert exc_info.value.category == FailureCategory.INFERENCE_ERROR
+
+
+def _probe_client(handler):
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_probe_endpoint_ready_true_on_healthy_endpoint():
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        captured["key"] = request.headers.get("Modal-Key")
+        return httpx.Response(200, text="ok")
+
+    ready = probe_endpoint_ready(
+        f"{ENDPOINT}/v1",
+        headers={"Modal-Key": "k", "Modal-Secret": "s"},
+        http_client=_probe_client(handler),
+    )
+
+    assert ready is True
+    # /health is served at the endpoint root, above the /v1 API prefix.
+    assert captured["url"] == f"{ENDPOINT}/health"
+    assert captured["key"] == "k"
+
+
+@pytest.mark.parametrize("error", [None, httpx.ConnectError, httpx.ReadTimeout])
+def test_probe_endpoint_ready_false_when_not_serving(error):
+    def handler(request):
+        if error is not None:
+            raise error("not serving", request=request)
+        return httpx.Response(503, text="starting")
+
+    assert (
+        probe_endpoint_ready(ENDPOINT, http_client=_probe_client(handler)) is False
+    )
+
+
+def test_modal_proxy_auth_headers_reads_env():
+    headers = modal_proxy_auth_headers(
+        environ={
+            "POSTFIAT_SIDECAR_MODAL_KEY": "k",
+            "POSTFIAT_SIDECAR_MODAL_SECRET": "s",
+        }
+    )
+    assert headers == {"Modal-Key": "k", "Modal-Secret": "s"}
+    assert modal_proxy_auth_headers(environ={}) is None
+
+
+SUBMIT_URL = f"{ENDPOINT}/submit"
+RESULT_URL = f"{ENDPOINT}/result"
+POLL_RAW_RESPONSE = json.dumps({"v1": {"score": 80}})
+POLL_DONE_PAYLOAD = {
+    "status": "done",
+    "response": {"choices": [{"message": {"content": POLL_RAW_RESPONSE}}]},
+}
+
+
+def _poll_backend(handler, **kwargs):
+    return ModalBackend(
+        ENDPOINT,
+        proxy_auth_key="key",
+        proxy_auth_secret="secret",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        submit_url=SUBMIT_URL,
+        result_url=RESULT_URL,
+        poll_interval_seconds=0,
+        **kwargs,
+    )
+
+
+def test_poll_transport_submits_then_polls_to_completion():
+    calls = {"submit": 0, "result": 0}
+    submitted_ids = []
+
+    def handler(request):
+        if str(request.url) == SUBMIT_URL:
+            calls["submit"] += 1
+            assert request.headers.get("Modal-Key") == "key"
+            return httpx.Response(200, json={"call_id": "fc-123"})
+        calls["result"] += 1
+        assert request.url.params["call_id"] == "fc-123"
+        if calls["result"] == 1:
+            return httpx.Response(200, json={"status": "pending"})
+        return httpx.Response(200, json=POLL_DONE_PAYLOAD)
+
+    backend = _poll_backend(handler, on_call_submitted=submitted_ids.append)
+    result = backend.run(_model_request())
+
+    assert result.content == POLL_RAW_RESPONSE
+    assert calls == {"submit": 1, "result": 2}
+    assert submitted_ids == ["fc-123"]
+
+
+def test_poll_transport_resumes_pending_call_without_submitting():
+    def handler(request):
+        assert str(request.url) != SUBMIT_URL, "resume must not submit a new job"
+        assert request.url.params["call_id"] == "fc-resume"
+        return httpx.Response(200, json=POLL_DONE_PAYLOAD)
+
+    backend = _poll_backend(handler, pending_call_id="fc-resume")
+    result = backend.run(_model_request())
+
+    assert result.content == POLL_RAW_RESPONSE
+
+
+def test_poll_transport_resubmits_once_when_resumed_call_expired():
+    submitted_ids = []
+
+    def handler(request):
+        if str(request.url) == SUBMIT_URL:
+            return httpx.Response(200, json={"call_id": "fc-fresh"})
+        if request.url.params["call_id"] == "fc-expired":
+            return httpx.Response(
+                200, json={"status": "failed", "error": "expired"}
+            )
+        return httpx.Response(200, json=POLL_DONE_PAYLOAD)
+
+    backend = _poll_backend(
+        handler,
+        pending_call_id="fc-expired",
+        on_call_submitted=submitted_ids.append,
+    )
+    result = backend.run(_model_request())
+
+    assert result.content == POLL_RAW_RESPONSE
+    assert submitted_ids == ["fc-fresh"]
+
+
+def test_poll_transport_raises_when_fresh_job_fails():
+    def handler(request):
+        if str(request.url) == SUBMIT_URL:
+            return httpx.Response(200, json={"call_id": "fc-bad"})
+        return httpx.Response(200, json={"status": "failed", "error": "boom"})
+
+    with pytest.raises(InferenceError) as exc_info:
+        _poll_backend(handler).run(_model_request())
+
+    assert exc_info.value.category == FailureCategory.INFERENCE_ERROR
+    assert "boom" in str(exc_info.value)
+
+
+def test_poll_transport_times_out_on_exhausted_budget():
+    def handler(request):
+        if str(request.url) == SUBMIT_URL:
+            return httpx.Response(200, json={"call_id": "fc-slow"})
+        return httpx.Response(200, json={"status": "pending"})
+
+    with pytest.raises(InferenceError) as exc_info:
+        _poll_backend(handler, timeout_seconds=0).run(_model_request())
+
+    assert exc_info.value.category == FailureCategory.INFERENCE_TIMEOUT
+    assert exc_info.value.failure.details == {
+        "call_id": "fc-slow",
+        FAILURE_REASON_KEY: "generation_in_progress",
+    }
+
+
+def test_poll_transport_survives_transient_poll_failures():
+    calls = {"result": 0}
+
+    def handler(request):
+        if str(request.url) == SUBMIT_URL:
+            return httpx.Response(200, json={"call_id": "fc-flaky"})
+        calls["result"] += 1
+        if calls["result"] == 1:
+            raise httpx.ConnectError("blip", request=request)
+        return httpx.Response(200, json=POLL_DONE_PAYLOAD)
+
+    result = _poll_backend(handler).run(_model_request())
+
+    assert result.content == POLL_RAW_RESPONSE
+    assert calls["result"] == 2
+
+
+def test_from_environment_forwards_job_interface_parameters():
+    def on_submitted(call_id):
+        pass
+
+    backend = ModalBackend.from_environment(
+        ENDPOINT,
+        environ={
+            "POSTFIAT_SIDECAR_MODAL_KEY": "k",
+            "POSTFIAT_SIDECAR_MODAL_SECRET": "s",
+        },
+        submit_url=SUBMIT_URL,
+        result_url=RESULT_URL,
+        pending_call_id="fc-resume",
+        on_call_submitted=on_submitted,
+    )
+    try:
+        assert backend._uses_poll_transport() is True
+        assert backend._pending_call_id == "fc-resume"
+        assert backend._on_call_submitted is on_submitted
+    finally:
+        backend.close()
+
+
+def test_poll_transport_network_failure_marks_endpoint_unreachable():
+    def handler(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    with pytest.raises(InferenceError) as exc_info:
+        _poll_backend(handler).run(_model_request())
+
+    assert exc_info.value.category == FailureCategory.RUNTIME_UNAVAILABLE
+    assert exc_info.value.failure.details == {
+        FAILURE_REASON_KEY: FAILURE_REASON_ENDPOINT_UNREACHABLE
+    }
+
+
+def test_modal_backend_without_job_interface_uses_direct_transport():
+    def handler(request):
+        assert str(request.url) == f"{ENDPOINT}/v1/chat/completions"
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": POLL_RAW_RESPONSE}}]}
+        )
+
+    backend = ModalBackend(
+        ENDPOINT,
+        proxy_auth_key="key",
+        proxy_auth_secret="secret",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    result = backend.run(_model_request())
+
+    assert result.content == POLL_RAW_RESPONSE
 
 
 def test_load_model_request_reads_inputs_file(tmp_path):
@@ -445,6 +680,9 @@ def test_local_connection_error_maps_to_runtime_unavailable():
         _local_backend(handler).run(_model_request())
 
     assert exc_info.value.category == FailureCategory.RUNTIME_UNAVAILABLE
+    assert exc_info.value.failure.details == {
+        FAILURE_REASON_KEY: FAILURE_REASON_ENDPOINT_UNREACHABLE
+    }
 
 
 def test_local_http_error_status_maps_to_inference_error():

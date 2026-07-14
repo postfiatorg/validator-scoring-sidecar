@@ -9,12 +9,15 @@ from xrpl.core.addresscodec import encode_node_public_key
 from validator_scoring_sidecar.chain import AnnouncementError, VerifiedAnnouncement
 from validator_scoring_sidecar.config import load_config
 from validator_scoring_sidecar.deployment import (
+    DeploymentError,
     ModalDeploymentResult,
     NoEligibleRoundError,
     deployment_record_path,
 )
 from validator_scoring_sidecar.input_package import FetchedInputPackage
 from validator_scoring_sidecar.participate import (
+    WARM_STATUS_ENDPOINT_STILL_STARTING,
+    WARM_STATUS_ENDPOINT_UNVERIFIED,
     WARM_STATUS_READY,
     WARM_STATUS_ROUND_NOT_DEPLOYABLE,
     WARM_STATUS_SKIPPED_LOCAL,
@@ -441,6 +444,7 @@ def _failing_score_runner(
         compared=False,
         matched_levels=[],
         error_category="INFERENCE_ERROR",
+        error_details={"message": "endpoint returned HTTP 500"},
     )
 
 
@@ -453,8 +457,13 @@ def test_participate_commits_after_transient_score_failure(tmp_path):
     # Pass 1: scoring fails. The announcement's windows are recorded and the
     # cursor advances past it; nothing commits because the round is not scored.
     rpc1 = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
-    _participate(tmp_path, signer, rpc1, score_runner=_failing_score_runner)
+    failed = _participate(tmp_path, signer, rpc1, score_runner=_failing_score_runner)
     assert rpc1.submitted == []
+    # The pass summary carries the scoring diagnosis, so the unattended loop's
+    # log line shows what failed without a manual `score` re-run.
+    assert failed.score_error_category == "INFERENCE_ERROR"
+    assert failed.score_error_details == {"message": "endpoint returned HTTP 500"}
+    assert failed.as_dict()["score_error_details"] == failed.score_error_details
     with SidecarState(tmp_path) as state:
         recorded = state.get_round(NETWORK, ROUND_ID)
     assert recorded is not None
@@ -786,9 +795,10 @@ def test_modal_runtime_provisioner_deploys_and_records(tmp_path):
     deployed = {}
 
     class FakeDeployer:
-        def deploy(self, spec, *, app_name):
+        def deploy(self, spec, *, app_name, scaledown_minutes):
             deployed["app_name"] = app_name
             deployed["image"] = spec.image
+            deployed["scaledown_minutes"] = scaledown_minutes
             return ModalDeploymentResult(endpoint_url="https://operator--app.modal.run")
 
     provision = modal_runtime_provisioner(
@@ -811,7 +821,7 @@ def test_modal_runtime_provisioner_uses_configured_app_name(tmp_path):
     deployed = {}
 
     class FakeDeployer:
-        def deploy(self, spec, *, app_name):
+        def deploy(self, spec, *, app_name, scaledown_minutes):
             deployed["app_name"] = app_name
             return ModalDeploymentResult(endpoint_url="https://operator--app.modal.run")
 
@@ -1031,6 +1041,7 @@ def test_warm_modal_runtime_provisions_when_no_record(tmp_path):
         WarmFakeClient(),
         package_fetcher=_warm_package_fetcher(_warm_manifest()),
         provisioner_factory=lambda config: provision,
+        readiness_prober=lambda url: True,
     )
 
     assert result.status == WARM_STATUS_READY
@@ -1041,6 +1052,84 @@ def test_warm_modal_runtime_provisions_when_no_record(tmp_path):
 def test_warm_modal_runtime_reuses_current_endpoint(tmp_path):
     _write_deployment_record(tmp_path, _warm_deployment_record())
 
+    probed = []
+
+    def prober(url):
+        probed.append(url)
+        return True
+
+    result = warm_modal_runtime(
+        _config(tmp_path),
+        WarmFakeClient(),
+        package_fetcher=_warm_package_fetcher(_warm_manifest()),
+        provisioner_factory=lambda config: _forbidden_provisioner,
+        readiness_prober=prober,
+    )
+
+    assert result.status == WARM_STATUS_READY
+    assert result.endpoint_url == WARM_ENDPOINT_URL
+    assert probed == [WARM_ENDPOINT_URL]
+
+
+def test_warm_modal_runtime_polls_until_endpoint_serves(tmp_path):
+    _write_deployment_record(tmp_path, _warm_deployment_record())
+
+    answers = iter([False, True])
+    probed = []
+
+    def prober(url):
+        probed.append(url)
+        return next(answers)
+
+    result = warm_modal_runtime(
+        _config(tmp_path),
+        WarmFakeClient(),
+        package_fetcher=_warm_package_fetcher(_warm_manifest()),
+        provisioner_factory=lambda config: _forbidden_provisioner,
+        readiness_prober=prober,
+        probe_interval_seconds=0,
+    )
+
+    assert result.status == WARM_STATUS_READY
+    assert probed == [WARM_ENDPOINT_URL, WARM_ENDPOINT_URL]
+
+
+def test_warm_modal_runtime_rejects_record_without_endpoint_url(tmp_path):
+    _write_deployment_record(tmp_path, _warm_deployment_record(endpoint_url=" "))
+
+    with pytest.raises(DeploymentError, match="endpoint_url"):
+        warm_modal_runtime(
+            _config(tmp_path),
+            WarmFakeClient(),
+            package_fetcher=_warm_package_fetcher(_warm_manifest()),
+            provisioner_factory=lambda config: _forbidden_provisioner,
+            readiness_prober=lambda url: True,
+        )
+
+
+def test_warm_modal_runtime_reports_still_starting_endpoint(tmp_path):
+    _write_deployment_record(tmp_path, _warm_deployment_record())
+
+    result = warm_modal_runtime(
+        _config(tmp_path),
+        WarmFakeClient(),
+        package_fetcher=_warm_package_fetcher(_warm_manifest()),
+        provisioner_factory=lambda config: _forbidden_provisioner,
+        readiness_prober=lambda url: False,
+        readiness_timeout_seconds=0,
+    )
+
+    assert result.status == WARM_STATUS_ENDPOINT_STILL_STARTING
+    assert result.endpoint_url == WARM_ENDPOINT_URL
+
+
+def test_warm_modal_runtime_reports_unverified_without_probe_credentials(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("POSTFIAT_SIDECAR_MODAL_KEY", raising=False)
+    monkeypatch.delenv("POSTFIAT_SIDECAR_MODAL_SECRET", raising=False)
+    _write_deployment_record(tmp_path, _warm_deployment_record())
+
     result = warm_modal_runtime(
         _config(tmp_path),
         WarmFakeClient(),
@@ -1048,7 +1137,7 @@ def test_warm_modal_runtime_reuses_current_endpoint(tmp_path):
         provisioner_factory=lambda config: _forbidden_provisioner,
     )
 
-    assert result.status == WARM_STATUS_READY
+    assert result.status == WARM_STATUS_ENDPOINT_UNVERIFIED
     assert result.endpoint_url == WARM_ENDPOINT_URL
 
 

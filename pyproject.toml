@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "validator-scoring-sidecar"
-version = "1.0.1"
+version = "1.1.0"
 description = "Validator-facing sidecar tooling for Post Fiat Dynamic UNL shadow verification."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,9 @@ dependencies = [
 dev = [
   "pytest>=8,<9",
   "ruff>=0.15,<1",
+  # The bundled Modal app's tests import the real SDK; without it the whole
+  # test_modal_app.py module skips silently, in CI included.
+  "modal>=0.73",
 ]
 modal = [
   "modal>=0.73",
