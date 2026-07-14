@@ -452,3 +452,35 @@ def test_select_latest_deployable_round_raises_when_none_eligible():
 def test_select_latest_deployable_round_raises_on_empty_list():
     with pytest.raises(NoEligibleRoundError):
         select_latest_deployable_round([])
+
+
+def test_deploy_modal_endpoint_records_job_interface_urls(tmp_path):
+    class JobInterfaceDeployer(FakeDeployer):
+        def deploy(self, spec, *, app_name, scaledown_minutes):
+            return ModalDeploymentResult(
+                endpoint_url=self.endpoint_url,
+                submit_url="https://operator--app-submit.modal.run",
+                result_url="https://operator--app-result.modal.run",
+            )
+
+    config = _config(tmp_path)
+    record = deploy_modal_endpoint(
+        _manifest(), config, deployer=JobInterfaceDeployer()
+    )
+
+    assert record.submit_url == "https://operator--app-submit.modal.run"
+    assert record.result_url == "https://operator--app-result.modal.run"
+    persisted = json.loads(
+        deployment_record_path(config).read_text(encoding="utf-8")
+    )
+    assert persisted["submit_url"] == record.submit_url
+    assert persisted["result_url"] == record.result_url
+
+
+def test_deploy_modal_endpoint_tolerates_missing_job_interface(tmp_path):
+    record = deploy_modal_endpoint(
+        _manifest(), _config(tmp_path), deployer=FakeDeployer()
+    )
+
+    assert record.submit_url is None
+    assert record.result_url is None

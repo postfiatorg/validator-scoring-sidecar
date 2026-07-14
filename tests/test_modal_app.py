@@ -69,3 +69,19 @@ def test_scaledown_window_reads_deployed_value(monkeypatch):
     modal_app = importlib.reload(modal_app)
     assert modal_app.SCALEDOWN_MINUTES == 12
     assert modal_app._DEPLOY_CONFIG["SIDECAR_MODAL_SCALEDOWN_MINUTES"] == "12"
+
+
+def test_job_interface_is_defined(monkeypatch):
+    for key, value in DEPLOY_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    import validator_scoring_sidecar._modal_app as modal_app
+
+    modal_app = importlib.reload(modal_app)
+    # The submit/poll control endpoints must exist alongside the web server,
+    # and their result statuses are the contract the sidecar backend parses.
+    assert modal_app.submit is not None
+    assert modal_app.result is not None
+    assert modal_app.RESULT_STATUS_PENDING == "pending"
+    assert modal_app.RESULT_STATUS_DONE == "done"
+    assert modal_app.RESULT_STATUS_FAILED == "failed"

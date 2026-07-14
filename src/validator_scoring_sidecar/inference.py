@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -49,6 +50,12 @@ PROXY_AUTH_KEY_HEADER = "Modal-Key"
 PROXY_AUTH_SECRET_HEADER = "Modal-Secret"
 CHAT_COMPLETIONS_SUFFIX = "chat/completions"
 HEALTH_SUFFIX = "health"
+DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+DEFAULT_POLL_READ_TIMEOUT_SECONDS = 30.0
+# Result statuses of the bundled app's job interface (_modal_app.result).
+POLL_STATUS_PENDING = "pending"
+POLL_STATUS_DONE = "done"
+POLL_STATUS_FAILED = "failed"
 
 # Structured reason markers recorded in a failure's details. RUNTIME_UNAVAILABLE
 # covers both an unreachable endpoint and a misconfigured runtime — conditions
@@ -58,6 +65,9 @@ HEALTH_SUFFIX = "health"
 FAILURE_REASON_KEY = "reason"
 FAILURE_REASON_ENDPOINT_UNREACHABLE = "endpoint_unreachable"
 FAILURE_REASON_CONFIGURATION = "configuration"
+# A poll-transport pass that ran out of budget while the generation is still
+# running server-side: not a fault — the persisted call resumes next pass.
+FAILURE_REASON_GENERATION_IN_PROGRESS = "generation_in_progress"
 
 # Fields forwarded verbatim from the frozen request, matching the foundation's
 # ModalClient.score_request selection. extra_body is merged at the top level,
@@ -277,8 +287,35 @@ class _ChatCompletionsBackend:
         )
 
 
+@dataclass(frozen=True)
+class _PollTransport:
+    """The job-interface pieces of a Modal backend, present as a unit.
+
+    Existing at all means both URLs were recorded at deploy time, so the
+    fields are non-optional by construction — the poll path never has to
+    re-check them.
+    """
+
+    client: httpx.Client
+    owns_client: bool
+    submit_url: str
+    result_url: str
+
+
 class ModalBackend(_ChatCompletionsBackend):
-    """Calls an operator-deployed Modal SGLang endpoint over its OpenAI API."""
+    """Calls an operator-deployed Modal SGLang endpoint over its OpenAI API.
+
+    With ``submit_url`` and ``result_url`` (the app's job interface, recorded
+    at deploy time) the backend uses the submit-and-poll transport: it submits
+    the frozen request, receives a call identifier, and polls with short
+    requests until the generation completes — no long-lived connection for a
+    VPN, firewall, or NAT to kill, and an interrupted client resumes the same
+    server-side call via ``pending_call_id`` instead of paying for a new one.
+    Without them it falls back to the direct chat-completions request, so a
+    deployment predating the job interface keeps working. ``timeout_seconds``
+    bounds the direct request's read; for the poll transport it is the overall
+    budget across submit and polls.
+    """
 
     backend_mode = BACKEND_MODE_MODAL
 
@@ -290,6 +327,11 @@ class ModalBackend(_ChatCompletionsBackend):
         proxy_auth_secret: str | None,
         timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
         http_client: httpx.Client | None = None,
+        submit_url: str | None = None,
+        result_url: str | None = None,
+        pending_call_id: str | None = None,
+        on_call_submitted: Callable[[str], None] | None = None,
+        poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     ):
         key = (proxy_auth_key or "").strip()
         secret = (proxy_auth_secret or "").strip()
@@ -307,6 +349,167 @@ class ModalBackend(_ChatCompletionsBackend):
             timeout_seconds=timeout_seconds,
             http_client=http_client,
         )
+        submit = (submit_url or "").strip()
+        result = (result_url or "").strip()
+        # Poll requests use short read timeouts of their own; an injected test
+        # client is reused for them, a real one is owned and closed here.
+        self._poll_transport: _PollTransport | None = (
+            _PollTransport(
+                client=http_client
+                or httpx.Client(
+                    timeout=inference_timeout(DEFAULT_POLL_READ_TIMEOUT_SECONDS),
+                    follow_redirects=True,
+                ),
+                owns_client=http_client is None,
+                submit_url=submit,
+                result_url=result,
+            )
+            if submit and result
+            else None
+        )
+        self._pending_call_id = pending_call_id
+        self._on_call_submitted = on_call_submitted
+        self._poll_interval = poll_interval_seconds
+        self._budget_seconds = timeout_seconds
+
+    def _uses_poll_transport(self) -> bool:
+        return self._poll_transport is not None
+
+    def close(self) -> None:
+        transport = self._poll_transport
+        if transport is not None and transport.owns_client:
+            transport.client.close()
+        super().close()
+
+    def run(self, model_request: dict[str, Any]) -> InferenceResult:
+        transport = self._poll_transport
+        if transport is None:
+            return super().run(model_request)
+        return self._run_polling(transport, model_request)
+
+    def _run_polling(
+        self, transport: _PollTransport, model_request: dict[str, Any]
+    ) -> InferenceResult:
+        body = _build_request_body(model_request)
+        deadline = time.monotonic() + self._budget_seconds
+        call_id = self._pending_call_id
+        submitted_this_run = call_id is None
+        if call_id is None:
+            call_id = self._submit(transport, body)
+
+        while True:
+            try:
+                status, payload = self._poll(transport, call_id)
+            except InferenceError:
+                # A single failed poll is a transport blip, not a verdict on
+                # the generation; keep polling while budget remains.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(self._poll_interval)
+                continue
+            if status == POLL_STATUS_DONE:
+                return InferenceResult(
+                    content=_extract_content(payload),
+                    response_payload=payload,
+                )
+            if status == POLL_STATUS_FAILED:
+                # A failed resumed call may simply have expired server-side;
+                # one fresh submit recovers that without looping on a
+                # genuinely failing generation, and only while budget remains
+                # — a resubmit starts a billed generation.
+                if submitted_this_run or time.monotonic() >= deadline:
+                    raise InferenceError(
+                        FailureCategory.INFERENCE_ERROR,
+                        f"inference job {call_id} failed: {payload}",
+                        details={"call_id": call_id},
+                    )
+                call_id = self._submit(transport, body)
+                submitted_this_run = True
+                continue
+            if time.monotonic() >= deadline:
+                # The generation keeps running server-side and the call id is
+                # persisted, so the next pass resumes it rather than paying
+                # for a new one.
+                raise InferenceError(
+                    FailureCategory.INFERENCE_TIMEOUT,
+                    f"inference job {call_id} is still generating after this "
+                    f"pass's {self._budget_seconds:.0f}s budget; the persisted "
+                    "call resumes on the next pass",
+                    details={
+                        "call_id": call_id,
+                        FAILURE_REASON_KEY: FAILURE_REASON_GENERATION_IN_PROGRESS,
+                    },
+                )
+            time.sleep(self._poll_interval)
+
+    def _submit(self, transport: _PollTransport, body: dict[str, Any]) -> str:
+        payload = self._poll_request(
+            lambda: transport.client.post(
+                transport.submit_url, json=body, headers=self._headers
+            ),
+            "submit inference job",
+        )
+        call_id = payload.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise InferenceError(
+                FailureCategory.INFERENCE_ERROR,
+                f"inference submit returned no call_id: {payload}",
+            )
+        if self._on_call_submitted is not None:
+            self._on_call_submitted(call_id)
+        return call_id
+
+    def _poll(self, transport: _PollTransport, call_id: str) -> tuple[str, Any]:
+        payload = self._poll_request(
+            lambda: transport.client.get(
+                transport.result_url,
+                params={"call_id": call_id},
+                headers=self._headers,
+            ),
+            f"poll inference job {call_id}",
+        )
+        status = payload.get("status")
+        if status == POLL_STATUS_DONE:
+            return POLL_STATUS_DONE, payload.get("response")
+        if status == POLL_STATUS_PENDING:
+            return POLL_STATUS_PENDING, None
+        return POLL_STATUS_FAILED, payload.get("error", payload)
+
+    def _poll_request(
+        self, send: Callable[[], httpx.Response], action: str
+    ) -> dict[str, Any]:
+        try:
+            response = send()
+        except httpx.TimeoutException as exc:
+            raise InferenceError(
+                FailureCategory.INFERENCE_TIMEOUT,
+                f"could not {action}: {exc}",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise InferenceError(
+                FailureCategory.RUNTIME_UNAVAILABLE,
+                f"could not {action}: {exc}",
+                details={FAILURE_REASON_KEY: FAILURE_REASON_ENDPOINT_UNREACHABLE},
+            ) from exc
+        if response.status_code < 200 or response.status_code >= 300:
+            raise InferenceError(
+                FailureCategory.INFERENCE_ERROR,
+                f"could not {action}: HTTP {response.status_code}",
+                details={"status_code": response.status_code},
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise InferenceError(
+                FailureCategory.INFERENCE_ERROR,
+                f"could not {action}: response is not valid JSON",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise InferenceError(
+                FailureCategory.INFERENCE_ERROR,
+                f"could not {action}: response is not a JSON object",
+            )
+        return payload
 
     @classmethod
     def from_environment(
@@ -316,6 +519,10 @@ class ModalBackend(_ChatCompletionsBackend):
         timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS,
         http_client: httpx.Client | None = None,
         environ: Mapping[str, str] | None = None,
+        submit_url: str | None = None,
+        result_url: str | None = None,
+        pending_call_id: str | None = None,
+        on_call_submitted: Callable[[str], None] | None = None,
     ) -> "ModalBackend":
         """Build a backend, reading proxy-auth credentials only from the env."""
 
@@ -326,6 +533,10 @@ class ModalBackend(_ChatCompletionsBackend):
             proxy_auth_secret=env.get(ENV_MODAL_SECRET),
             timeout_seconds=timeout_seconds,
             http_client=http_client,
+            submit_url=submit_url,
+            result_url=result_url,
+            pending_call_id=pending_call_id,
+            on_call_submitted=on_call_submitted,
         )
 
 

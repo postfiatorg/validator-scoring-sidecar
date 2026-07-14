@@ -29,6 +29,8 @@ from validator_scoring_sidecar.deployment import (
 APP_MODULE_PATH = Path(__file__).with_name("_modal_app.py")
 ENDPOINT_CLASS_NAME = "SidecarScoringEndpoint"
 ENDPOINT_WEB_METHOD = "serve"
+CONTROL_SUBMIT_FUNCTION = "submit"
+CONTROL_RESULT_FUNCTION = "result"
 # The Modal SDK's own credential variables; the deploy subprocess inherits them.
 ENV_MODAL_TOKEN_ID = "MODAL_TOKEN_ID"
 ENV_MODAL_TOKEN_SECRET = "MODAL_TOKEN_SECRET"
@@ -68,7 +70,15 @@ class RealModalDeployer:
         self._require_modal_login()
         completed = self._run_modal_deploy(spec, app_name, scaledown_minutes)
         endpoint_url = self._resolve_endpoint_url(app_name, completed.stdout)
-        return ModalDeploymentResult(endpoint_url=endpoint_url)
+        return ModalDeploymentResult(
+            endpoint_url=endpoint_url,
+            submit_url=self._lookup_function_web_url(
+                app_name, CONTROL_SUBMIT_FUNCTION
+            ),
+            result_url=self._lookup_function_web_url(
+                app_name, CONTROL_RESULT_FUNCTION
+            ),
+        )
 
     def _require_modal_installed(self) -> None:
         if importlib.util.find_spec("modal") is None:
@@ -155,6 +165,19 @@ class RealModalDeployer:
             endpoint = modal.Cls.from_name(app_name, ENDPOINT_CLASS_NAME)
             web_method = getattr(endpoint(), ENDPOINT_WEB_METHOD)
             return web_method.get_web_url()
+        except Exception:
+            return None
+
+    def _lookup_function_web_url(
+        self, app_name: str, function_name: str
+    ) -> str | None:
+        """Best-effort URL of a control endpoint; ``None`` degrades the backend
+        to the direct transport rather than failing the deploy."""
+
+        try:
+            import modal
+
+            return modal.Function.from_name(app_name, function_name).get_web_url()
         except Exception:
             return None
 

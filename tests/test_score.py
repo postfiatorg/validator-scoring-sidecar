@@ -916,3 +916,54 @@ def test_dry_run_round_is_skipped_without_provisioning(tmp_path):
 
     assert result.status == SCORE_STATUS_SKIPPED
     assert result.error_category == FailureCategory.SKIPPED_OPERATOR_OPT_OUT.value
+
+
+def test_score_round_wires_persisted_call_id_into_default_factory(
+    tmp_path, monkeypatch
+):
+    config = _setup(tmp_path)
+    metadata = RoundMetadata(
+        round_id=123,
+        round_number=456,
+        status="INPUT_FROZEN",
+        input_package_cid="QmInput",
+        input_package_hash=PACKAGE_HASH,
+        input_frozen_at="2026-05-25T00:00:00+00:00",
+        final_bundle_cid=None,
+    )
+    with SidecarState(tmp_path) as state:
+        state.record_discovered("testnet", metadata)
+        state.record_inference_call(
+            "testnet", metadata, inference_call_id="fc-resume"
+        )
+
+    captured = {}
+
+    def fake_default_factory(record, *, timeout_seconds, pending_call_id=None,
+                             on_call_submitted=None):
+        captured["pending_call_id"] = pending_call_id
+        captured["on_call_submitted"] = on_call_submitted
+        return FakeBackend()
+
+    import validator_scoring_sidecar.score as score_module
+
+    monkeypatch.setattr(
+        score_module, "_default_backend_factory", fake_default_factory
+    )
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        foundation_hash_fetcher=lambda *args: None,
+        package_fetcher=_make_package_fetcher(_manifest()),
+    )
+
+    assert result.sidecar_state == STATE_SCORED
+    assert captured["pending_call_id"] == "fc-resume"
+
+    # The submit callback persists the new call id into the round state.
+    captured["on_call_submitted"]("fc-fresh")
+    with SidecarState(tmp_path) as state:
+        record = state.get_round("testnet", 123)
+    assert record.inference_call_id == "fc-fresh"
