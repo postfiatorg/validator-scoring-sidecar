@@ -738,6 +738,34 @@ def test_warm_runtime_human_output(capsys, monkeypatch, tmp_path):
     assert captured.err == ""
 
 
+@pytest.mark.parametrize(
+    "status, expected_exit",
+    [
+        ("endpoint_still_starting", 3),
+        ("endpoint_unverified", 1),
+    ],
+)
+def test_warm_runtime_unconfirmed_endpoint_exits_nonzero(
+    capsys, monkeypatch, tmp_path, status, expected_exit
+):
+    from validator_scoring_sidecar.participate import WarmRuntimeResult
+
+    result = WarmRuntimeResult(
+        status=status, endpoint_url="https://operator--app.modal.run"
+    )
+    monkeypatch.setattr(
+        cli,
+        "warm_modal_runtime",
+        lambda config, client, *, source, round_limit: result,
+    )
+
+    exit_code = cli.main(["warm-runtime", "--data-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == expected_exit
+    assert f"Runtime warm-up: {status}" in captured.out
+
+
 def test_warm_runtime_json_output(capsys, monkeypatch, tmp_path):
     from validator_scoring_sidecar.participate import (
         WARM_STATUS_SKIPPED_NO_CREDENTIALS,

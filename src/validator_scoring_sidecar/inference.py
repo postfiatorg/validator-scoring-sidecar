@@ -44,9 +44,11 @@ DEFAULT_INFERENCE_CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_INFERENCE_WRITE_TIMEOUT_SECONDS = 10.0
 DEFAULT_INFERENCE_POOL_TIMEOUT_SECONDS = 5.0
 DEFAULT_LOCAL_ENDPOINT_URL = "http://localhost:8000/v1"
+DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS = 20.0
 PROXY_AUTH_KEY_HEADER = "Modal-Key"
 PROXY_AUTH_SECRET_HEADER = "Modal-Secret"
 CHAT_COMPLETIONS_SUFFIX = "chat/completions"
+HEALTH_SUFFIX = "health"
 
 # Structured reason markers recorded in a failure's details. RUNTIME_UNAVAILABLE
 # covers both an unreachable endpoint and a misconfigured runtime — conditions
@@ -132,6 +134,56 @@ def inference_timeout(read_timeout_seconds: float | None = None) -> httpx.Timeou
         write=DEFAULT_INFERENCE_WRITE_TIMEOUT_SECONDS,
         pool=DEFAULT_INFERENCE_POOL_TIMEOUT_SECONDS,
     )
+
+
+def probe_endpoint_ready(
+    endpoint_url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS,
+    http_client: httpx.Client | None = None,
+) -> bool:
+    """Whether the inference endpoint actually serves right now.
+
+    Probes SGLang's ``/health`` (served at the endpoint root, above the ``/v1``
+    API prefix). Any transport failure, timeout, or non-2xx answer reads as not
+    ready — the caller polls, so a false negative only costs one interval. On a
+    scaled-to-zero Modal endpoint the probe itself triggers the container cold
+    start, which is exactly what a warm-up pass wants.
+    """
+
+    base = (endpoint_url or "").strip().rstrip("/")
+    if not base:
+        raise InferenceConfigError("an inference endpoint URL is required")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    url = f"{base}/{HEALTH_SUFFIX}"
+
+    client = http_client or httpx.Client(
+        timeout=inference_timeout(timeout_seconds), follow_redirects=True
+    )
+    try:
+        response = client.get(url, headers=headers or {})
+    except httpx.HTTPError:
+        return False
+    finally:
+        if http_client is None:
+            client.close()
+    return 200 <= response.status_code < 300
+
+
+def modal_proxy_auth_headers(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str] | None:
+    """The Modal proxy-auth headers from the environment, or ``None`` when the
+    proxy credentials are not configured (the endpoint cannot be probed)."""
+
+    env = os.environ if environ is None else environ
+    key = (env.get(ENV_MODAL_KEY) or "").strip()
+    secret = (env.get(ENV_MODAL_SECRET) or "").strip()
+    if not key or not secret:
+        return None
+    return {PROXY_AUTH_KEY_HEADER: key, PROXY_AUTH_SECRET_HEADER: secret}
 
 
 def load_model_request(package_path: Path) -> dict[str, Any]:

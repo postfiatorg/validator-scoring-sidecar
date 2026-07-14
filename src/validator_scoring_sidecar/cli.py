@@ -64,6 +64,8 @@ from validator_scoring_sidecar.preflight import (
     run_preflight,
 )
 from validator_scoring_sidecar.participate import (
+    WARM_STATUS_ENDPOINT_STILL_STARTING,
+    WARM_STATUS_ENDPOINT_UNVERIFIED,
     ParticipateResult,
     ParticipationConfigError,
     WarmRuntimeResult,
@@ -711,6 +713,13 @@ def warm_runtime_command(args: argparse.Namespace) -> int:
     else:
         print(_format_warm_runtime_result(result))
 
+    # A deployed-but-unconfirmed endpoint exits non-zero so the entrypoint's
+    # non-fatal handling reports the warm-up as incomplete rather than done;
+    # the participation loop still provisions and retries on demand.
+    if result.status == WARM_STATUS_ENDPOINT_STILL_STARTING:
+        return EXIT_NETWORK_ERROR
+    if result.status == WARM_STATUS_ENDPOINT_UNVERIFIED:
+        return EXIT_OPERATOR_ERROR
     return EXIT_OK
 
 

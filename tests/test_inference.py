@@ -22,6 +22,8 @@ from validator_scoring_sidecar.inference import (
     ModalBackend,
     ModelRequestError,
     load_model_request,
+    modal_proxy_auth_headers,
+    probe_endpoint_ready,
 )
 
 ENDPOINT = "https://operator--app.modal.run"
@@ -279,6 +281,53 @@ def test_missing_message_content_maps_to_inference_error():
         ).run(_model_request())
 
     assert exc_info.value.category == FailureCategory.INFERENCE_ERROR
+
+
+def _probe_client(handler):
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_probe_endpoint_ready_true_on_healthy_endpoint():
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        captured["key"] = request.headers.get("Modal-Key")
+        return httpx.Response(200, text="ok")
+
+    ready = probe_endpoint_ready(
+        f"{ENDPOINT}/v1",
+        headers={"Modal-Key": "k", "Modal-Secret": "s"},
+        http_client=_probe_client(handler),
+    )
+
+    assert ready is True
+    # /health is served at the endpoint root, above the /v1 API prefix.
+    assert captured["url"] == f"{ENDPOINT}/health"
+    assert captured["key"] == "k"
+
+
+@pytest.mark.parametrize("error", [None, httpx.ConnectError, httpx.ReadTimeout])
+def test_probe_endpoint_ready_false_when_not_serving(error):
+    def handler(request):
+        if error is not None:
+            raise error("not serving", request=request)
+        return httpx.Response(503, text="starting")
+
+    assert (
+        probe_endpoint_ready(ENDPOINT, http_client=_probe_client(handler)) is False
+    )
+
+
+def test_modal_proxy_auth_headers_reads_env():
+    headers = modal_proxy_auth_headers(
+        environ={
+            "POSTFIAT_SIDECAR_MODAL_KEY": "k",
+            "POSTFIAT_SIDECAR_MODAL_SECRET": "s",
+        }
+    )
+    assert headers == {"Modal-Key": "k", "Modal-Secret": "s"}
+    assert modal_proxy_auth_headers(environ={}) is None
 
 
 def test_load_model_request_reads_inputs_file(tmp_path):
