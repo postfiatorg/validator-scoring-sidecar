@@ -667,6 +667,8 @@ def _format_score_result(result: ScoreResult) -> str:
         lines.append(f"Matched levels: {', '.join(result.matched_levels) or 'none'}")
     if result.error_category is not None:
         lines.append(f"Outcome category: {result.error_category}")
+    if result.error_details is not None and result.error_details.get("message"):
+        lines.append(f"Outcome detail: {result.error_details['message']}")
     return "\n".join(lines)
 
 

@@ -14,6 +14,8 @@ from validator_scoring_sidecar.inference import (
     DEFAULT_INFERENCE_POOL_TIMEOUT_SECONDS,
     DEFAULT_INFERENCE_TIMEOUT_SECONDS,
     DEFAULT_INFERENCE_WRITE_TIMEOUT_SECONDS,
+    FAILURE_REASON_ENDPOINT_UNREACHABLE,
+    FAILURE_REASON_KEY,
     InferenceConfigError,
     InferenceError,
     LocalSglangBackend,
@@ -236,6 +238,10 @@ def test_connection_error_maps_to_runtime_unavailable():
         _backend(handler).run(_model_request())
 
     assert exc_info.value.category == FailureCategory.RUNTIME_UNAVAILABLE
+    assert exc_info.value.failure.details == {
+        FAILURE_REASON_KEY: FAILURE_REASON_ENDPOINT_UNREACHABLE
+    }
+    assert "connection refused" in str(exc_info.value)
 
 
 def test_http_error_status_maps_to_inference_error():
@@ -445,6 +451,9 @@ def test_local_connection_error_maps_to_runtime_unavailable():
         _local_backend(handler).run(_model_request())
 
     assert exc_info.value.category == FailureCategory.RUNTIME_UNAVAILABLE
+    assert exc_info.value.failure.details == {
+        FAILURE_REASON_KEY: FAILURE_REASON_ENDPOINT_UNREACHABLE
+    }
 
 
 def test_local_http_error_status_maps_to_inference_error():

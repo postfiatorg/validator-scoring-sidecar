@@ -45,6 +45,8 @@ from validator_scoring_sidecar.deployment import (
 )
 from validator_scoring_sidecar.failure import Failure, FailureCategory
 from validator_scoring_sidecar.inference import (
+    FAILURE_REASON_CONFIGURATION,
+    FAILURE_REASON_KEY,
     InferenceBackend,
     InferenceConfigError,
     InferenceError,
@@ -123,6 +125,7 @@ class ScoreResult:
     compared: bool
     matched_levels: list[str]
     error_category: str | None
+    error_details: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +138,9 @@ class ScoreResult:
             "compared": self.compared,
             "matched_levels": list(self.matched_levels),
             "error_category": self.error_category,
+            "error_details": (
+                dict(self.error_details) if self.error_details is not None else None
+            ),
         }
 
 
@@ -180,6 +186,7 @@ def score_round(
                     compared=True,
                     matched_levels=_split_levels(existing.comparison_levels_matched),
                     error_category=existing.error_category,
+                    error_details=_parse_persisted_details(existing.error_details),
                 )
             deferred_existing = existing
 
@@ -289,7 +296,7 @@ def _full_score(
                 compat.effective_mode,
                 FailureCategory.INFERENCE_TIMEOUT,
                 {
-                    "reason": "round_deadline_elapsed",
+                    FAILURE_REASON_KEY: "round_deadline_elapsed",
                     "deadline": (
                         inference_deadline.isoformat()
                         if inference_deadline is not None
@@ -313,15 +320,17 @@ def _full_score(
             metadata,
             compat.effective_mode,
             FailureCategory.RUNTIME_UNAVAILABLE,
-            {"message": str(exc)},
+            {"message": str(exc), FAILURE_REASON_KEY: FAILURE_REASON_CONFIGURATION},
         )
     except InferenceError as exc:
+        # The failure message is the operator's diagnosis (endpoint, underlying
+        # transport error); persist it with the structured details.
         return _record_failure(
             config,
             metadata,
             compat.effective_mode,
             exc.category,
-            exc.failure.details or None,
+            {"message": str(exc), **exc.failure.details},
         )
     finally:
         if backend is not None:
@@ -674,6 +683,7 @@ def _scored_result(
         compared=compared,
         matched_levels=list(outcome.comparison_levels_matched or []),
         error_category=outcome.error_category,
+        error_details=outcome.error_details,
     )
 
 
@@ -697,6 +707,7 @@ def _outcome_result(
         compared=False,
         matched_levels=[],
         error_category=outcome.error_category,
+        error_details=outcome.error_details,
     )
 
 
@@ -723,3 +734,15 @@ def _split_levels(value: str | None) -> list[str]:
     if not value:
         return []
     return value.split(",")
+
+
+def _parse_persisted_details(value: str | None) -> dict[str, Any] | None:
+    """Decode error details persisted as JSON in the round state, or ``None``."""
+
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None

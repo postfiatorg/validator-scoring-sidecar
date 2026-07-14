@@ -157,7 +157,13 @@ class ParticipationConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class ParticipateResult:
-    """Summary of one participation pass."""
+    """Summary of one participation pass.
+
+    ``score_error_category`` and ``score_error_details`` mirror the scoring
+    outcome's failure classification so the unattended loop's log line carries
+    the diagnosis — the loop is where production scoring failures surface, and
+    an operator must not need a manual ``score`` re-run to read them.
+    """
 
     network: str
     score_status: str
@@ -168,12 +174,20 @@ class ParticipateResult:
     announcements: list[dict[str, Any]]
     protocol_violations: list[dict[str, Any]]
     score_error: str | None = None
+    score_error_category: str | None = None
+    score_error_details: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "network": self.network,
             "score_status": self.score_status,
             "score_error": self.score_error,
+            "score_error_category": self.score_error_category,
+            "score_error_details": (
+                dict(self.score_error_details)
+                if self.score_error_details is not None
+                else None
+            ),
             "round_id": self.round_id,
             "round_number": self.round_number,
             "commits": list(self.commits),
@@ -325,6 +339,8 @@ def participate(
         else modal_runtime_provisioner(config)
     )
     score_error: str | None = None
+    score_error_category: str | None = None
+    score_error_details: dict[str, Any] | None = None
     try:
         score = score_runner(
             config,
@@ -334,6 +350,8 @@ def participate(
             runtime_provisioner=provisioner,
         )
         score_status = score.status
+        score_error_category = score.error_category
+        score_error_details = score.error_details
         active_round_id: int | None = score.round_id
         active_round_number = score.round_number
     except NoEligibleRoundError:
@@ -400,6 +418,8 @@ def participate(
         announcements=announcements,
         protocol_violations=protocol_violations,
         score_error=score_error,
+        score_error_category=score_error_category,
+        score_error_details=score_error_details,
     )
 
 

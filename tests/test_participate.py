@@ -441,6 +441,7 @@ def _failing_score_runner(
         compared=False,
         matched_levels=[],
         error_category="INFERENCE_ERROR",
+        error_details={"message": "endpoint returned HTTP 500"},
     )
 
 
@@ -453,8 +454,13 @@ def test_participate_commits_after_transient_score_failure(tmp_path):
     # Pass 1: scoring fails. The announcement's windows are recorded and the
     # cursor advances past it; nothing commits because the round is not scored.
     rpc1 = FakeRpc(close_time=COMMIT_TIME, transactions=[ANNOUNCEMENT_TX])
-    _participate(tmp_path, signer, rpc1, score_runner=_failing_score_runner)
+    failed = _participate(tmp_path, signer, rpc1, score_runner=_failing_score_runner)
     assert rpc1.submitted == []
+    # The pass summary carries the scoring diagnosis, so the unattended loop's
+    # log line shows what failed without a manual `score` re-run.
+    assert failed.score_error_category == "INFERENCE_ERROR"
+    assert failed.score_error_details == {"message": "endpoint returned HTTP 500"}
+    assert failed.as_dict()["score_error_details"] == failed.score_error_details
     with SidecarState(tmp_path) as state:
         recorded = state.get_round(NETWORK, ROUND_ID)
     assert recorded is not None

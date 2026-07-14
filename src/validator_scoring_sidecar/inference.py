@@ -48,6 +48,15 @@ PROXY_AUTH_KEY_HEADER = "Modal-Key"
 PROXY_AUTH_SECRET_HEADER = "Modal-Secret"
 CHAT_COMPLETIONS_SUFFIX = "chat/completions"
 
+# Structured reason markers recorded in a failure's details. RUNTIME_UNAVAILABLE
+# covers both an unreachable endpoint and a misconfigured runtime — conditions
+# with opposite operator fixes — and the FailureCategory vocabulary is shared
+# with foundation convergence reporting and must not grow a new member, so the
+# disambiguation lives in the details instead.
+FAILURE_REASON_KEY = "reason"
+FAILURE_REASON_ENDPOINT_UNREACHABLE = "endpoint_unreachable"
+FAILURE_REASON_CONFIGURATION = "configuration"
+
 # Fields forwarded verbatim from the frozen request, matching the foundation's
 # ModalClient.score_request selection. extra_body is merged at the top level,
 # which is how the OpenAI client serializes it on the wire.
@@ -191,6 +200,7 @@ class _ChatCompletionsBackend:
             raise InferenceError(
                 FailureCategory.RUNTIME_UNAVAILABLE,
                 f"could not reach inference endpoint at {self._url}: {exc}",
+                details={FAILURE_REASON_KEY: FAILURE_REASON_ENDPOINT_UNREACHABLE},
             ) from exc
 
         if response.status_code < 200 or response.status_code >= 300:
