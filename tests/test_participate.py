@@ -792,9 +792,10 @@ def test_modal_runtime_provisioner_deploys_and_records(tmp_path):
     deployed = {}
 
     class FakeDeployer:
-        def deploy(self, spec, *, app_name):
+        def deploy(self, spec, *, app_name, scaledown_minutes):
             deployed["app_name"] = app_name
             deployed["image"] = spec.image
+            deployed["scaledown_minutes"] = scaledown_minutes
             return ModalDeploymentResult(endpoint_url="https://operator--app.modal.run")
 
     provision = modal_runtime_provisioner(
@@ -817,7 +818,7 @@ def test_modal_runtime_provisioner_uses_configured_app_name(tmp_path):
     deployed = {}
 
     class FakeDeployer:
-        def deploy(self, spec, *, app_name):
+        def deploy(self, spec, *, app_name, scaledown_minutes):
             deployed["app_name"] = app_name
             return ModalDeploymentResult(endpoint_url="https://operator--app.modal.run")
 

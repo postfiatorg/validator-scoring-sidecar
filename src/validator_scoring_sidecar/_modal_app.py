@@ -41,6 +41,7 @@ _DEPLOY_CONFIG = {
         "SIDECAR_MODAL_ENVIRONMENT",
         "SIDECAR_MODAL_MODEL_REPO_ID",
         "SIDECAR_MODAL_MODEL_REVISION",
+        "SIDECAR_MODAL_SCALEDOWN_MINUTES",
     )
 }
 APP_NAME = _DEPLOY_CONFIG["SIDECAR_MODAL_APP_NAME"]
@@ -56,6 +57,9 @@ MODEL_VOLUME_NAME = os.environ.get(
     f"{APP_NAME}-model-weights",
 )
 _DEPLOY_CONFIG["SIDECAR_MODAL_MODEL_VOLUME"] = MODEL_VOLUME_NAME
+# Idle GPU-billing minutes before scale-to-zero; operator-tuned via
+# POSTFIAT_SIDECAR_MODAL_SCALEDOWN_MINUTES (validated in config.py).
+SCALEDOWN_MINUTES = int(_DEPLOY_CONFIG["SIDECAR_MODAL_SCALEDOWN_MINUTES"])
 
 # The manifest environment is reproduced verbatim; HF cache locations are added
 # so weight downloads persist in the Modal volume across cold starts.
@@ -122,7 +126,7 @@ def _wait_for_server(timeout: int = 30 * MINUTES) -> None:
     gpu=GPU_TYPE,
     volumes={HF_CACHE_PATH: model_volume},
     timeout=60 * MINUTES,
-    scaledown_window=20 * MINUTES,
+    scaledown_window=SCALEDOWN_MINUTES * MINUTES,
     max_containers=1,
 )
 class SidecarScoringEndpoint:

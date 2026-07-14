@@ -2,7 +2,10 @@ import json
 
 import pytest
 
-from validator_scoring_sidecar.config import load_config
+from validator_scoring_sidecar.config import (
+    DEFAULT_MODAL_SCALEDOWN_MINUTES,
+    load_config,
+)
 from validator_scoring_sidecar.deployment import (
     GpuMismatchError,
     LocalRuntimeError,
@@ -23,6 +26,11 @@ from validator_scoring_sidecar.deployment import (
     start_local_sglang_endpoint,
 )
 from validator_scoring_sidecar.manifest import check_compatibility
+from validator_scoring_sidecar.modal_deployer import (
+    ENV_APP_NAME,
+    ENV_SCALEDOWN_MINUTES,
+    RealModalDeployer,
+)
 from validator_scoring_sidecar.scoring import (
     SUPPORTED_PARSER_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
@@ -39,10 +47,12 @@ class FakeDeployer:
         self.endpoint_url = endpoint_url
         self.spec = None
         self.app_name = None
+        self.scaledown_minutes = None
 
-    def deploy(self, spec, *, app_name):
+    def deploy(self, spec, *, app_name, scaledown_minutes):
         self.spec = spec
         self.app_name = app_name
+        self.scaledown_minutes = scaledown_minutes
         return ModalDeploymentResult(endpoint_url=self.endpoint_url)
 
 
@@ -215,6 +225,7 @@ def test_deploy_modal_endpoint_writes_record(tmp_path):
     )
 
     assert deployer.app_name == "my-app"
+    assert deployer.scaledown_minutes == DEFAULT_MODAL_SCALEDOWN_MINUTES
     assert record.mode == "modal"
     assert record.endpoint_url == "https://operator--app.modal.run"
     assert record.deployed_at == "2026-06-01T00:00:00+00:00"
@@ -222,6 +233,28 @@ def test_deploy_modal_endpoint_writes_record(tmp_path):
     path = deployment_record_path(config)
     assert path == tmp_path / "runtime" / "deployment_record.json"
     assert json.loads(path.read_text(encoding="utf-8")) == record.as_dict()
+
+
+def test_deploy_modal_endpoint_passes_configured_scaledown(tmp_path):
+    config = load_config(
+        base_url="https://scoring.example.org",
+        data_dir=tmp_path,
+        network="testnet",
+        environ={"POSTFIAT_SIDECAR_MODAL_SCALEDOWN_MINUTES": "12"},
+    )
+    deployer = FakeDeployer()
+
+    deploy_modal_endpoint(_manifest(), config, deployer=deployer)
+
+    assert deployer.scaledown_minutes == 12
+
+
+def test_real_deployer_stamps_scaledown_into_subprocess_env():
+    spec = extract_runtime_spec(_manifest())
+    environment = RealModalDeployer()._deploy_environment(spec, "my-app", 7)
+
+    assert environment[ENV_SCALEDOWN_MINUTES] == "7"
+    assert environment[ENV_APP_NAME] == "my-app"
 
 
 def test_deploy_modal_endpoint_defaults_app_name_to_network(tmp_path):

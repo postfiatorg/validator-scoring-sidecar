@@ -123,7 +123,13 @@ class LocalStartResult:
 class ModalDeployer(Protocol):
     """Stands up a Modal endpoint for a spec and reports where it lives."""
 
-    def deploy(self, spec: RuntimeSpec, *, app_name: str) -> ModalDeploymentResult: ...
+    def deploy(
+        self,
+        spec: RuntimeSpec,
+        *,
+        app_name: str,
+        scaledown_minutes: int,
+    ) -> ModalDeploymentResult: ...
 
 
 class LocalRuntimeStarter(Protocol):
@@ -420,7 +426,11 @@ def deploy_modal_endpoint(
 
     spec = extract_runtime_spec(manifest)
     resolved_app_name = app_name or default_app_name(config.network)
-    result = deployer.deploy(spec, app_name=resolved_app_name)
+    result = deployer.deploy(
+        spec,
+        app_name=resolved_app_name,
+        scaledown_minutes=config.modal_scaledown_minutes,
+    )
     if not isinstance(result, ModalDeploymentResult) or not result.endpoint_url.strip():
         raise ModalDeploymentError("Modal deployment did not return an endpoint URL")
     record = build_deployment_record(

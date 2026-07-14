@@ -16,6 +16,7 @@ DEPLOY_ENV = {
     "SIDECAR_MODAL_ENVIRONMENT": json.dumps({"SGLANG_KEY": "value"}),
     "SIDECAR_MODAL_MODEL_REPO_ID": "Qwen/Qwen3.6-27B-FP8",
     "SIDECAR_MODAL_MODEL_REVISION": "a" * 40,
+    "SIDECAR_MODAL_SCALEDOWN_MINUTES": "5",
 }
 
 
@@ -39,3 +40,18 @@ def test_deploy_config_is_baked_for_container_reimport(monkeypatch):
         == modal_app.MODEL_VOLUME_NAME
     )
     assert modal_app.MODEL_REVISION == "a" * 40
+
+
+def test_scaledown_window_reads_deployed_value(monkeypatch):
+    for key, value in DEPLOY_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    import validator_scoring_sidecar._modal_app as modal_app
+
+    modal_app = importlib.reload(modal_app)
+    assert modal_app.SCALEDOWN_MINUTES == 5
+
+    monkeypatch.setenv("SIDECAR_MODAL_SCALEDOWN_MINUTES", "12")
+    modal_app = importlib.reload(modal_app)
+    assert modal_app.SCALEDOWN_MINUTES == 12
+    assert modal_app._DEPLOY_CONFIG["SIDECAR_MODAL_SCALEDOWN_MINUTES"] == "12"
