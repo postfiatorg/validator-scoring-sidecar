@@ -42,7 +42,12 @@ from typing import Any
 from validator_scoring_sidecar.config import SidecarConfig
 from validator_scoring_sidecar.failure import Failure, FailureCategory
 from validator_scoring_sidecar.input_package import canonical_json_hash
-from validator_scoring_sidecar.scoring import ScoringResult, parse_response, select_unl
+from validator_scoring_sidecar.scoring import (
+    ScoringResult,
+    apply_formula,
+    parse_response,
+    select_unl,
+)
 
 VALIDATOR_MAP_RELATIVE_PATH = "inputs/validator_map.json"
 PREVIOUS_UNL_RELATIVE_PATH = "inputs/previous_unl.json"
@@ -195,6 +200,7 @@ def compute_verification_hashes(
     *,
     previous_unl: list[str] | None = None,
     selector_parameters: dict[str, int] | None = None,
+    apply_score_formula: bool = False,
 ) -> dict[str, str]:
     """Compute the sidecar's reproducible verification hashes from a response.
 
@@ -202,7 +208,10 @@ def compute_verification_hashes(
     ``selected_unl`` is computed only when both ``previous_unl`` and
     ``selector_parameters`` are supplied — the previous UNL comes from the frozen
     ``inputs/previous_unl.json`` and the parameters from the execution manifest's
-    ``code.selector.parameters``.
+    ``code.selector.parameters``. ``apply_score_formula`` mirrors whether the
+    round's manifest carries ``code.score_formula``: formula rounds select over
+    the vendored formula's final scores, pre-formula rounds over the model
+    scores directly.
     """
 
     scoring_result = parse_response(raw_text, validator_id_map)
@@ -215,8 +224,11 @@ def compute_verification_hashes(
         ),
     }
     if previous_unl is not None and selector_parameters is not None:
+        selection_input = (
+            apply_formula(scoring_result) if apply_score_formula else scoring_result
+        )
         unl_result = select_unl(
-            scoring_result,
+            selection_input,
             cutoff=selector_parameters["score_cutoff"],
             max_size=selector_parameters["max_size"],
             min_gap=selector_parameters["min_score_gap"],
@@ -236,6 +248,7 @@ def verify_round(
     foundation_hashes: dict[str, Any] | None = None,
     previous_unl: list[str] | None = None,
     selector_parameters: dict[str, int] | None = None,
+    apply_score_formula: bool = False,
 ) -> VerificationResult:
     """Compute the sidecar hashes and compare them to the foundation's, if given.
 
@@ -253,6 +266,7 @@ def verify_round(
         validator_id_map,
         previous_unl=previous_unl,
         selector_parameters=selector_parameters,
+        apply_score_formula=apply_score_formula,
     )
     if foundation_hashes is None:
         return VerificationResult(

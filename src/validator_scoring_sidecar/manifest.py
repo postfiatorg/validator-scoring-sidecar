@@ -21,6 +21,7 @@ from typing import Any, Literal
 from validator_scoring_sidecar.failure import Failure, FailureCategory
 from validator_scoring_sidecar.scoring import (
     SUPPORTED_PARSER_CONTENT_HASHES,
+    SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
 )
 
@@ -502,6 +503,25 @@ def _check_code(
                 f"the sidecar's supported set; vendor refresh required"
             ),
         )
+
+    # An absent key means a pre-formula round: legacy selection, nothing to
+    # gate. Any present value — including null — must carry a supported hash,
+    # so malformed sections fail closed.
+    if "score_formula" in code_section:
+        formula_section = code_section.get("score_formula")
+        formula_hash = (
+            formula_section.get("content_sha256")
+            if isinstance(formula_section, dict)
+            else None
+        )
+        if formula_hash not in SUPPORTED_SCORE_FORMULA_CONTENT_HASHES:
+            return _incompatible(
+                "code.score_formula.content_sha256",
+                (
+                    f"manifest score formula content hash {formula_hash!r} is "
+                    f"not in the sidecar's supported set; vendor refresh required"
+                ),
+            )
     return None
 
 
@@ -613,6 +633,19 @@ def _incompatible(field_name: str, message: str) -> Failure:
 
 class ManifestError(ValueError):
     """Raised when a required manifest value is missing or malformed."""
+
+
+def score_formula_present(manifest: dict[str, Any]) -> bool:
+    """Return whether the round's manifest declares the deterministic formula.
+
+    Rounds carrying ``code.score_formula`` select over formula-derived final
+    scores; rounds without it predate the deterministic final-score stage and
+    reproduce selection directly from the model scores. A null section counts
+    as absent here — ``check_compatibility`` fails such rounds closed before
+    scoring, so the two predicates cannot disagree on a scored round.
+    """
+    code = manifest.get("code", {}) if isinstance(manifest, dict) else {}
+    return isinstance(code, dict) and code.get("score_formula") is not None
 
 
 def selector_parameters(manifest: dict[str, Any]) -> dict[str, int]:
