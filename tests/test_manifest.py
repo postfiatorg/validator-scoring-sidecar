@@ -11,15 +11,18 @@ from validator_scoring_sidecar.manifest import (
     CompatibilityResult,
     ManifestError,
     check_compatibility,
+    score_formula_present,
     selector_parameters,
 )
 from validator_scoring_sidecar.scoring import (
     SUPPORTED_PARSER_CONTENT_HASHES,
+    SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
 )
 
 PARSER_HASH = sorted(SUPPORTED_PARSER_CONTENT_HASHES)[0]
 SELECTOR_HASH = sorted(SUPPORTED_SELECTOR_CONTENT_HASHES)[0]
+SCORE_FORMULA_HASH = sorted(SUPPORTED_SCORE_FORMULA_CONTENT_HASHES)[0]
 MODEL_REVISION = "a" * 40
 DEFAULT_ROUND_NUMBER = 100
 IMAGE_REF = (
@@ -638,3 +641,60 @@ def test_selector_parameters_rejects_missing_value():
     manifest = {"code": {"selector": {"parameters": {"score_cutoff": 40}}}}
     with pytest.raises(ManifestError):
         selector_parameters(manifest)
+
+
+# ---------------------------------------------------------------------------
+# Score formula section (bimodal rounds)
+# ---------------------------------------------------------------------------
+
+
+def _formula_section(content_sha256: str) -> dict[str, Any]:
+    return {
+        "module": "scoring_service.services.score_formula",
+        "content_sha256": content_sha256,
+        "version": 1,
+        "parameters": {
+            "weights": {
+                "consensus": 50,
+                "reliability": 20,
+                "software": 10,
+                "diversity": 10,
+                "identity": 10,
+            },
+            "consensus_gate_margin": 25,
+        },
+    }
+
+
+def test_formula_round_with_supported_hash_passes():
+    manifest = _manifest()
+    manifest["code"]["score_formula"] = _formula_section(SCORE_FORMULA_HASH)
+
+    result = _check(manifest)
+
+    assert result.passed is True
+
+
+def test_formula_round_with_unsupported_hash_is_incompatible():
+    manifest = _manifest()
+    manifest["code"]["score_formula"] = _formula_section("f" * 64)
+
+    result = _check(manifest)
+
+    assert result.passed is False
+    assert result.failure.category is FailureCategory.MANIFEST_INCOMPATIBLE
+    assert result.failure.field == "code.score_formula.content_sha256"
+
+
+def test_pre_formula_round_without_section_passes():
+    result = _check(_manifest())
+
+    assert result.passed is True
+
+
+def test_score_formula_present_keys_on_code_section():
+    manifest = _manifest()
+    assert score_formula_present(manifest) is False
+
+    manifest["code"]["score_formula"] = _formula_section(SCORE_FORMULA_HASH)
+    assert score_formula_present(manifest) is True

@@ -56,7 +56,11 @@ from validator_scoring_sidecar.inference import (
     load_model_request,
 )
 from validator_scoring_sidecar.input_package import SOURCE_AUTO, fetch_input_package
-from validator_scoring_sidecar.manifest import check_compatibility, selector_parameters
+from validator_scoring_sidecar.manifest import (
+    check_compatibility,
+    score_formula_present,
+    selector_parameters,
+)
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.scoring_client import ScoringClient, ScoringClientError
 from validator_scoring_sidecar.state import (
@@ -385,6 +389,7 @@ def _full_score(
         foundation_hashes=foundation,
         previous_unl=previous_unl,
         selector_parameters=selector_params,
+        apply_score_formula=score_formula_present(manifest),
     )
     persist_verification_hashes(config, metadata.input_package_hash, verification.hashes)
     outcome = _scored_outcome(compat.effective_mode, verification.hashes, verification)

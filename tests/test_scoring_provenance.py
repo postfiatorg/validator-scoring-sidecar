@@ -1,8 +1,8 @@
 """Provenance tests for the vendored scoring sub-package.
 
 These tests prove that the values of ``SUPPORTED_PARSER_CONTENT_HASHES``,
-``SUPPORTED_SELECTOR_CONTENT_HASHES``, and
-``SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES`` can be reconstructed from the
+``SUPPORTED_SELECTOR_CONTENT_HASHES``, ``SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES``,
+and ``SUPPORTED_SCORE_FORMULA_CONTENT_HASHES`` can be reconstructed from the
 unadapted foundation source files checked into ``scoring/_vendor_source``. If a
 constant drifts from its on-disk source, or a source file is modified without
 updating the constant, the relevant test fails.
@@ -22,6 +22,7 @@ from importlib.resources import files
 from validator_scoring_sidecar.scoring import (
     SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES,
     SUPPORTED_PARSER_CONTENT_HASHES,
+    SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
 )
 
@@ -67,6 +68,18 @@ def test_commit_reveal_vendor_source_hash_is_in_supported_set():
     )
 
 
+def test_score_formula_vendor_source_hash_is_in_supported_set():
+    digest = _vendor_source_hash("score_formula.py")
+    assert digest in SUPPORTED_SCORE_FORMULA_CONTENT_HASHES, (
+        f"Vendor source score_formula.py sha256 {digest} is not in "
+        f"SUPPORTED_SCORE_FORMULA_CONTENT_HASHES "
+        f"{sorted(SUPPORTED_SCORE_FORMULA_CONTENT_HASHES)}. "
+        f"Either the source file in _vendor_source drifted from the declared "
+        f"hash, or the constant needs updating per the refresh procedure in "
+        f"scoring/__init__.py."
+    )
+
+
 def test_supported_hash_sets_are_non_empty():
     assert SUPPORTED_PARSER_CONTENT_HASHES, (
         "SUPPORTED_PARSER_CONTENT_HASHES must declare at least one supported hash"
@@ -76,4 +89,7 @@ def test_supported_hash_sets_are_non_empty():
     )
     assert SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES, (
         "SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES must declare at least one supported hash"
+    )
+    assert SUPPORTED_SCORE_FORMULA_CONTENT_HASHES, (
+        "SUPPORTED_SCORE_FORMULA_CONTENT_HASHES must declare at least one supported hash"
     )

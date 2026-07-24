@@ -71,6 +71,11 @@ In order, each round:
 3. **It scores them on your inference runtime** and produces three fingerprints:
    the model response, the validator scores, and the selected UNL. It compares
    these to the foundation's whenever the foundation's results are available.
+   On rounds whose execution manifest carries the deterministic score formula
+   (`code.score_formula`), the sidecar applies the vendored formula to the
+   model's sub-scores before selection, exactly as the foundation does; older
+   rounds reproduce selection directly from the model scores, so both kinds of
+   round verify with the same sidecar.
 4. **It commits (commit window).** Commit-reveal is a two-step way to vote without
    copying. The commit publishes a *sealed envelope*: your fingerprints scrambled
    with a secret random salt. Locked in and timestamped, but unreadable.

@@ -16,6 +16,16 @@ byte-identical copy in ``_vendor_source`` is re-exported here and imported
 directly at runtime, guarded by ``SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES`` and
 the same freshness CI and provenance test as the parser and selector.
 
+The package also vendors the foundation's ``score_formula.py`` (the
+deterministic final-score stage introduced by the foundation's
+``docs/DeterministicFinalScore.md``). Round reproduction is bimodal, keyed
+on the round's execution manifest: rounds carrying a ``code.score_formula``
+section apply the vendored formula to the parsed sub-scores before UNL
+selection, while rounds without it (all pre-formula history and any round
+from a pre-formula foundation deployment) reproduce selection directly from
+the model scores exactly as before, so upgrade ordering between sidecar
+operators and the foundation deployment is unconstrained.
+
 Local adaptations are limited to making the modules self-contained:
 
 - The selector's ``cutoff``, ``max_size``, and ``min_gap`` parameters are
@@ -24,6 +34,8 @@ Local adaptations are limited to making the modules self-contained:
 - The parser consumes its validator identity mapping directly from a dict
   built from the frozen ``inputs/validator_map.json`` file in the round's
   input package, instead of the foundation's ``PromptBuilder`` output.
+- The formula imports its result types from the vendored parser module and
+  omits the foundation-only final-scores artifact helper.
 
 Parser and selector are vendored as a unit. The foundation publishes a single
 ``code.commit`` per round, so any upstream update that touches one of these
@@ -47,10 +59,11 @@ foundation deploys any unrelated change. The sidecar therefore identifies
 foundation equivalence by the sha256 content hash of the foundation source
 files instead.
 
-``SUPPORTED_PARSER_CONTENT_HASHES`` and ``SUPPORTED_SELECTOR_CONTENT_HASHES``
-are the sha256 digests of the foundation's
-``scoring_service/services/response_parser.py`` and
-``scoring_service/services/unl_selector.py`` files at the commits the sidecar
+``SUPPORTED_PARSER_CONTENT_HASHES``, ``SUPPORTED_SELECTOR_CONTENT_HASHES``,
+and ``SUPPORTED_SCORE_FORMULA_CONTENT_HASHES`` are the sha256 digests of the
+foundation's ``scoring_service/services/response_parser.py``,
+``scoring_service/services/unl_selector.py``, and
+``scoring_service/services/score_formula.py`` files at the commits the sidecar
 vendor was lifted from. The unadapted source files are checked into the
 ``_vendor_source`` directory inside this package so the declared hashes are
 auditable: anyone can recompute the digests from disk and confirm they match
@@ -81,6 +94,13 @@ Refresh procedure when the foundation updates parser or selector:
      been successfully verified by a sidecar running the new vendor with no
      manifest-incompatible errors. Only then drop the prior hash.
 
+For ``score_formula.py`` the procedure mirrors the parser and selector: the
+runnable adapted copy is ``formula.py``, the provenance copy lives in
+``_vendor_source``, and the supported set is
+``SUPPORTED_SCORE_FORMULA_CONTENT_HASHES``. The freshness check treats the
+file as legitimately absent on foundation branches that predate the
+deterministic final-score stage.
+
 For ``commit_reveal.py`` the procedure is the same but simpler: it has no local
 adaptation and no separate runnable copy, so a refresh is just replacing the
 file in ``_vendor_source`` and adding the new digest to
@@ -95,6 +115,10 @@ branches map directly to deployed sidecar environments and must remain
 synchronized with the corresponding deployed foundation branch.
 """
 
+from validator_scoring_sidecar.scoring.formula import (
+    apply_formula,
+    compute_final_score,
+)
 from validator_scoring_sidecar.scoring.parser import (
     DIMENSIONAL_FIELDS,
     NetworkReport,
@@ -124,6 +148,11 @@ SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES: frozenset[str] = frozenset(
         "5ce025098523557a2d02f828e00bfa1e82ddc6323cff5af3f9f8a4bc04c65049",
     }
 )
+SUPPORTED_SCORE_FORMULA_CONTENT_HASHES: frozenset[str] = frozenset(
+    {
+        "fd4b430672b85c357e0e0605799aea9a989618ebbb4a87f3bb2a92a0d24935ec",
+    }
+)
 
 __all__ = [
     "DIMENSIONAL_FIELDS",
@@ -131,11 +160,14 @@ __all__ = [
     "NetworkReportCategory",
     "SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES",
     "SUPPORTED_PARSER_CONTENT_HASHES",
+    "SUPPORTED_SCORE_FORMULA_CONTENT_HASHES",
     "SUPPORTED_SELECTOR_CONTENT_HASHES",
     "ScoringResult",
     "UNLSelectionResult",
     "ValidatorScore",
+    "apply_formula",
     "commit_reveal",
+    "compute_final_score",
     "parse_response",
     "select_unl",
 ]

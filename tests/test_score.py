@@ -34,6 +34,7 @@ from validator_scoring_sidecar.score import (
 )
 from validator_scoring_sidecar.scoring import (
     SUPPORTED_PARSER_CONTENT_HASHES,
+    SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
 )
 from validator_scoring_sidecar.round_metadata import RoundMetadata
@@ -221,7 +222,7 @@ class BlockingBackend(FakeBackend):
         )
 
 
-def _make_package_fetcher(manifest):
+def _make_package_fetcher(manifest, previous_unl=None):
     def fetcher(metadata, config, client, *, source, force):
         local_path = config.data_dir / "packages" / metadata.input_package_hash
         (local_path / "runtime").mkdir(parents=True, exist_ok=True)
@@ -235,6 +236,10 @@ def _make_package_fetcher(manifest):
         (local_path / "inputs" / "validator_map.json").write_text(
             json.dumps(VALIDATOR_MAP), encoding="utf-8"
         )
+        if previous_unl is not None:
+            (local_path / "inputs" / "previous_unl.json").write_text(
+                json.dumps({"previous_unl": previous_unl}), encoding="utf-8"
+            )
         return FetchedInputPackage(
             round_id=metadata.round_id,
             round_number=metadata.round_number,
@@ -297,6 +302,57 @@ def test_full_score_all_levels_match(tmp_path):
     assert record.sidecar_state == STATE_SCORED
     assert record.model_response_hash == EXPECTED_HASHES[HASH_MODEL_RESPONSE]
     assert record.comparison_levels_matched == "RAW_MATCH,PARSED_MATCH"
+
+
+def test_full_score_formula_round_selects_over_final_scores(tmp_path):
+    # score 80 clears the cutoff but consensus 0 caps the formula final at 25,
+    # below it: the foundation hashes are computed formula-mode, so all three
+    # levels match only if score_round threads apply_score_formula from the
+    # manifest into verification.
+    config = _setup(tmp_path)
+    raw = json.dumps(
+        {
+            "v1": {
+                "score": 80,
+                "consensus": 0,
+                "reliability": 85,
+                "software": 100,
+                "diversity": 40,
+                "identity": 80,
+                "reasoning": "offline",
+            },
+            "network_summary": "healthy",
+        }
+    )
+    selector_params = {"score_cutoff": 40, "max_size": 35, "min_score_gap": 5}
+    manifest = _manifest()
+    manifest["code"]["selector"]["parameters"] = dict(selector_params)
+    manifest["code"]["score_formula"] = {
+        "content_sha256": next(iter(SUPPORTED_SCORE_FORMULA_CONTENT_HASHES)),
+    }
+    foundation = compute_verification_hashes(
+        raw,
+        VALIDATOR_MAP,
+        previous_unl=[],
+        selector_parameters=selector_params,
+        apply_score_formula=True,
+    )
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=lambda record: FakeBackend(content=raw),
+        foundation_hash_fetcher=lambda *args: dict(foundation),
+        package_fetcher=_make_package_fetcher(manifest, previous_unl=[]),
+    )
+
+    assert result.status == SCORE_STATUS_SCORED
+    assert result.matched_levels == [
+        "RAW_MATCH",
+        "PARSED_MATCH",
+        "SELECTED_UNL_MATCH",
+    ]
 
 
 def test_full_score_pending_when_foundation_unavailable(tmp_path):

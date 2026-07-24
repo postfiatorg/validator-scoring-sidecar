@@ -336,3 +336,36 @@ def test_load_previous_unl_reads_frozen_file(tmp_path):
         '{"previous_unl": ["nHx", "nHy"]}', encoding="utf-8"
     )
     assert load_previous_unl(tmp_path) == ["nHx", "nHy"]
+
+
+def test_selection_is_bimodal_on_score_formula():
+    # score 80 clears the cutoff, but consensus 0 caps the formula final at
+    # 25, below it: a formula round must exclude what a legacy round selects.
+    raw = json.dumps({
+        "v1": _entry(consensus=0, reliability=85, software=100, diversity=40, identity=80),
+        "network_summary": "healthy",
+    })
+
+    legacy = compute_verification_hashes(
+        raw,
+        VALIDATOR_MAP,
+        previous_unl=[],
+        selector_parameters=SELECTOR_PARAMETERS,
+    )
+    formula = compute_verification_hashes(
+        raw,
+        VALIDATOR_MAP,
+        previous_unl=[],
+        selector_parameters=SELECTOR_PARAMETERS,
+        apply_score_formula=True,
+    )
+
+    assert legacy[HASH_SELECTED_UNL] == canonical_json_hash(
+        {"unl": [MASTER_KEY], "alternates": []}
+    )
+    assert formula[HASH_SELECTED_UNL] == canonical_json_hash(
+        {"unl": [], "alternates": []}
+    )
+    # The LLM-output levels are unaffected by the formula.
+    assert legacy[HASH_MODEL_RESPONSE] == formula[HASH_MODEL_RESPONSE]
+    assert legacy[HASH_VALIDATOR_SCORES] == formula[HASH_VALIDATOR_SCORES]

@@ -96,7 +96,7 @@ Add the participation overlay to both commands if you run participation. State i
 
 ### The foundation moves past the vendored parser or selector
 
-The sidecar reproduces the foundation's parsing and UNL selection with foundation code vendored at pinned content hashes. If the foundation deploys a behavioral change to its parser or selector, the round's manifest carries a parser/selector `content_sha256` outside the set this sidecar build recognizes, and the round is recorded `MANIFEST_INCOMPATIBLE` ("vendor refresh required"). An operator does not fix this locally — it needs a newer sidecar image whose vendored copy matches the foundation's new code. Until such an image is published and pulled, the round is correctly left unverified rather than compared against stale logic. (Refreshing the vendored copy is a maintainer task — see the repository `README.md`.)
+The sidecar reproduces the foundation's parsing and UNL selection with foundation code vendored at pinned content hashes. If the foundation deploys a behavioral change to its parser, selector, or score formula, the round's manifest carries a `content_sha256` for that module outside the set this sidecar build recognizes, and the round is recorded `MANIFEST_INCOMPATIBLE` ("vendor refresh required"). An operator does not fix this locally — it needs a newer sidecar image whose vendored copy matches the foundation's new code. Until such an image is published and pulled, the round is correctly left unverified rather than compared against stale logic. (Refreshing the vendored copy is a maintainer task — see the repository `README.md`.)
 
 ### When the sidecar declines a round instead of scoring it
 
@@ -105,7 +105,7 @@ Because the compatibility gate runs before inference, the sidecar declines a rou
 | Condition | Signal in `sidecar_rounds` | What to do |
 |---|---|---|
 | Manifest `schema_version` is newer than this sidecar supports | `error_category` `MANIFEST_UNSUPPORTED` | Upgrade the sidecar image. |
-| Manifest parser/selector `content_sha256` is outside the supported set | `error_category` `MANIFEST_INCOMPATIBLE` ("vendor refresh required") | Upgrade the sidecar image once one carrying the new vendor is published. |
+| Manifest parser/selector/score-formula `content_sha256` is outside the supported set | `error_category` `MANIFEST_INCOMPATIBLE` ("vendor refresh required") | Upgrade the sidecar image once one carrying the new vendor is published. |
 | Deployed runtime does not match the manifest (model revision, image digest, launch args, GPU, tensor parallelism) | `error_category` `MANIFEST_INCOMPATIBLE` | Modal redeploys automatically in the participate loop; local SGLang: re-run `start-sglang`. |
 | Override round | `sidecar_state` `SKIPPED` (`error_category` `SKIPPED_OVERRIDE`) | Nothing — intentionally never scored. |
 | Dry-run round | `sidecar_state` `SKIPPED` (`error_category` `SKIPPED_OPERATOR_OPT_OUT`) | Nothing — intentionally never scored. |
