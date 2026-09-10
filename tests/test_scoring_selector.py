@@ -1,3 +1,5 @@
+import pytest
+
 from validator_scoring_sidecar.scoring import (
     ScoringResult,
     UNLSelectionResult,
@@ -273,3 +275,45 @@ def test_select_unl_empty_previous_unl_treated_as_first_round():
 
     assert result.unl == ["A", "B"]
     assert result.alternates == []
+
+
+def test_select_unl_rejects_zero_max_size():
+    # Foundation guard parity: a seatless UNL is rejected at entry instead of
+    # crashing on min() once every incumbent is displaced by the cap.
+    with pytest.raises(ValueError, match="max_size must be at least 1"):
+        select_unl(
+            _result(
+                _validator("INCUMBENT", 50),
+                _validator("CHALLENGER", 60),
+            ),
+            cutoff=40,
+            max_size=0,
+            min_gap=5,
+            previous_unl=["INCUMBENT"],
+        )
+
+
+def test_select_unl_rejects_negative_max_size():
+    with pytest.raises(ValueError, match="max_size must be at least 1"):
+        select_unl(
+            _result(_validator("A", 80)),
+            cutoff=40,
+            max_size=-1,
+            min_gap=5,
+        )
+
+
+def test_select_unl_max_size_one_still_selects():
+    result = select_unl(
+        _result(
+            _validator("INCUMBENT", 50),
+            _validator("CHALLENGER", 60),
+        ),
+        cutoff=40,
+        max_size=1,
+        min_gap=5,
+        previous_unl=["INCUMBENT"],
+    )
+
+    assert result.unl == ["CHALLENGER"]
+    assert result.alternates == ["INCUMBENT"]
