@@ -156,16 +156,15 @@ from validator_scoring_sidecar.scoring.selector import (
 )
 from validator_scoring_sidecar.scoring._vendor_source import commit_reveal
 
+from validator_scoring_sidecar.scoring.selector_versions import SELECTORS
+
 SUPPORTED_PARSER_CONTENT_HASHES: frozenset[str] = frozenset(
     {
         "1eeeed7bee91d2e6e95039018074c5e30ba3e92dffaa16257e6e5dbd07a2f7f7",
     }
 )
-SUPPORTED_SELECTOR_CONTENT_HASHES: frozenset[str] = frozenset(
-    {
-        "cdd65a60565ba5ac340b5be60421f770905fc461cefa770c71465a179c2ff9f2",
-    }
-)
+
+SUPPORTED_SELECTOR_CONTENT_HASHES: frozenset[str] = frozenset(SELECTORS)
 SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES: frozenset[str] = frozenset(
     {
         "5ce025098523557a2d02f828e00bfa1e82ddc6323cff5af3f9f8a4bc04c65049",
