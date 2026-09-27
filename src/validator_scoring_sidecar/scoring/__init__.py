@@ -101,11 +101,11 @@ Refresh procedure when the foundation updates parser or selector:
      is preserved.
    - **Behavioral** (new field, new validation, changed control flow):
      vendor refresh required. Copy the new file into ``_vendor_source``,
-     re-apply the local adaptations, and add the new hash to the supported
-     set. Keep the prior hash in the set until both devnet and testnet have
-     deployed the new foundation commit AND at least one round on each has
-     been successfully verified by a sidecar running the new vendor with no
-     manifest-incompatible errors. Only then drop the prior hash.
+     preserve the prior runnable implementation and dispatch by the round
+     content hash (see ``parser_versions.py``). Never register a behavioral
+     hash against a different implementation. Retain prior implementations
+     for historical-round verification; a foundation rollout alone does not
+     make historical manifests obsolete.
 
 For ``score_formula.py`` the procedure mirrors the parser and selector: the
 runnable adapted copy is ``formula.py``, the provenance copy lives in
@@ -156,11 +156,9 @@ from validator_scoring_sidecar.scoring.selector import (
 )
 from validator_scoring_sidecar.scoring._vendor_source import commit_reveal
 
-SUPPORTED_PARSER_CONTENT_HASHES: frozenset[str] = frozenset(
-    {
-        "1eeeed7bee91d2e6e95039018074c5e30ba3e92dffaa16257e6e5dbd07a2f7f7",
-    }
-)
+from validator_scoring_sidecar.scoring.parser_versions import PARSERS
+
+SUPPORTED_PARSER_CONTENT_HASHES: frozenset[str] = frozenset(PARSERS)
 SUPPORTED_SELECTOR_CONTENT_HASHES: frozenset[str] = frozenset(
     {
         "cdd65a60565ba5ac340b5be60421f770905fc461cefa770c71465a179c2ff9f2",
