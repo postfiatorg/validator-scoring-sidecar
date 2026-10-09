@@ -11,10 +11,12 @@ from validator_scoring_sidecar.manifest import (
     CompatibilityResult,
     ManifestError,
     check_compatibility,
+    diversity_formula_present,
     score_formula_present,
     selector_parameters,
 )
 from validator_scoring_sidecar.scoring import (
+    SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES,
     SUPPORTED_PARSER_CONTENT_HASHES,
     SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
@@ -23,6 +25,7 @@ from validator_scoring_sidecar.scoring import (
 PARSER_HASH = sorted(SUPPORTED_PARSER_CONTENT_HASHES)[0]
 SELECTOR_HASH = sorted(SUPPORTED_SELECTOR_CONTENT_HASHES)[0]
 SCORE_FORMULA_HASH = sorted(SUPPORTED_SCORE_FORMULA_CONTENT_HASHES)[0]
+DIVERSITY_FORMULA_HASH = sorted(SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES)[0]
 MODEL_REVISION = "a" * 40
 DEFAULT_ROUND_NUMBER = 100
 IMAGE_REF = (
@@ -698,3 +701,72 @@ def test_score_formula_present_keys_on_code_section():
 
     manifest["code"]["score_formula"] = _formula_section(SCORE_FORMULA_HASH)
     assert score_formula_present(manifest) is True
+
+
+# ---------------------------------------------------------------------------
+# Diversity formula section (bimodal rounds)
+# ---------------------------------------------------------------------------
+
+
+def _diversity_section(content_sha256: str) -> dict[str, Any]:
+    return {
+        "module": "scoring_service.services.diversity_formula",
+        "content_sha256": content_sha256,
+        "version": 1,
+        "parameters": {
+            "axis_points": 50,
+            "axis_penalty": 119,
+            "unknown_axis_points": 10,
+        },
+        "inputs": "inputs/diversity_inputs.json",
+    }
+
+
+def test_diversity_round_with_supported_hash_passes():
+    manifest = _manifest()
+    manifest["code"]["score_formula"] = _formula_section(SCORE_FORMULA_HASH)
+    manifest["code"]["diversity_formula"] = _diversity_section(DIVERSITY_FORMULA_HASH)
+
+    result = _check(manifest)
+
+    assert result.passed is True
+
+
+def test_diversity_round_with_unsupported_hash_is_incompatible():
+    manifest = _manifest()
+    manifest["code"]["diversity_formula"] = _diversity_section("f" * 64)
+
+    result = _check(manifest)
+
+    assert result.passed is False
+    assert result.failure.category is FailureCategory.MANIFEST_INCOMPATIBLE
+    assert result.failure.field == "code.diversity_formula.content_sha256"
+
+
+@pytest.mark.parametrize("malformed", [None, "not-a-dict", {}, {"content_sha256": 1}])
+def test_diversity_round_with_malformed_section_is_incompatible(malformed):
+    manifest = _manifest()
+    manifest["code"]["diversity_formula"] = malformed
+
+    result = _check(manifest)
+
+    assert result.passed is False
+    assert result.failure.category is FailureCategory.MANIFEST_INCOMPATIBLE
+    assert result.failure.field == "code.diversity_formula.content_sha256"
+
+
+def test_pre_diversity_round_without_section_passes():
+    manifest = _manifest()
+    manifest["code"]["score_formula"] = _formula_section(SCORE_FORMULA_HASH)
+
+    result = _check(manifest)
+
+    assert result.passed is True
+
+
+def test_diversity_formula_present_keys_on_code_section():
+    manifest = _manifest()
+    assert diversity_formula_present(manifest) is False
+
+    manifest["code"]["diversity_formula"] = _diversity_section(DIVERSITY_FORMULA_HASH)
+    assert diversity_formula_present(manifest) is True

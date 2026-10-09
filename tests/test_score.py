@@ -33,6 +33,7 @@ from validator_scoring_sidecar.score import (
     score_round,
 )
 from validator_scoring_sidecar.scoring import (
+    SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES,
     SUPPORTED_PARSER_CONTENT_HASHES,
     SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
@@ -48,6 +49,7 @@ from validator_scoring_sidecar.state import (
 )
 from validator_scoring_sidecar.verification import (
     HASH_MODEL_RESPONSE,
+    VerificationError,
     compute_verification_hashes,
 )
 
@@ -222,7 +224,7 @@ class BlockingBackend(FakeBackend):
         )
 
 
-def _make_package_fetcher(manifest, previous_unl=None):
+def _make_package_fetcher(manifest, previous_unl=None, diversity_inputs=None):
     def fetcher(metadata, config, client, *, source, force):
         local_path = config.data_dir / "packages" / metadata.input_package_hash
         (local_path / "runtime").mkdir(parents=True, exist_ok=True)
@@ -239,6 +241,10 @@ def _make_package_fetcher(manifest, previous_unl=None):
         if previous_unl is not None:
             (local_path / "inputs" / "previous_unl.json").write_text(
                 json.dumps({"previous_unl": previous_unl}), encoding="utf-8"
+            )
+        if diversity_inputs is not None:
+            (local_path / "inputs" / "diversity_inputs.json").write_text(
+                json.dumps(diversity_inputs), encoding="utf-8"
             )
         return FetchedInputPackage(
             round_id=metadata.round_id,
@@ -353,6 +359,129 @@ def test_full_score_formula_round_selects_over_final_scores(tmp_path):
         "PARSED_MATCH",
         "SELECTED_UNL_MATCH",
     ]
+
+
+# All sub-scores 40 with a model diversity of 100 give a formula final of 46,
+# above the cutoff; the computed diversity of 25 (Hetzner in the United States
+# on testnet round 26) pulls it to 38, below it.
+DIVERSITY_RAW_RESPONSE = json.dumps(
+    {
+        "v1": {
+            "score": 80,
+            "consensus": 40,
+            "reliability": 40,
+            "software": 40,
+            "diversity": 100,
+            "identity": 40,
+            "reasoning": "crowded",
+        },
+        "network_summary": "healthy",
+    }
+)
+DIVERSITY_INPUTS = {
+    "resolved_endpoints": 44,
+    "validators": [
+        {"master_key": "MK1", "country_validators": 15, "provider_validators": 14},
+    ],
+}
+DIVERSITY_SELECTOR_PARAMS = {"score_cutoff": 40, "max_size": 35, "min_score_gap": 5}
+
+
+def _formula_manifest(*, diversity: bool):
+    manifest = _manifest()
+    manifest["code"]["selector"]["parameters"] = dict(DIVERSITY_SELECTOR_PARAMS)
+    manifest["code"]["score_formula"] = {
+        "content_sha256": next(iter(SUPPORTED_SCORE_FORMULA_CONTENT_HASHES)),
+    }
+    if diversity:
+        manifest["code"]["diversity_formula"] = {
+            "content_sha256": next(iter(SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES)),
+            "inputs": "inputs/diversity_inputs.json",
+        }
+    return manifest
+
+
+def _diversity_foundation_hashes(*, diversity_inputs):
+    return compute_verification_hashes(
+        DIVERSITY_RAW_RESPONSE,
+        VALIDATOR_MAP,
+        previous_unl=[],
+        selector_parameters=DIVERSITY_SELECTOR_PARAMS,
+        apply_score_formula=True,
+        diversity_inputs=diversity_inputs,
+    )
+
+
+def test_full_score_diversity_round_selects_over_computed_diversity(tmp_path):
+    # The foundation hashes are computed diversity-mode, so all three levels
+    # match only if score_round loads the frozen inputs named by the manifest
+    # and threads them into verification ahead of the formula.
+    config = _setup(tmp_path)
+    foundation = _diversity_foundation_hashes(diversity_inputs=DIVERSITY_INPUTS)
+    assert foundation != _diversity_foundation_hashes(diversity_inputs=None)
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=lambda record: FakeBackend(content=DIVERSITY_RAW_RESPONSE),
+        foundation_hash_fetcher=lambda *args: dict(foundation),
+        package_fetcher=_make_package_fetcher(
+            _formula_manifest(diversity=True),
+            previous_unl=[],
+            diversity_inputs=DIVERSITY_INPUTS,
+        ),
+    )
+
+    assert result.status == SCORE_STATUS_SCORED
+    assert result.matched_levels == [
+        "RAW_MATCH",
+        "PARSED_MATCH",
+        "SELECTED_UNL_MATCH",
+    ]
+
+
+def test_full_score_pre_diversity_round_ignores_frozen_diversity_inputs(tmp_path):
+    # Without the manifest section the package's diversity file must not be
+    # consulted: selection reproduces the formula-only pipeline.
+    config = _setup(tmp_path)
+    foundation = _diversity_foundation_hashes(diversity_inputs=None)
+
+    result = score_round(
+        config,
+        FakeClient(),
+        round_id=123,
+        backend_factory=lambda record: FakeBackend(content=DIVERSITY_RAW_RESPONSE),
+        foundation_hash_fetcher=lambda *args: dict(foundation),
+        package_fetcher=_make_package_fetcher(
+            _formula_manifest(diversity=False),
+            previous_unl=[],
+            diversity_inputs=DIVERSITY_INPUTS,
+        ),
+    )
+
+    assert result.status == SCORE_STATUS_SCORED
+    assert result.matched_levels == [
+        "RAW_MATCH",
+        "PARSED_MATCH",
+        "SELECTED_UNL_MATCH",
+    ]
+
+
+def test_full_score_diversity_round_without_frozen_inputs_fails_closed(tmp_path):
+    config = _setup(tmp_path)
+
+    with pytest.raises(VerificationError, match="diversity inputs not found"):
+        score_round(
+            config,
+            FakeClient(),
+            round_id=123,
+            backend_factory=lambda record: FakeBackend(content=DIVERSITY_RAW_RESPONSE),
+            foundation_hash_fetcher=lambda *args: None,
+            package_fetcher=_make_package_fetcher(
+                _formula_manifest(diversity=True), previous_unl=[]
+            ),
+        )
 
 
 def test_full_score_pending_when_foundation_unavailable(tmp_path):

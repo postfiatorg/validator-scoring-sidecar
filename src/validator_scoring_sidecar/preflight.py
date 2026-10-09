@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from validator_scoring_sidecar.config import SidecarConfig
+from validator_scoring_sidecar.config import ENV_VALIDATOR_KEYS_PATH, SidecarConfig
 from validator_scoring_sidecar.wallet import relay_wallet_from_secret
 
 # Funding floor for the relay account: the account reserve plus a runway of
@@ -140,7 +140,7 @@ def _check_validator_key(keys_path: str | None) -> CheckResult:
         return CheckResult(
             CHECK_VALIDATOR_KEY,
             False,
-            "no validator-keys file set (POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE)",
+            f"no validator-keys file set ({ENV_VALIDATOR_KEYS_PATH})",
         )
     if not os.path.exists(keys_path):
         return CheckResult(

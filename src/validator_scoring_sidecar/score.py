@@ -58,6 +58,7 @@ from validator_scoring_sidecar.inference import (
 from validator_scoring_sidecar.input_package import SOURCE_AUTO, fetch_input_package
 from validator_scoring_sidecar.manifest import (
     check_compatibility,
+    diversity_formula_present,
     score_formula_present,
     selector_parameters,
 )
@@ -83,6 +84,7 @@ from validator_scoring_sidecar.verification import (
     HASH_VALIDATOR_SCORES,
     HASH_SELECTED_UNL,
     compare_hashes,
+    load_diversity_inputs,
     load_previous_unl,
     load_validator_map,
     persist_verification_hashes,
@@ -381,6 +383,13 @@ def _full_score(
     if (fetched.local_path / "inputs" / "previous_unl.json").exists():
         previous_unl = load_previous_unl(fetched.local_path)
         selector_params = selector_parameters(manifest)
+    # A manifest that names the diversity formula promises its frozen inputs;
+    # a package without them is unusable, not a pre-diversity round.
+    diversity_inputs = (
+        load_diversity_inputs(fetched.local_path)
+        if diversity_formula_present(manifest)
+        else None
+    )
     foundation = fetch_foundation(client, metadata, config)
     verification = verify_round(
         inference.content,
@@ -390,6 +399,7 @@ def _full_score(
         previous_unl=previous_unl,
         selector_parameters=selector_params,
         apply_score_formula=score_formula_present(manifest),
+        diversity_inputs=diversity_inputs,
     )
     persist_verification_hashes(config, metadata.input_package_hash, verification.hashes)
     outcome = _scored_outcome(compat.effective_mode, verification.hashes, verification)

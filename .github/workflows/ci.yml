@@ -40,7 +40,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install ruff
-        run: python -m pip install "ruff>=0.15,<1"
+        run: python -m pip install "ruff>=0.15,<0.16"
 
       - name: Run ruff
         run: ruff check .
