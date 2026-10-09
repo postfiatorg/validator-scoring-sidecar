@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from validator_scoring_sidecar.config import ENV_VALIDATOR_KEYS_PATH, load_config
 from validator_scoring_sidecar.preflight import (
     CHECK_RELAY_FUNDING,
     CHECK_RELAY_WALLET,
@@ -107,6 +108,23 @@ def test_missing_key_file_is_not_ready(tmp_path):
     )
     assert report.ready is False
     assert _find(report, CHECK_VALIDATOR_KEY).ok is False
+
+
+def test_unset_key_path_names_the_variable_config_reads(tmp_path):
+    report = run_preflight(
+        _config(keys_path=None),
+        rpc_client=FakeRpc(),
+        resolve_publisher=_ok_publisher,
+        run_reproduction=None,
+    )
+    check = _find(report, CHECK_VALIDATOR_KEY)
+    assert report.ready is False
+    assert check.ok is False
+    assert f"({ENV_VALIDATOR_KEYS_PATH})" in check.detail
+
+    keys_path = _key_file(tmp_path)
+    config = load_config(environ={ENV_VALIDATOR_KEYS_PATH: keys_path})
+    assert config.validator_keys_path == keys_path
 
 
 def test_unreachable_rpc_is_not_ready(tmp_path):

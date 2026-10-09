@@ -2,16 +2,18 @@
 
 Fetches ``scoring_service/services/response_parser.py``,
 ``scoring_service/services/unl_selector.py``,
-``scoring_service/services/commit_reveal.py``, and
-``scoring_service/services/score_formula.py`` from
+``scoring_service/services/commit_reveal.py``,
+``scoring_service/services/score_formula.py``, and
+``scoring_service/services/diversity_formula.py`` from
 ``postfiatorg/dynamic-unl-scoring`` at the given branch, computes sha256 over
 each, and compares against the sidecar's ``SUPPORTED_PARSER_CONTENT_HASHES``,
 ``SUPPORTED_SELECTOR_CONTENT_HASHES``,
-``SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES``, and
-``SUPPORTED_SCORE_FORMULA_CONTENT_HASHES``. The score formula is allowed to be
-absent upstream: foundation branches that predate the deterministic
-final-score stage legitimately lack the file, and the bimodal sidecar handles
-their rounds without it.
+``SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES``,
+``SUPPORTED_SCORE_FORMULA_CONTENT_HASHES``, and
+``SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES``. The score and diversity
+formulas are allowed to be absent upstream: foundation branches that predate
+the deterministic final-score or diversity stage legitimately lack the file,
+and the bimodal sidecar handles their rounds without it.
 
 Exit codes:
 
@@ -32,6 +34,7 @@ import urllib.request
 
 from validator_scoring_sidecar.scoring import (
     SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES,
+    SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES,
     SUPPORTED_PARSER_CONTENT_HASHES,
     SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
@@ -44,6 +47,7 @@ PARSER_PATH = "scoring_service/services/response_parser.py"
 SELECTOR_PATH = "scoring_service/services/unl_selector.py"
 COMMIT_REVEAL_PATH = "scoring_service/services/commit_reveal.py"
 SCORE_FORMULA_PATH = "scoring_service/services/score_formula.py"
+DIVERSITY_FORMULA_PATH = "scoring_service/services/diversity_formula.py"
 HTTP_TIMEOUT_SECONDS = 30
 HTTP_NOT_FOUND = 404
 EXIT_OK = 0
@@ -72,7 +76,7 @@ def _check_module(
             if missing_ok:
                 print(
                     f"OK: foundation {module_label} ({path}) "
-                    f"not present at branch '{branch}' (pre-formula branch); "
+                    f"not present at branch '{branch}' (branch predates this module); "
                     f"nothing to drift against"
                 )
                 return True
@@ -144,6 +148,13 @@ def main(argv: list[str] | None = None) -> int:
             SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
             missing_ok=True,
         )
+        diversity_formula_matched = _check_module(
+            args.branch,
+            "diversity-formula",
+            DIVERSITY_FORMULA_PATH,
+            SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES,
+            missing_ok=True,
+        )
     except urllib.error.URLError as exc:
         print(f"ERROR: failed to fetch foundation source: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -153,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         and selector_matched
         and commit_reveal_matched
         and score_formula_matched
+        and diversity_formula_matched
     ):
         return EXIT_OK
 

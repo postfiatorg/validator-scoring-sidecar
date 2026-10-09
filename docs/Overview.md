@@ -75,7 +75,10 @@ In order, each round:
    (`code.score_formula`), the sidecar applies the vendored formula to the
    model's sub-scores before selection, exactly as the foundation does; older
    rounds reproduce selection directly from the model scores, so both kinds of
-   round verify with the same sidecar.
+   round verify with the same sidecar. Likewise, on rounds whose manifest
+   carries the deterministic diversity formula (`code.diversity_formula`), the
+   sidecar first replaces the model's diversity sub-score with one computed
+   from the frozen `inputs/diversity_inputs.json`, in the foundation's order.
 4. **It commits (commit window).** Commit-reveal is a two-step way to vote without
    copying. The commit publishes a *sealed envelope*: your fingerprints scrambled
    with a secret random salt. Locked in and timestamped, but unreadable.
@@ -118,6 +121,11 @@ only reads the *public* master key so it knows which identity it is committing a
 The transaction is paid for and broadcast by a **separate funded relay wallet** —
 so the account that sends the transaction is deliberately *not* your validator
 identity.
+
+Terminology note: the relay wallet just pays commit-reveal transaction fees. It is unrelated to a network relay or *sentry* host fronting a
+validator's public endpoint — that networking concept is covered in the
+validator setup guide:
+https://postfiat.org/validator-setup/#endpoint-visibility-and-your-diversity-score
 
 ## The lifecycle, as local state
 

@@ -8,7 +8,7 @@ This file is for developers working on the sidecar source. Validator operators d
 
 ```
 src/validator_scoring_sidecar/             Sidecar source: CLI, config, fetch + verify, SQLite state
-src/validator_scoring_sidecar/scoring/     Vendored foundation parser and selector
+src/validator_scoring_sidecar/scoring/     Vendored foundation parser, selector, score formula, and diversity formula
 tests/                                     pytest suite
 scripts/                                   Maintainer scripts (vendor freshness)
 docs/                                      Operator documentation
@@ -78,7 +78,7 @@ Only the participation build pins a platform: the postfiatd image supplying the 
 
 ## Vendor freshness
 
-The `validator_scoring_sidecar.scoring` sub-package vendors the foundation parser and selector at pinned content hashes. To check whether the live foundation source still matches the vendored copy:
+The `validator_scoring_sidecar.scoring` sub-package vendors the foundation parser, selector, score formula, and diversity formula at pinned content hashes. To check whether the live foundation source still matches the vendored copies:
 
 ```bash
 python scripts/check_vendor_freshness.py --branch main --mode warning

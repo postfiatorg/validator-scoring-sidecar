@@ -19,6 +19,7 @@ from validator_scoring_sidecar.verification import (
     build_validator_scores_document,
     compare_hashes,
     compute_verification_hashes,
+    load_diversity_inputs,
     load_previous_unl,
     load_validator_map,
     persist_verification_hashes,
@@ -369,3 +370,119 @@ def test_selection_is_bimodal_on_score_formula():
     # The LLM-output levels are unaffected by the formula.
     assert legacy[HASH_MODEL_RESPONSE] == formula[HASH_MODEL_RESPONSE]
     assert legacy[HASH_VALIDATOR_SCORES] == formula[HASH_VALIDATOR_SCORES]
+
+
+DIVERSITY_INPUTS = {
+    "resolved_endpoints": 44,
+    "validators": [
+        # Hetzner (14) in the United States (15): computed diversity 25.
+        {"master_key": MASTER_KEY, "country_validators": 15, "provider_validators": 14},
+    ],
+}
+
+
+def test_load_diversity_inputs_reads_frozen_file(tmp_path):
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    (inputs_dir / "diversity_inputs.json").write_text(
+        json.dumps(DIVERSITY_INPUTS), encoding="utf-8"
+    )
+    assert load_diversity_inputs(tmp_path) == DIVERSITY_INPUTS
+
+
+def test_load_diversity_inputs_missing_raises(tmp_path):
+    with pytest.raises(VerificationError, match="not found"):
+        load_diversity_inputs(tmp_path)
+
+
+def test_load_diversity_inputs_invalid_json_raises(tmp_path):
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    (inputs_dir / "diversity_inputs.json").write_text("{bad", encoding="utf-8")
+
+    with pytest.raises(VerificationError, match="not valid JSON"):
+        load_diversity_inputs(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [],
+        {"validators": []},
+        {"resolved_endpoints": "44", "validators": []},
+        {"resolved_endpoints": True, "validators": []},
+        {"resolved_endpoints": 44, "validators": {}},
+        {"resolved_endpoints": 44, "validators": ["nHx"]},
+        {"resolved_endpoints": 44, "validators": [{"country_validators": 1}]},
+        {
+            "resolved_endpoints": 44,
+            "validators": [{"master_key": "nHx", "country_validators": 1}],
+        },
+        {
+            "resolved_endpoints": 44,
+            "validators": [
+                {"master_key": "nHx", "country_validators": "1", "provider_validators": 1}
+            ],
+        },
+    ],
+)
+def test_load_diversity_inputs_malformed_raises(tmp_path, content):
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    (inputs_dir / "diversity_inputs.json").write_text(
+        json.dumps(content), encoding="utf-8"
+    )
+
+    with pytest.raises(VerificationError, match="must"):
+        load_diversity_inputs(tmp_path)
+
+
+def test_selection_is_bimodal_on_diversity_formula():
+    # All sub-scores 40 and a generous model diversity of 100 give a formula
+    # final of 46, above the cutoff; the computed diversity of 25 pulls it
+    # to 38, below it. A diversity round must exclude what a formula-only
+    # round selects.
+    raw = json.dumps({
+        "v1": _entry(consensus=40, reliability=40, software=40, diversity=100, identity=40),
+        "network_summary": "healthy",
+    })
+
+    formula_only = compute_verification_hashes(
+        raw,
+        VALIDATOR_MAP,
+        previous_unl=[],
+        selector_parameters=SELECTOR_PARAMETERS,
+        apply_score_formula=True,
+    )
+    with_diversity = compute_verification_hashes(
+        raw,
+        VALIDATOR_MAP,
+        previous_unl=[],
+        selector_parameters=SELECTOR_PARAMETERS,
+        apply_score_formula=True,
+        diversity_inputs=DIVERSITY_INPUTS,
+    )
+
+    assert formula_only[HASH_SELECTED_UNL] == canonical_json_hash(
+        {"unl": [MASTER_KEY], "alternates": []}
+    )
+    assert with_diversity[HASH_SELECTED_UNL] == canonical_json_hash(
+        {"unl": [], "alternates": []}
+    )
+    # The LLM-output levels publish the model's advisory diversity untouched.
+    assert formula_only[HASH_MODEL_RESPONSE] == with_diversity[HASH_MODEL_RESPONSE]
+    assert formula_only[HASH_VALIDATOR_SCORES] == with_diversity[HASH_VALIDATOR_SCORES]
+
+
+def test_diversity_inputs_without_an_entry_for_a_scored_validator_fail_closed():
+    inputs = {"resolved_endpoints": 44, "validators": []}
+
+    with pytest.raises(VerificationError, match=MASTER_KEY):
+        compute_verification_hashes(
+            _raw_response(),
+            VALIDATOR_MAP,
+            previous_unl=[],
+            selector_parameters=SELECTOR_PARAMETERS,
+            apply_score_formula=True,
+            diversity_inputs=inputs,
+        )
