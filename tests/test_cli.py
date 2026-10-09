@@ -801,3 +801,23 @@ def test_warm_runtime_deploy_error_exits_operator_error(capsys, monkeypatch, tmp
     assert exit_code == 1
     assert "modal deploy failed" in captured.err
     assert captured.out == ""
+
+
+def test_every_cli_subcommand_is_documented_in_usage():
+    """docs/Usage.md must name every subcommand the CLI exposes, so a new
+    command cannot ship undocumented (preflight and warm-runtime once did)."""
+    import argparse
+    from pathlib import Path
+
+    parser = cli.build_parser()
+    subcommands = sorted(
+        name
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+        for name in action.choices
+    )
+    assert len(subcommands) >= 8, subcommands
+    usage = (Path(__file__).resolve().parents[1] / "docs" / "Usage.md").read_text(encoding="utf-8")
+    undocumented = [name for name in subcommands if f"`{name}`" not in usage]
+    assert undocumented == [], f"subcommands missing from docs/Usage.md: {undocumented}"
+

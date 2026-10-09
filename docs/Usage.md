@@ -79,6 +79,19 @@ A `sync completed` line means the first pass succeeded. Either it fetched a fres
 
 ## One-shot commands
 
+The image exposes eight subcommands (`docker compose run --rm sidecar <command> --help` prints each one's flags):
+
+| Command | What it does |
+| --- | --- |
+| `sync` | Discover and verify the newest unhandled frozen input package (the verify-only loop runs this). |
+| `fetch-input-package` | Fetch, verify, and cache one round's frozen input package by scoring-service round ID. |
+| `score` | Score a round end to end and record the verification outcome. |
+| `participate` | Run one unattended participation pass: score the latest round and commit/reveal on chain (the participation loop runs this). |
+| `preflight` | Confirm a participation deployment is ready to commit and reveal; prints one READY / NOT READY verdict (see [Preflight](#preflight)). |
+| `warm-runtime` | Provision the manifest-pinned Modal inference endpoint before the participation loop starts; a no-op without Modal credentials. |
+| `deploy-modal` | Deploy a manifest-pinned Modal inference endpoint and record it (see [`Deployment.md`](Deployment.md)). |
+| `start-sglang` | Start a manifest-pinned local SGLang endpoint and record it (see [`Deployment.md`](Deployment.md)). |
+
 To fetch a specific round by its scoring-service ID (for example to test or to recover a known-bad cache entry):
 
 ```bash
@@ -131,7 +144,45 @@ The overlay switches to the published participation image, which bundles the pos
 
 Before starting, uncomment the participation block in your `.env`: set `POSTFIAT_SIDECAR_MODE=participate`, the funded relay wallet seed, and `POSTFIAT_SIDECAR_VALIDATOR_KEYS_FILE` pointing at your `validator-keys.json` on the host. Participation is all-or-nothing: if any prerequisite is missing, the container logs a clear error and changes nothing on chain. The verify-only deployment is unaffected by the overlay's existence — `docker compose up -d` without the overlay keeps pulling and running the sync-only image.
 
-Participation also needs an inference runtime — scoring runs there, and a pass that cannot score has nothing to commit. With Modal this is zero-touch: set the four Modal values in `.env` and the sidecar deploys the foundation-pinned runtime itself, and redeploys when the foundation pins a new one. Running your own local SGLang H100 instead stays operator-managed — see [`Deployment.md`](Deployment.md). For the full list of participation variables and the key-handling model, see [`Configuration.md`](Configuration.md).
+Participation also needs an inference runtime — scoring runs there, and a pass that cannot score has nothing to commit. With Modal this is zero-touch: set the four Modal values in `.env` and the sidecar deploys the foundation-pinned runtime itself, and redeploys when the foundation pins a new one. To take that deployment off the critical path of the first round, provision it ahead of time:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.participate.yml run --rm sidecar warm-runtime
+```
+
+`warm-runtime` is a no-op without Modal credentials, so it is safe in a local-SGLang deployment. Running your own local SGLang H100 instead stays operator-managed — see [`Deployment.md`](Deployment.md). For the full list of participation variables and the key-handling model, see [`Configuration.md`](Configuration.md).
+
+## Preflight
+
+Before the first live round, run the readiness preflight. It performs the checks that would otherwise surface only at the first scoring round and prints one consolidated verdict:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.participate.yml run --rm sidecar preflight
+```
+
+```text
+Preflight: READY
+  relay address: r...
+  [PASS] relay_wallet: ...
+  [PASS] validator_key: ...
+  [PASS] rpc: ...
+  [PASS] relay_funding: ...
+  [PASS] foundation_publisher: ...
+  [PASS] round_reproduction: ...
+```
+
+The checks, in the order they run (cheap checks first, so a misconfiguration is reported before any inference runtime is spent):
+
+| Check | Passes when |
+| --- | --- |
+| `relay_wallet` | the relay seed derives a wallet |
+| `validator_key` | the validator key file is readable |
+| `rpc` | the PFTL RPC endpoint answers with a validated ledger |
+| `relay_funding` | the relay account's validated balance is at least 5 PFT (the account reserve plus a runway of per-round commit and reveal fees) |
+| `foundation_publisher` | the foundation publisher address is configured or discoverable |
+| `round_reproduction` | the latest completed round reproduces end to end on your inference runtime (the GPU step) |
+
+`--quick` skips `round_reproduction` and runs the configuration checks only. `--json` prints the report as JSON (`ready`, `relay_address`, `checks[]` with `name`, `ok`, `detail`). The exit code is 0 when READY and 1 when NOT READY, so the command can gate a deployment script. No secret material (relay seed, inference credentials, validator key contents) is included in the output.
 
 ## Participation lifecycle and recovery
 
@@ -198,7 +249,7 @@ A missed window is a chain-participation miss only — it does not fail the roun
 
 ### Avoiding misses
 
-- **Keep the relay wallet funded** — maintain the account reserve plus a long runway of per-round transaction fees so a commit or reveal is never skipped for balance. (An explicit startup balance pre-flight check is not yet built; underfunding is handled reactively.)
+- **Keep the relay wallet funded** — maintain the account reserve plus a long runway of per-round transaction fees so a commit or reveal is never skipped for balance. `preflight` checks this before the first round (`relay_funding`, floor 5 PFT); during operation underfunding is handled reactively as described above.
 - **Keep the poll interval well below the window lengths** — the default 60s sits comfortably inside devnet windows, so each window is polled many times.
 - **Keep the container running** — the reveal happens passes after the commit, so a host that is down across the reveal window misses it even though the commit landed.
 
