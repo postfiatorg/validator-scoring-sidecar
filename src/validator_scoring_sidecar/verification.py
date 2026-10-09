@@ -17,7 +17,10 @@ package:
   previous UNL (now frozen into the input package as ``inputs/previous_unl.json``)
   and the manifest's selector parameters, rendered into the foundation's
   ``selected_unl`` document and hashed. It is computed only when the caller
-  supplies the previous UNL and selector parameters.
+  supplies the previous UNL and selector parameters. On rounds whose manifest
+  carries them, the vendored diversity formula (fed from the frozen
+  ``inputs/diversity_inputs.json``) and then the vendored score formula are
+  applied to the parsed scores first, in the foundation's order.
 
 ``signed_validator_list`` is foundation-only; the sidecar never signs.
 
@@ -44,6 +47,7 @@ from validator_scoring_sidecar.failure import Failure, FailureCategory
 from validator_scoring_sidecar.input_package import canonical_json_hash
 from validator_scoring_sidecar.scoring import (
     ScoringResult,
+    apply_diversity_formula,
     apply_formula,
     parse_response,
     select_unl,
@@ -51,6 +55,7 @@ from validator_scoring_sidecar.scoring import (
 
 VALIDATOR_MAP_RELATIVE_PATH = "inputs/validator_map.json"
 PREVIOUS_UNL_RELATIVE_PATH = "inputs/previous_unl.json"
+DIVERSITY_INPUTS_RELATIVE_PATH = "inputs/diversity_inputs.json"
 SCORED_DIR_NAME = "scored"
 VERIFICATION_HASHES_FILE_NAME = "verification_hashes.json"
 
@@ -154,6 +159,59 @@ def load_previous_unl(package_path: Path) -> list[str]:
     return previous_unl
 
 
+def load_diversity_inputs(package_path: Path) -> dict[str, Any]:
+    """Load the frozen ``inputs/diversity_inputs.json`` from a verified package.
+
+    Returns the per-validator concentration counts the vendored diversity
+    formula consumes. The foundation freezes this at INPUT_FROZEN so the
+    computed diversity is reproducible from the package alone.
+    """
+
+    target = Path(package_path).joinpath(*DIVERSITY_INPUTS_RELATIVE_PATH.split("/"))
+    try:
+        content = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise VerificationError(
+            f"frozen diversity inputs not found: {target}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise VerificationError(
+            f"frozen diversity inputs are not valid JSON: {target}"
+        ) from exc
+    if not isinstance(content, dict):
+        raise VerificationError(
+            f"frozen diversity inputs must be a JSON object: {target}"
+        )
+    resolved_endpoints = content.get("resolved_endpoints")
+    validators = content.get("validators")
+    if (
+        isinstance(resolved_endpoints, bool)
+        or not isinstance(resolved_endpoints, int)
+        or not isinstance(validators, list)
+        or any(not _is_diversity_entry(entry) for entry in validators)
+    ):
+        raise VerificationError(
+            "frozen diversity inputs must contain an integer 'resolved_endpoints' "
+            "and a 'validators' list of per-validator count entries: "
+            f"{target}"
+        )
+    return content
+
+
+def _is_diversity_entry(entry: Any) -> bool:
+    """A per-validator entry: master key plus an integer-or-null count per axis."""
+
+    if not isinstance(entry, dict) or not isinstance(entry.get("master_key"), str):
+        return False
+    for axis in ("country_validators", "provider_validators"):
+        if axis not in entry:
+            return False
+        value = entry[axis]
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            return False
+    return True
+
+
 def build_model_response_document(raw_text: str) -> dict[str, Any]:
     """Mirror the foundation's ``_build_raw_response``."""
 
@@ -201,6 +259,7 @@ def compute_verification_hashes(
     previous_unl: list[str] | None = None,
     selector_parameters: dict[str, int] | None = None,
     apply_score_formula: bool = False,
+    diversity_inputs: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Compute the sidecar's reproducible verification hashes from a response.
 
@@ -211,7 +270,10 @@ def compute_verification_hashes(
     ``code.selector.parameters``. ``apply_score_formula`` mirrors whether the
     round's manifest carries ``code.score_formula``: formula rounds select over
     the vendored formula's final scores, pre-formula rounds over the model
-    scores directly.
+    scores directly. ``diversity_inputs`` mirrors ``code.diversity_formula``
+    the same way: when supplied (from the frozen ``inputs/diversity_inputs.json``)
+    the vendored diversity replaces the model's diversity sub-score before the
+    formula runs, as in the foundation's selection pipeline.
     """
 
     scoring_result = parse_response(raw_text, validator_id_map)
@@ -224,9 +286,11 @@ def compute_verification_hashes(
         ),
     }
     if previous_unl is not None and selector_parameters is not None:
-        selection_input = (
-            apply_formula(scoring_result) if apply_score_formula else scoring_result
-        )
+        selection_input = scoring_result
+        if diversity_inputs is not None:
+            selection_input = _with_computed_diversity(selection_input, diversity_inputs)
+        if apply_score_formula:
+            selection_input = apply_formula(selection_input)
         unl_result = select_unl(
             selection_input,
             cutoff=selector_parameters["score_cutoff"],
@@ -240,6 +304,18 @@ def compute_verification_hashes(
     return hashes
 
 
+def _with_computed_diversity(
+    scoring_result: ScoringResult, diversity_inputs: dict[str, Any]
+) -> ScoringResult:
+    # The vendored formula refuses a validator the frozen inputs do not cover;
+    # that is a package/response disagreement, reported like any other
+    # unusable frozen input rather than as an unhandled error.
+    try:
+        return apply_diversity_formula(scoring_result, diversity_inputs)
+    except ValueError as exc:
+        raise VerificationError(f"frozen diversity inputs are incomplete: {exc}") from exc
+
+
 def verify_round(
     raw_text: str,
     validator_id_map: dict[str, Any],
@@ -249,6 +325,7 @@ def verify_round(
     previous_unl: list[str] | None = None,
     selector_parameters: dict[str, int] | None = None,
     apply_score_formula: bool = False,
+    diversity_inputs: dict[str, Any] | None = None,
 ) -> VerificationResult:
     """Compute the sidecar hashes and compare them to the foundation's, if given.
 
@@ -267,6 +344,7 @@ def verify_round(
         previous_unl=previous_unl,
         selector_parameters=selector_parameters,
         apply_score_formula=apply_score_formula,
+        diversity_inputs=diversity_inputs,
     )
     if foundation_hashes is None:
         return VerificationResult(

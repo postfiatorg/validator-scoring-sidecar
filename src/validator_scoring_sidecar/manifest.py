@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 from validator_scoring_sidecar.failure import Failure, FailureCategory
 from validator_scoring_sidecar.scoring import (
+    SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES,
     SUPPORTED_PARSER_CONTENT_HASHES,
     SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
@@ -522,6 +523,24 @@ def _check_code(
                     f"not in the sidecar's supported set; vendor refresh required"
                 ),
             )
+
+    # Same contract for the diversity formula: absent means a pre-diversity
+    # round, any present value must carry a supported hash.
+    if "diversity_formula" in code_section:
+        diversity_section = code_section.get("diversity_formula")
+        diversity_hash = (
+            diversity_section.get("content_sha256")
+            if isinstance(diversity_section, dict)
+            else None
+        )
+        if diversity_hash not in SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES:
+            return _incompatible(
+                "code.diversity_formula.content_sha256",
+                (
+                    f"manifest diversity formula content hash {diversity_hash!r} "
+                    f"is not in the sidecar's supported set; vendor refresh required"
+                ),
+            )
     return None
 
 
@@ -646,6 +665,19 @@ def score_formula_present(manifest: dict[str, Any]) -> bool:
     """
     code = manifest.get("code", {}) if isinstance(manifest, dict) else {}
     return isinstance(code, dict) and code.get("score_formula") is not None
+
+
+def diversity_formula_present(manifest: dict[str, Any]) -> bool:
+    """Return whether the round's manifest declares the deterministic diversity.
+
+    Rounds carrying ``code.diversity_formula`` compute the diversity sub-score
+    from the frozen ``inputs/diversity_inputs.json`` before the score formula;
+    rounds without it predate the deterministic diversity stage and keep the
+    model's diversity sub-score. A null section counts as absent here for the
+    same reason as in ``score_formula_present``.
+    """
+    code = manifest.get("code", {}) if isinstance(manifest, dict) else {}
+    return isinstance(code, dict) and code.get("diversity_formula") is not None
 
 
 def selector_parameters(manifest: dict[str, Any]) -> dict[str, int]:

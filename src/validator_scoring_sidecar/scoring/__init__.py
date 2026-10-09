@@ -26,6 +26,15 @@ from a pre-formula foundation deployment) reproduce selection directly from
 the model scores exactly as before, so upgrade ordering between sidecar
 operators and the foundation deployment is unconstrained.
 
+The package likewise vendors the foundation's ``diversity_formula.py`` (the
+deterministic diversity sub-score introduced by the foundation's
+``docs/DeterministicDiversity.md``), keyed the same way on a
+``code.diversity_formula`` manifest section. On rounds carrying it, the
+vendored diversity is computed from the frozen ``inputs/diversity_inputs.json``
+and applied to the parsed sub-scores before the score formula, exactly as the
+foundation's ``select_unl(apply_formula(apply_diversity_formula(...)))``
+pipeline; rounds without it leave the model's diversity sub-score untouched.
+
 Local adaptations are limited to making the modules self-contained:
 
 - The selector's ``cutoff``, ``max_size``, and ``min_gap`` parameters are
@@ -36,6 +45,8 @@ Local adaptations are limited to making the modules self-contained:
   input package, instead of the foundation's ``PromptBuilder`` output.
 - The formula imports its result types from the vendored parser module and
   omits the foundation-only final-scores artifact helper.
+- The diversity formula imports its result type from the vendored parser
+  module and omits the foundation-only manifest-parameters helper.
 
 Parser and selector are vendored as a unit. The foundation publishes a single
 ``code.commit`` per round, so any upstream update that touches one of these
@@ -60,11 +71,13 @@ foundation equivalence by the sha256 content hash of the foundation source
 files instead.
 
 ``SUPPORTED_PARSER_CONTENT_HASHES``, ``SUPPORTED_SELECTOR_CONTENT_HASHES``,
-and ``SUPPORTED_SCORE_FORMULA_CONTENT_HASHES`` are the sha256 digests of the
+``SUPPORTED_SCORE_FORMULA_CONTENT_HASHES``, and
+``SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES`` are the sha256 digests of the
 foundation's ``scoring_service/services/response_parser.py``,
-``scoring_service/services/unl_selector.py``, and
-``scoring_service/services/score_formula.py`` files at the commits the sidecar
-vendor was lifted from. The unadapted source files are checked into the
+``scoring_service/services/unl_selector.py``,
+``scoring_service/services/score_formula.py``, and
+``scoring_service/services/diversity_formula.py`` files at the commits the
+sidecar vendor was lifted from. The unadapted source files are checked into the
 ``_vendor_source`` directory inside this package so the declared hashes are
 auditable: anyone can recompute the digests from disk and confirm they match
 the declared constants (``tests/test_scoring_provenance.py`` enforces this).
@@ -101,6 +114,12 @@ runnable adapted copy is ``formula.py``, the provenance copy lives in
 file as legitimately absent on foundation branches that predate the
 deterministic final-score stage.
 
+For ``diversity_formula.py`` the same applies: the runnable adapted copy is
+``diversity.py``, the provenance copy lives in ``_vendor_source``, the
+supported set is ``SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES``, and the
+freshness check treats the file as legitimately absent on foundation
+branches that predate the deterministic diversity stage.
+
 For ``commit_reveal.py`` the procedure is the same but simpler: it has no local
 adaptation and no separate runnable copy, so a refresh is just replacing the
 file in ``_vendor_source`` and adding the new digest to
@@ -115,6 +134,10 @@ branches map directly to deployed sidecar environments and must remain
 synchronized with the corresponding deployed foundation branch.
 """
 
+from validator_scoring_sidecar.scoring.diversity import (
+    apply_diversity_formula,
+    compute_diversity,
+)
 from validator_scoring_sidecar.scoring.formula import (
     apply_formula,
     compute_final_score,
@@ -153,20 +176,28 @@ SUPPORTED_SCORE_FORMULA_CONTENT_HASHES: frozenset[str] = frozenset(
         "fd4b430672b85c357e0e0605799aea9a989618ebbb4a87f3bb2a92a0d24935ec",
     }
 )
+SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES: frozenset[str] = frozenset(
+    {
+        "97e6b2fbc83d6592564007b4dded0738776d6ea06ee35c7e8859146ba91a30e7",
+    }
+)
 
 __all__ = [
     "DIMENSIONAL_FIELDS",
     "NetworkReport",
     "NetworkReportCategory",
     "SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES",
+    "SUPPORTED_DIVERSITY_FORMULA_CONTENT_HASHES",
     "SUPPORTED_PARSER_CONTENT_HASHES",
     "SUPPORTED_SCORE_FORMULA_CONTENT_HASHES",
     "SUPPORTED_SELECTOR_CONTENT_HASHES",
     "ScoringResult",
     "UNLSelectionResult",
     "ValidatorScore",
+    "apply_diversity_formula",
     "apply_formula",
     "commit_reveal",
+    "compute_diversity",
     "compute_final_score",
     "parse_response",
     "select_unl",
