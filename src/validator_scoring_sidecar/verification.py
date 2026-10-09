@@ -49,8 +49,12 @@ from validator_scoring_sidecar.scoring import (
     ScoringResult,
     apply_diversity_formula,
     apply_formula,
-    parse_response,
     select_unl,
+)
+
+from validator_scoring_sidecar.scoring.parser_versions import (
+    LEGACY_PARSER_HASH,
+    parse_response_for_hash,
 )
 
 VALIDATOR_MAP_RELATIVE_PATH = "inputs/validator_map.json"
@@ -260,6 +264,7 @@ def compute_verification_hashes(
     selector_parameters: dict[str, int] | None = None,
     apply_score_formula: bool = False,
     diversity_inputs: dict[str, Any] | None = None,
+    parser_content_hash: str = LEGACY_PARSER_HASH,
 ) -> dict[str, str]:
     """Compute the sidecar's reproducible verification hashes from a response.
 
@@ -274,9 +279,13 @@ def compute_verification_hashes(
     the same way: when supplied (from the frozen ``inputs/diversity_inputs.json``)
     the vendored diversity replaces the model's diversity sub-score before the
     formula runs, as in the foundation's selection pipeline.
+    ``parser_content_hash`` selects the exact parser behavior frozen in the
+    manifest; omission preserves the legacy direct-call API.
     """
 
-    scoring_result = parse_response(raw_text, validator_id_map)
+    scoring_result = parse_response_for_hash(
+        raw_text, validator_id_map, parser_content_hash
+    )
     hashes = {
         HASH_MODEL_RESPONSE: canonical_json_hash(
             build_model_response_document(raw_text)
@@ -326,6 +335,7 @@ def verify_round(
     selector_parameters: dict[str, int] | None = None,
     apply_score_formula: bool = False,
     diversity_inputs: dict[str, Any] | None = None,
+    parser_content_hash: str = LEGACY_PARSER_HASH,
 ) -> VerificationResult:
     """Compute the sidecar hashes and compare them to the foundation's, if given.
 
@@ -345,6 +355,7 @@ def verify_round(
         selector_parameters=selector_parameters,
         apply_score_formula=apply_score_formula,
         diversity_inputs=diversity_inputs,
+        parser_content_hash=parser_content_hash,
     )
     if foundation_hashes is None:
         return VerificationResult(

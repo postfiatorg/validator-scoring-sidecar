@@ -400,6 +400,7 @@ def _full_score(
         selector_parameters=selector_params,
         apply_score_formula=score_formula_present(manifest),
         diversity_inputs=diversity_inputs,
+        parser_content_hash=manifest["code"]["parser"]["content_sha256"],
     )
     persist_verification_hashes(config, metadata.input_package_hash, verification.hashes)
     outcome = _scored_outcome(compat.effective_mode, verification.hashes, verification)
