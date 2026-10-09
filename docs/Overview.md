@@ -75,7 +75,10 @@ In order, each round:
    (`code.score_formula`), the sidecar applies the vendored formula to the
    model's sub-scores before selection, exactly as the foundation does; older
    rounds reproduce selection directly from the model scores, so both kinds of
-   round verify with the same sidecar.
+   round verify with the same sidecar. Likewise, on rounds whose manifest
+   carries the deterministic diversity formula (`code.diversity_formula`), the
+   sidecar first replaces the model's diversity sub-score with one computed
+   from the frozen `inputs/diversity_inputs.json`, in the foundation's order.
 4. **It commits (commit window).** Commit-reveal is a two-step way to vote without
    copying. The commit publishes a *sealed envelope*: your fingerprints scrambled
    with a secret random salt. Locked in and timestamped, but unreadable.
