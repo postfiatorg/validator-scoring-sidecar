@@ -5,7 +5,7 @@ Fetches ``scoring_service/services/response_parser.py``,
 ``scoring_service/services/commit_reveal.py``,
 ``scoring_service/services/score_formula.py``, and
 ``scoring_service/services/diversity_formula.py`` from
-``postfiatorg/dynamic-unl-scoring`` at the given branch, computes sha256 over
+the selected GitHub repository and ref, computes sha256 over
 each, and compares against the sidecar's ``SUPPORTED_PARSER_CONTENT_HASHES``,
 ``SUPPORTED_SELECTOR_CONTENT_HASHES``,
 ``SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES``,
@@ -28,8 +28,10 @@ locally for ad-hoc checks.
 
 import argparse
 import hashlib
+import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from validator_scoring_sidecar.scoring import (
@@ -40,9 +42,9 @@ from validator_scoring_sidecar.scoring import (
     SUPPORTED_SELECTOR_CONTENT_HASHES,
 )
 
-FOUNDATION_RAW_BASE = (
-    "https://raw.githubusercontent.com/postfiatorg/dynamic-unl-scoring"
-)
+FOUNDATION_RAW_ORIGIN = "https://raw.githubusercontent.com"
+DEFAULT_FOUNDATION_REPOSITORY = "postfiatorg/dynamic-unl-scoring"
+GITHUB_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 PARSER_PATH = "scoring_service/services/response_parser.py"
 SELECTOR_PATH = "scoring_service/services/unl_selector.py"
 COMMIT_REVEAL_PATH = "scoring_service/services/commit_reveal.py"
@@ -56,33 +58,42 @@ EXIT_ERROR = 2
 DESCRIPTION = "Drift detection between the sidecar vendor and the foundation scoring modules."
 
 
-def _fetch(branch: str, path: str) -> bytes:
-    url = f"{FOUNDATION_RAW_BASE}/{branch}/{path}"
+def _repository(value: str) -> str:
+    if not GITHUB_REPOSITORY_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError("repository must use the owner/name form")
+    return value
+
+
+def _fetch(repository: str, reference: str, path: str) -> bytes:
+    encoded_ref = urllib.parse.quote(reference, safe="/")
+    url = f"{FOUNDATION_RAW_ORIGIN}/{repository}/{encoded_ref}/{path}"
     with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as response:
         return response.read()
 
 
 def _check_module(
-    branch: str,
+    repository: str,
+    reference: str,
     module_label: str,
     path: str,
     supported: frozenset[str],
     missing_ok: bool = False,
 ) -> bool:
     try:
-        content = _fetch(branch, path)
+        content = _fetch(repository, reference, path)
     except urllib.error.HTTPError as exc:
         if exc.code == HTTP_NOT_FOUND:
             if missing_ok:
                 print(
                     f"OK: foundation {module_label} ({path}) "
-                    f"not present at branch '{branch}' (branch predates this module); "
+                    f"not present at {repository}@{reference} "
+                    f"(ref predates this module); "
                     f"nothing to drift against"
                 )
                 return True
             print(
                 f"DRIFT: foundation {module_label} ({path}) "
-                f"not found at branch '{branch}' (HTTP {exc.code}); "
+                f"not found at {repository}@{reference} (HTTP {exc.code}); "
                 f"foundation may have renamed or moved this file"
             )
             return False
@@ -109,7 +120,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--branch",
         required=True,
-        help="dynamic-unl-scoring branch to fetch (main, devnet, testnet)",
+        help="dynamic-unl-scoring branch, tag, or commit to fetch",
+    )
+    parser.add_argument(
+        "--repository",
+        type=_repository,
+        default=DEFAULT_FOUNDATION_REPOSITORY,
+        help=(
+            "GitHub repository in owner/name form "
+            f"(default: {DEFAULT_FOUNDATION_REPOSITORY})"
+        ),
     )
     parser.add_argument(
         "--mode",
@@ -124,24 +144,28 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         parser_matched = _check_module(
+            args.repository,
             args.branch,
             "parser",
             PARSER_PATH,
             SUPPORTED_PARSER_CONTENT_HASHES,
         )
         selector_matched = _check_module(
+            args.repository,
             args.branch,
             "selector",
             SELECTOR_PATH,
             SUPPORTED_SELECTOR_CONTENT_HASHES,
         )
         commit_reveal_matched = _check_module(
+            args.repository,
             args.branch,
             "commit-reveal",
             COMMIT_REVEAL_PATH,
             SUPPORTED_COMMIT_REVEAL_CONTENT_HASHES,
         )
         score_formula_matched = _check_module(
+            args.repository,
             args.branch,
             "score-formula",
             SCORE_FORMULA_PATH,
@@ -149,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             missing_ok=True,
         )
         diversity_formula_matched = _check_module(
+            args.repository,
             args.branch,
             "diversity-formula",
             DIVERSITY_FORMULA_PATH,
@@ -170,8 +195,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print(
-        f"Drift detected against postfiatorg/dynamic-unl-scoring "
-        f"branch '{args.branch}'."
+        f"Drift detected against {args.repository}@{args.branch}."
     )
     print(
         "Maintainer action: either the foundation made a behavioral change "

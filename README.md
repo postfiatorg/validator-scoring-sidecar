@@ -84,4 +84,37 @@ The `validator_scoring_sidecar.scoring` sub-package vendors the foundation parse
 python scripts/check_vendor_freshness.py --branch main --mode warning
 ```
 
+To validate an unmerged foundation contribution at its final contributor ref,
+select that repository explicitly:
+
+```bash
+python scripts/check_vendor_freshness.py \
+  --repository <owner>/dynamic-unl-scoring \
+  --branch <contribution-branch> \
+  --mode blocking
+```
+
 `.github/workflows/vendor-freshness.yml` runs this automatically on every push and pull request against `main`, `devnet`, and `testnet`.
+
+### Adding a compatible foundation implementation
+
+Foundation manifests identify scoring modules by the SHA-256 of their exact
+source bytes. A behavioral change therefore needs a coordinated sidecar release
+before the foundation publishes a round carrying the new hash:
+
+1. Copy the exact foundation source into `scoring/_vendor_source` without edits.
+2. Keep the historical implementation registered so old rounds remain
+   replayable, and register the new hash alongside it.
+3. Put any sidecar-only import adaptations in a separate runnable module. Never
+   change the vendored copy to make it importable.
+4. Extend source-provenance and behavior tests to prove that the runnable body
+   matches the vendored source and that manifest dispatch selects the expected
+   implementation. Unknown hashes must continue to fail closed.
+5. Run the contributor-ref freshness check above after any rebase or merge
+   conflict resolution. Then publish and roll out the compatible sidecar image
+   before deploying the foundation change. A hash calculated from an earlier
+   PR head is not sufficient.
+
+Run the complete test and lint suites plus the vendor-freshness check before
+release. The blocking environment-branch workflow is the final guard against a
+foundation deployment whose manifest hash the published sidecar cannot replay.
