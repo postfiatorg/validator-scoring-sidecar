@@ -38,6 +38,12 @@ from validator_scoring_sidecar.scoring import (
     SUPPORTED_SCORE_FORMULA_CONTENT_HASHES,
     SUPPORTED_SELECTOR_CONTENT_HASHES,
 )
+from validator_scoring_sidecar.scoring.selector_versions import (
+    COMBINED_SELECTOR_HASH,
+    LEGACY_SELECTOR_HASH,
+    STRICT_SELECTOR_HASH,
+    TIE_BREAK_SELECTOR_HASH,
+)
 from validator_scoring_sidecar.round_metadata import RoundMetadata
 from validator_scoring_sidecar.state import (
     STATE_COMMITTED,
@@ -387,8 +393,9 @@ DIVERSITY_INPUTS = {
 DIVERSITY_SELECTOR_PARAMS = {"score_cutoff": 40, "max_size": 35, "min_score_gap": 5}
 
 
-def _formula_manifest(*, diversity: bool):
+def _formula_manifest(*, diversity: bool, selector_hash: str = LEGACY_SELECTOR_HASH):
     manifest = _manifest()
+    manifest["code"]["selector"]["content_sha256"] = selector_hash
     manifest["code"]["selector"]["parameters"] = dict(DIVERSITY_SELECTOR_PARAMS)
     manifest["code"]["score_formula"] = {
         "content_sha256": next(iter(SUPPORTED_SCORE_FORMULA_CONTENT_HASHES)),
@@ -401,7 +408,9 @@ def _formula_manifest(*, diversity: bool):
     return manifest
 
 
-def _diversity_foundation_hashes(*, diversity_inputs):
+def _diversity_foundation_hashes(
+    *, diversity_inputs, selector_hash: str = LEGACY_SELECTOR_HASH
+):
     return compute_verification_hashes(
         DIVERSITY_RAW_RESPONSE,
         VALIDATOR_MAP,
@@ -409,16 +418,32 @@ def _diversity_foundation_hashes(*, diversity_inputs):
         selector_parameters=DIVERSITY_SELECTOR_PARAMS,
         apply_score_formula=True,
         diversity_inputs=diversity_inputs,
+        selector_content_hash=selector_hash,
     )
 
 
-def test_full_score_diversity_round_selects_over_computed_diversity(tmp_path):
+@pytest.mark.parametrize(
+    "selector_hash",
+    [
+        LEGACY_SELECTOR_HASH,
+        STRICT_SELECTOR_HASH,
+        TIE_BREAK_SELECTOR_HASH,
+        COMBINED_SELECTOR_HASH,
+    ],
+)
+def test_full_score_diversity_round_selects_over_computed_diversity(
+    tmp_path, selector_hash
+):
     # The foundation hashes are computed diversity-mode, so all three levels
     # match only if score_round loads the frozen inputs named by the manifest
     # and threads them into verification ahead of the formula.
     config = _setup(tmp_path)
-    foundation = _diversity_foundation_hashes(diversity_inputs=DIVERSITY_INPUTS)
-    assert foundation != _diversity_foundation_hashes(diversity_inputs=None)
+    foundation = _diversity_foundation_hashes(
+        diversity_inputs=DIVERSITY_INPUTS, selector_hash=selector_hash
+    )
+    assert foundation != _diversity_foundation_hashes(
+        diversity_inputs=None, selector_hash=selector_hash
+    )
 
     result = score_round(
         config,
@@ -427,7 +452,7 @@ def test_full_score_diversity_round_selects_over_computed_diversity(tmp_path):
         backend_factory=lambda record: FakeBackend(content=DIVERSITY_RAW_RESPONSE),
         foundation_hash_fetcher=lambda *args: dict(foundation),
         package_fetcher=_make_package_fetcher(
-            _formula_manifest(diversity=True),
+            _formula_manifest(diversity=True, selector_hash=selector_hash),
             previous_unl=[],
             diversity_inputs=DIVERSITY_INPUTS,
         ),
