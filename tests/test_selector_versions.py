@@ -6,10 +6,15 @@ from pathlib import Path
 import pytest
 
 from validator_scoring_sidecar.scoring import SUPPORTED_SELECTOR_CONTENT_HASHES
-from validator_scoring_sidecar.scoring import selector, selector_minimum_cap
+from validator_scoring_sidecar.scoring import (
+    selector,
+    selector_minimum_cap,
+    selector_tie_break,
+)
 from validator_scoring_sidecar.scoring.parser import ScoringResult, ValidatorScore
 from validator_scoring_sidecar.scoring.selector_versions import (
-    LEGACY_SELECTOR_HASH, STRICT_SELECTOR_HASH, select_unl_for_hash,
+    LEGACY_SELECTOR_HASH, STRICT_SELECTOR_HASH, TIE_BREAK_SELECTOR_HASH,
+    select_unl_for_hash,
 )
 
 
@@ -53,14 +58,37 @@ def test_unknown_hash_fails_closed(unknown):
         select_unl_for_hash(result(False), unknown, cutoff=40, max_size=35, min_gap=5)
 
 
+def test_tie_break_version_displaces_lexicographically_larger_weakest_incumbent():
+    scores = [
+        ValidatorScore(master_key=key, score=score, consensus=score,
+            reliability=score, software=score, diversity=score, identity=score,
+            reasoning='ok')
+        for key, score in [('A', 50), ('B', 50), ('C', 55)]
+    ]
+    scored = ScoringResult(validator_scores=scores, network_summary='ok',
+        network_report=None, raw_response='{}', complete=True, errors=[])
+    args = dict(cutoff=40, max_size=2, min_gap=5, previous_unl=['A', 'B'])
+    legacy = select_unl_for_hash(scored, LEGACY_SELECTOR_HASH, **args)
+    fixed = select_unl_for_hash(scored, TIE_BREAK_SELECTOR_HASH, **args)
+    assert legacy.unl == ['C', 'B']
+    assert fixed.unl == ['C', 'A']
+
+
 def test_source_provenance_and_runnable_body_parity():
     source = Path(selector.__file__).parent / '_vendor_source'
     raw = (source / 'unl_selector_minimum_cap.py').read_bytes()
     assert hashlib.sha256(raw).hexdigest() == STRICT_SELECTOR_HASH
     assert hashlib.sha256((source / 'unl_selector.py').read_bytes()).hexdigest() == LEGACY_SELECTOR_HASH
-    assert SUPPORTED_SELECTOR_CONTENT_HASHES == {LEGACY_SELECTOR_HASH, STRICT_SELECTOR_HASH}
+    tie_raw = (source / 'unl_selector_tie_break.py').read_bytes()
+    assert hashlib.sha256(tie_raw).hexdigest() == TIE_BREAK_SELECTOR_HASH
+    assert SUPPORTED_SELECTOR_CONTENT_HASHES == {
+        LEGACY_SELECTOR_HASH, STRICT_SELECTOR_HASH, TIE_BREAK_SELECTOR_HASH,
+    }
     upstream = next(n for n in ast.parse(raw).body if isinstance(n, ast.FunctionDef) and n.name == 'select_unl')
     adapted = next(n for n in ast.parse(Path(selector_minimum_cap.__file__).read_text()).body if isinstance(n, ast.FunctionDef) and n.name == 'select_unl')
     # Only the docstring and three settings fallback assignments are removed
     # from the upstream body; selection/validation must otherwise be identical.
     assert [ast.dump(n) for n in upstream.body[4:]] == [ast.dump(n) for n in adapted.body[1:]]
+    tie_upstream = next(n for n in ast.parse(tie_raw).body if isinstance(n, ast.FunctionDef) and n.name == 'select_unl')
+    tie_adapted = next(n for n in ast.parse(Path(selector_tie_break.__file__).read_text()).body if isinstance(n, ast.FunctionDef) and n.name == 'select_unl')
+    assert [ast.dump(n) for n in tie_upstream.body[4:]] == [ast.dump(n) for n in tie_adapted.body[1:]]
