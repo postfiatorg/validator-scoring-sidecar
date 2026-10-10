@@ -1154,26 +1154,34 @@ def test_score_round_wires_persisted_call_id_into_default_factory(
     assert record.inference_call_id == "fc-fresh"
 
 
-@pytest.mark.parametrize('strict_mode', [False, True])
-def test_full_score_threads_selector_hash(tmp_path, monkeypatch, strict_mode):
+@pytest.mark.parametrize('expected', [
+    'legacy', 'minimum_cap', 'tie_break', 'combined',
+])
+def test_full_score_threads_selector_hash(tmp_path, monkeypatch, expected):
     from validator_scoring_sidecar.scoring.selector_versions import (
-        LEGACY_SELECTOR_HASH, STRICT_SELECTOR_HASH, SELECTORS,
+        COMBINED_SELECTOR_HASH, LEGACY_SELECTOR_HASH, STRICT_SELECTOR_HASH,
+        TIE_BREAK_SELECTOR_HASH, SELECTORS,
     )
     config = _setup(tmp_path)
     manifest = _manifest()
-    expected = STRICT_SELECTOR_HASH if strict_mode else LEGACY_SELECTOR_HASH
-    manifest['code']['selector']['content_sha256'] = expected
+    expected_hash = {
+        'legacy': LEGACY_SELECTOR_HASH,
+        'minimum_cap': STRICT_SELECTOR_HASH,
+        'tie_break': TIE_BREAK_SELECTOR_HASH,
+        'combined': COMBINED_SELECTOR_HASH,
+    }[expected]
+    manifest['code']['selector']['content_sha256'] = expected_hash
     manifest['code']['selector']['parameters'] = {
         'score_cutoff':40, 'max_size':35, 'min_score_gap':5,
     }
     calls = []
-    original = SELECTORS[expected]
+    original = SELECTORS[expected_hash]
 
     def observed(*args, **kwargs):
-        calls.append(expected)
+        calls.append(expected_hash)
         return original(*args, **kwargs)
 
-    monkeypatch.setitem(SELECTORS, expected, observed)
+    monkeypatch.setitem(SELECTORS, expected_hash, observed)
     response = score_round(
         config, FakeClient(), round_id=123,
         backend_factory=lambda record: FakeBackend(),
@@ -1181,4 +1189,4 @@ def test_full_score_threads_selector_hash(tmp_path, monkeypatch, strict_mode):
         package_fetcher=_make_package_fetcher(manifest, previous_unl=[]),
     )
     assert response.status == "comparison_pending"
-    assert calls == [expected]
+    assert calls == [expected_hash]
