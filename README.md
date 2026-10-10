@@ -85,3 +85,26 @@ python scripts/check_vendor_freshness.py --branch main --mode warning
 ```
 
 `.github/workflows/vendor-freshness.yml` runs this automatically on every push and pull request against `main`, `devnet`, and `testnet`.
+
+### Adding a compatible foundation implementation
+
+Foundation manifests identify scoring modules by the SHA-256 of their exact
+source bytes. A behavioral change therefore needs a coordinated sidecar release
+before the foundation publishes a round carrying the new hash:
+
+1. Copy the exact foundation source into `scoring/_vendor_source` without edits.
+2. Keep the historical implementation registered so old rounds remain
+   replayable, and register the new hash alongside it.
+3. Put any sidecar-only import adaptations in a separate runnable module. Never
+   change the vendored copy to make it importable.
+4. Extend source-provenance and behavior tests to prove that the runnable body
+   matches the vendored source and that manifest dispatch selects the expected
+   implementation. Unknown hashes must continue to fail closed.
+5. Publish and roll out the compatible sidecar image before deploying the
+   foundation change. Record the final foundation source hash after rebases or
+   merge conflict resolution; a hash calculated from an earlier PR head is not
+   sufficient.
+
+Run the complete test and lint suites plus the vendor-freshness check before
+release. The blocking environment-branch workflow is the final guard against a
+foundation deployment whose manifest hash the published sidecar cannot replay.
