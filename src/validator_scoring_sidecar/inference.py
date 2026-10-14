@@ -52,6 +52,14 @@ CHAT_COMPLETIONS_SUFFIX = "chat/completions"
 HEALTH_SUFFIX = "health"
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_POLL_READ_TIMEOUT_SECONDS = 30.0
+# Result-endpoint statuses that will not change by polling again: bad or
+# rotated proxy credentials (401/403) and a request the endpoint rejects
+# (400/405/422). The poll loop raises these at once instead of spending the
+# whole inference budget on them. 404 stays retryable: the endpoint can
+# answer it for a call id that is not yet, or no longer, visible, and the
+# FAILED/resubmit path owns expiry.
+NON_RETRYABLE_POLL_STATUS = frozenset({400, 401, 403, 405, 422})
+
 # Result statuses of the bundled app's job interface (_modal_app.result).
 POLL_STATUS_PENDING = "pending"
 POLL_STATUS_DONE = "done"
@@ -400,9 +408,14 @@ class ModalBackend(_ChatCompletionsBackend):
         while True:
             try:
                 status, payload = self._poll(transport, call_id)
-            except InferenceError:
+            except InferenceError as exc:
                 # A single failed poll is a transport blip, not a verdict on
-                # the generation; keep polling while budget remains.
+                # the generation; keep polling while budget remains. A
+                # permanent HTTP rejection is the exception: polling again
+                # cannot fix it.
+                status_code = exc.failure.details.get("status_code")
+                if status_code in NON_RETRYABLE_POLL_STATUS:
+                    raise
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(self._poll_interval)

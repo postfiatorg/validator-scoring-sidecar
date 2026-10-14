@@ -6,6 +6,7 @@ from threading import Thread
 import httpx
 import pytest
 
+from validator_scoring_sidecar import inference
 from validator_scoring_sidecar.failure import FailureCategory
 from validator_scoring_sidecar.inference import (
     BACKEND_MODE_LOCAL,
@@ -454,6 +455,59 @@ def test_poll_transport_survives_transient_poll_failures():
 
     assert result.content == POLL_RAW_RESPONSE
     assert calls["result"] == 2
+
+
+def _record_sleeps(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(inference.time, "sleep", sleeps.append)
+    return sleeps
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 405, 422])
+def test_poll_transport_fails_fast_on_permanent_poll_status(
+    monkeypatch, status_code
+):
+    sleeps = _record_sleeps(monkeypatch)
+    calls = {"result": 0}
+
+    def handler(request):
+        assert str(request.url) != SUBMIT_URL, "resume must not submit a new job"
+        calls["result"] += 1
+        return httpx.Response(status_code, json={"detail": "rejected"})
+
+    # A short budget keeps the pre-fix behaviour (poll until the deadline)
+    # from stalling the suite; the fixed loop must not reach it at all.
+    backend = _poll_backend(handler, pending_call_id="fc-resume", timeout_seconds=0.2)
+    with pytest.raises(InferenceError) as exc_info:
+        backend.run(_model_request())
+
+    assert exc_info.value.category == FailureCategory.INFERENCE_ERROR
+    assert str(exc_info.value) == (
+        f"could not poll inference job fc-resume: HTTP {status_code}"
+    )
+    assert exc_info.value.failure.details == {"status_code": status_code}
+    assert calls["result"] == 1
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("status_code", [404, 503])
+def test_poll_transport_retries_transient_poll_status(monkeypatch, status_code):
+    sleeps = _record_sleeps(monkeypatch)
+    calls = {"result": 0}
+
+    def handler(request):
+        if str(request.url) == SUBMIT_URL:
+            return httpx.Response(200, json={"call_id": "fc-flaky"})
+        calls["result"] += 1
+        if calls["result"] == 1:
+            return httpx.Response(status_code, json={"detail": "not yet"})
+        return httpx.Response(200, json=POLL_DONE_PAYLOAD)
+
+    result = _poll_backend(handler).run(_model_request())
+
+    assert result.content == POLL_RAW_RESPONSE
+    assert calls["result"] == 2
+    assert sleeps == [0]
 
 
 def test_from_environment_forwards_job_interface_parameters():
