@@ -176,7 +176,7 @@ The checks, in the order they run (cheap checks first, so a misconfiguration is 
 | Check | Passes when |
 | --- | --- |
 | `relay_wallet` | the relay seed derives a wallet |
-| `validator_key` | the validator key file is readable |
+| `validator_key` | the validator key file is a regular file containing a JSON object with a non-empty `public_key` |
 | `rpc` | the PFTL RPC endpoint answers with a validated ledger |
 | `relay_funding` | the relay account's validated balance is at least 5 PFT (the account reserve plus a runway of per-round commit and reveal fees) |
 | `foundation_publisher` | the foundation publisher address is configured or discoverable |
