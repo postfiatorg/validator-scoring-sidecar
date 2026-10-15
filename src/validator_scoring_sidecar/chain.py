@@ -406,8 +406,20 @@ class PftlAccountWatcher:
                 ledger_index_min = floor
 
     def _fetch_pages(self, ledger_index_min: int) -> list[dict[str, Any]]:
+        """Follow ``account_tx`` markers until the node reports no more pages.
+
+        A marker must never repeat within one pagination run: rippled always
+        advances it, so a repeat (immediate or a cycle) means a misbehaving or
+        proxied endpoint that would otherwise keep this loop issuing RPCs and
+        growing ``entries`` forever. A page that carries a marker but no
+        ``transactions`` list is equally malformed and is rejected rather than
+        silently skipped.
+        """
+
         entries: list[dict[str, Any]] = []
         marker: Any | None = None
+        seen_markers: set[str] = set()
+        pages = 0
         while True:
             result = self._rpc.account_tx(
                 account=self._account,
@@ -417,12 +429,24 @@ class PftlAccountWatcher:
                 limit=self._page_limit,
                 marker=marker,
             )
+            pages += 1
             page = result.get("transactions")
+            marker = result.get("marker")
+            if marker is not None and not isinstance(page, list):
+                raise ChainWatcherError(
+                    f"account_tx page {pages} carries marker {marker!r} but "
+                    f"transactions is {type(page).__name__}, not a list"
+                )
             if isinstance(page, list):
                 entries.extend(item for item in page if isinstance(item, dict))
-            marker = result.get("marker")
             if marker is None:
                 break
+            marker_key = json.dumps(marker, sort_keys=True, default=str)
+            if marker_key in seen_markers:
+                raise ChainWatcherError(
+                    f"account_tx marker repeated after {pages} pages: {marker!r}"
+                )
+            seen_markers.add(marker_key)
         return entries
 
     def _to_trusted(self, entry: dict[str, Any]) -> WatchedTransaction | None:

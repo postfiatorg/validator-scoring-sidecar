@@ -12,9 +12,11 @@ placed in the result.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from validator_scoring_sidecar.config import ENV_VALIDATOR_KEYS_PATH, SidecarConfig
@@ -146,6 +148,12 @@ def _check_validator_key(keys_path: str | None) -> CheckResult:
         return CheckResult(
             CHECK_VALIDATOR_KEY, False, f"validator-keys file not found at {keys_path}"
         )
+    if not os.path.isfile(keys_path):
+        return CheckResult(
+            CHECK_VALIDATOR_KEY,
+            False,
+            f"validator-keys path is not a file at {keys_path}",
+        )
     if not os.access(keys_path, os.R_OK):
         return CheckResult(
             CHECK_VALIDATOR_KEY,
@@ -153,8 +161,31 @@ def _check_validator_key(keys_path: str | None) -> CheckResult:
             f"validator-keys file at {keys_path} is not readable by this process "
             "(check file ownership/permissions)",
         )
+    try:
+        data = json.loads(Path(keys_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return CheckResult(
+            CHECK_VALIDATOR_KEY,
+            False,
+            f"validator-keys file at {keys_path} is not valid JSON",
+        )
+    if not isinstance(data, dict):
+        return CheckResult(
+            CHECK_VALIDATOR_KEY,
+            False,
+            f"validator-keys file at {keys_path} must contain a JSON object",
+        )
+    public_key = data.get("public_key")
+    if not isinstance(public_key, str) or not public_key.strip():
+        return CheckResult(
+            CHECK_VALIDATOR_KEY,
+            False,
+            f"validator-keys file at {keys_path} has no public_key",
+        )
     return CheckResult(
-        CHECK_VALIDATOR_KEY, True, f"validator-keys file readable at {keys_path}"
+        CHECK_VALIDATOR_KEY,
+        True,
+        f"validator-keys file readable with public_key at {keys_path}",
     )
 
 

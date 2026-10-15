@@ -104,6 +104,87 @@ def test_poll_paginates_until_marker_exhausted(tmp_path):
     assert len(rpc.calls) == 3  # 2 + 2 + 1
 
 
+class ScriptedMarkerRpc(FakeRpc):
+    """account_tx fake replaying scripted pages, repeating the last one forever."""
+
+    def __init__(self, pages):
+        super().__init__([])
+        self.pages = list(pages)
+
+    def account_tx(
+        self, *, account, ledger_index_min, ledger_index_max, forward, limit, marker
+    ):
+        self.calls.append(
+            {"min": ledger_index_min, "max": ledger_index_max, "marker": marker}
+        )
+        assert len(self.calls) <= 50, "pagination did not stop"
+        return self.pages[min(len(self.calls), len(self.pages)) - 1]
+
+
+def test_poll_rejects_repeating_marker(tmp_path):
+    same = {"ledger": 100, "seq": 0}
+    with SidecarState(tmp_path) as state:
+        rpc = ScriptedMarkerRpc([{"transactions": [], "marker": dict(same)}])
+        with pytest.raises(ChainWatcherError) as exc:
+            _watcher(state, rpc).poll()
+
+    assert str(exc.value) == (
+        "account_tx marker repeated after 2 pages: {'ledger': 100, 'seq': 0}"
+    )
+    assert len(rpc.calls) == 2
+    assert rpc.calls[1]["marker"] == same
+
+
+def test_poll_rejects_marker_cycle(tmp_path):
+    a = {"ledger": 100, "seq": 0}
+    b = {"seq": 7, "ledger": 101}
+    pages = [
+        {"transactions": [_entry(100, "A")], "marker": a},
+        {"transactions": [_entry(101, "B")], "marker": b},
+        # Same marker as page 1 with keys reordered: still a repeat.
+        {"transactions": [_entry(100, "A")], "marker": {"seq": 0, "ledger": 100}},
+    ]
+    with SidecarState(tmp_path) as state:
+        rpc = ScriptedMarkerRpc(pages)
+        with pytest.raises(ChainWatcherError) as exc:
+            _watcher(state, rpc).poll()
+
+    assert str(exc.value) == (
+        "account_tx marker repeated after 3 pages: {'seq': 0, 'ledger': 100}"
+    )
+    assert len(rpc.calls) == 3
+    assert [c["marker"] for c in rpc.calls] == [None, a, b]
+
+
+def test_poll_rejects_marker_with_non_list_transactions(tmp_path):
+    marker = {"ledger": 100, "seq": 0}
+    pages = [
+        {"transactions": [_entry(100, "A")], "marker": marker},
+        {"transactions": None, "marker": {"ledger": 101, "seq": 0}},
+    ]
+    with SidecarState(tmp_path) as state:
+        rpc = ScriptedMarkerRpc(pages)
+        with pytest.raises(ChainWatcherError) as exc:
+            _watcher(state, rpc).poll()
+
+    assert str(exc.value) == (
+        "account_tx page 2 carries marker {'ledger': 101, 'seq': 0} but "
+        "transactions is NoneType, not a list"
+    )
+    assert len(rpc.calls) == 2
+
+
+def test_poll_accepts_single_and_empty_pages_without_marker(tmp_path):
+    with SidecarState(tmp_path) as state:
+        rpc = ScriptedMarkerRpc([{"transactions": [_entry(100, "A")]}])
+        assert [t.tx_hash for t in _watcher(state, rpc).poll()] == ["A"]
+        assert len(rpc.calls) == 1
+    with SidecarState(tmp_path / "empty") as state:
+        rpc = ScriptedMarkerRpc([{"transactions": [], "marker": None}])
+        assert _watcher(state, rpc).poll() == []
+        assert len(rpc.calls) == 1
+
+
 def test_poll_resumes_from_cursor(tmp_path):
     entries = [_entry(100, "A"), _entry(101, "B"), _entry(102, "C")]
     with SidecarState(tmp_path) as state:
