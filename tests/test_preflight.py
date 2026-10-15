@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from validator_scoring_sidecar.config import ENV_VALIDATOR_KEYS_PATH, load_config
 from validator_scoring_sidecar.preflight import (
     CHECK_RELAY_FUNDING,
@@ -49,7 +51,7 @@ def _config(*, seed=GOOD_SEED, keys_path, rpc_url="https://rpc.example"):
 
 def _key_file(tmp_path):
     path = tmp_path / "validator-keys.json"
-    path.write_text("{}")
+    path.write_text('{"public_key": "nHTestMasterKey"}', encoding="utf-8")
     return str(path)
 
 
@@ -108,6 +110,54 @@ def test_missing_key_file_is_not_ready(tmp_path):
     )
     assert report.ready is False
     assert _find(report, CHECK_VALIDATOR_KEY).ok is False
+
+
+def test_validator_key_path_must_be_a_file(tmp_path):
+    report = run_preflight(
+        _config(keys_path=str(tmp_path)),
+        rpc_client=FakeRpc(),
+        resolve_publisher=_ok_publisher,
+        run_reproduction=_repro_ok,
+    )
+    check = _find(report, CHECK_VALIDATOR_KEY)
+    assert report.ready is False
+    assert check.ok is False
+    assert "not a file" in check.detail
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected_detail"),
+    [
+        ("not json", "valid JSON"),
+        ("[]", "JSON object"),
+        ("{}", "public_key"),
+        ('{"public_key": null}', "public_key"),
+        ('{"public_key": ""}', "public_key"),
+        ('{"public_key": "   "}', "public_key"),
+    ],
+)
+def test_invalid_validator_key_file_blocks_reproduction(
+    tmp_path, contents, expected_detail
+):
+    path = tmp_path / "validator-keys.json"
+    path.write_text(contents, encoding="utf-8")
+    reproduction_calls = []
+
+    def _repro_spy():
+        reproduction_calls.append(True)
+        return _repro_ok()
+
+    report = run_preflight(
+        _config(keys_path=str(path)),
+        rpc_client=FakeRpc(),
+        resolve_publisher=_ok_publisher,
+        run_reproduction=_repro_spy,
+    )
+    check = _find(report, CHECK_VALIDATOR_KEY)
+    assert report.ready is False
+    assert check.ok is False
+    assert expected_detail in check.detail
+    assert reproduction_calls == []
 
 
 def test_unset_key_path_names_the_variable_config_reads(tmp_path):
